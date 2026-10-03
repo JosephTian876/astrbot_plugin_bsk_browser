@@ -36,3 +36,4 @@ Thumbs.db
 # 本地配置（可能含 instance_id 等个人信息）
 local_config.json
 *.local.json
+.commitmsg
