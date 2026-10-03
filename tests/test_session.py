@@ -1656,5 +1656,762 @@ class TestRecoverOrphans(TestJournalIntegration):
         self.assertEqual(stops, ["abcd", session.session_id])
 
 
+# ----------------------------------------------------------------------
+# ★ `session stop` 的有界重试（回归测试：修复"stop 失败不重试 → 会话泄漏"）
+#
+# 背景（另一名工程师用真实浏览器实测确认）：
+#   bsk 0.3.2 会间歇性地对 `session stop` 返回
+#       extension rejected tool.session_stop: RpcError {
+#           code: ProtocolError, message: "Background execution cleanup timed out" }
+#   此时会话**仍然活着**（Agent Window 还开着），而修复前的实现只试一次就放弃，
+#   会话于是泄漏在 daemon 里直到 bsk 自己回收（且回收不保证归还借用的标签页）。
+#   量化：navigate 失败过的会话 48 轮泄漏 6 轮（≈12.5%），紧接一次重试就能成功。
+#
+# 本段**只追加**，不改动上面任何既有测试。
+# ----------------------------------------------------------------------
+
+# 与 session.py 保持一致的模块级延迟注入：测试里把重试延迟调到 10ms，
+# 避免每个用例真的 sleep 半秒而拖慢整个测试套件。
+import time  # noqa: E402
+
+from bsk.errors import BskNotInstalled, BskProtocolError, BskTimeout, BskVersionError  # noqa: E402
+from bsk.session import (  # noqa: E402
+    STOP_MAX_ATTEMPTS,
+    STOP_RETRY_DELAY_SEC,
+    _is_transient_stop_error,
+)
+
+
+TRANSIENT_STOP_MESSAGE = (
+    "extension rejected tool.session_stop: RpcError { "
+    'code: ProtocolError, message: "Background execution cleanup timed out" }'
+)
+"""★ 实测报错原文（bsk 0.3.2，本机真实浏览器复现）。
+
+刻意逐字照抄而不是自己编一句"看起来像瞬时"的话 —— 这个用例的全部价值就在于
+证明**真实那条报错**能被识别成瞬时故障；改一个字就不再是回归测试了。
+"""
+
+FAST_STOP_KWARGS: dict[str, Any] = {
+    "stop_max_attempts": STOP_MAX_ATTEMPTS,
+    "stop_retry_delay_sec": 0.01,
+    "stop_retry_budget_sec": 5.0,
+    "stop_timeout_sec": 1.0,
+    # 假 runner 不做真实的进程清理，所以这份"超时后的清理开销"按 0 计；
+    # 生产走 STOP_ATTEMPT_OVERHEAD_SEC（runner.py 的优雅取消宽限 + 收管道 = 17s）。
+    "stop_attempt_overhead_sec": 0.0,
+    "stop_total_budget_sec": 5.0,
+    "stop_attempt_backstop_sec": 1.0,
+}
+"""把重试的几处时间参数全部调小，让用例毫秒级跑完（生产用模块常量的默认值）。
+
+``stop_total_budget_sec`` 必须**显式**给：默认值会把 runner 的超时后清理开销
+（15s 宽限 + 2s 收管道）算进去，那是生产环境才需要的大数字，测试里只会让超时
+用例等很久。
+"""
+
+
+class _HangingStopRunner(FakeRunner):
+    """``session stop`` 永远不返回的 runner（模拟 runner 卡死）。
+
+    用于验证"``terminate()`` 绝不能被挂住"：真实 ``BskRunner`` 有自己的超时，
+    不会这样；这里刻意造出最坏情况，证明 ``_stop_session_id`` 还有第二道
+    墙钟兜底，而不是无限等下去。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._never = asyncio.Event()
+
+    async def run_or_raise(
+        self, args: list[str], *, timeout: float | None = None, expect_json: bool = True
+    ) -> BskResult:
+        if list(args)[:2] == ["session", "stop"]:
+            self.calls.append(list(args))
+            self.timeouts.append(timeout)
+            await self._never.wait()  # 永不 set → 只能靠外层兜底取消
+        return await super().run_or_raise(
+            args, timeout=timeout, expect_json=expect_json
+        )
+
+
+class _OverlapStopRunner(FakeRunner):
+    """统计 ``session stop`` 的**并发重叠**，并让每次 stop 都失败。
+
+    并发重叠在这里是"``release_all`` 没有把 N 个会话串行处理"的**确定性**证据
+    （墙钟断言会受机器负载影响，只当宽松上限用）。
+    """
+
+    def __init__(self, *, stop_delay: float = 0.0) -> None:
+        super().__init__()
+        self.stop_delay = stop_delay
+        self.stop_in_flight = 0
+        self.peak_stop_in_flight = 0
+
+    async def run_or_raise(
+        self, args: list[str], *, timeout: float | None = None, expect_json: bool = True
+    ) -> BskResult:
+        if list(args)[:2] == ["session", "stop"]:
+            self.calls.append(list(args))
+            self.timeouts.append(timeout)
+            self.stop_in_flight += 1
+            self.peak_stop_in_flight = max(
+                self.peak_stop_in_flight, self.stop_in_flight
+            )
+            try:
+                if self.stop_delay:
+                    await asyncio.sleep(self.stop_delay)
+                # 瞬时故障（超时）→ 必须走重试，且每次尝试都要占住这个窗口。
+                raise errors.classify(
+                    exit_code=errors.EXIT_TIMEOUT,
+                    code="",
+                    message="fake stop timeout",
+                    hint="",
+                    reason="",
+                    stderr="",
+                )
+            finally:
+                self.stop_in_flight -= 1
+        return await super().run_or_raise(
+            args, timeout=timeout, expect_json=expect_json
+        )
+
+
+class _NotInstalledStopRunner(FakeRunner):
+    """``session stop`` 抛 ``BskNotInstalled`` 的 runner（bsk 没装）。"""
+
+    async def run_or_raise(
+        self, args: list[str], *, timeout: float | None = None, expect_json: bool = True
+    ) -> BskResult:
+        if list(args)[:2] == ["session", "stop"]:
+            self.calls.append(list(args))
+            self.timeouts.append(timeout)
+            raise BskNotInstalled(
+                "PATH 中找不到可执行文件：bsk",
+                friendly="在系统 PATH 里找不到 bsk。",
+                code="bsk_not_installed",
+            )
+        return await super().run_or_raise(
+            args, timeout=timeout, expect_json=expect_json
+        )
+
+
+class TestTransientStopErrorPredicate(unittest.TestCase):
+    """``_is_transient_stop_error`` 的判定表 —— 纯函数，直接单测。"""
+
+    def test_real_measured_error_text_is_transient(self) -> None:
+        """★ 实测原文必须判为瞬时（这是本次修复的核心依据）。"""
+        exc = errors.classify(
+            exit_code=errors.EXIT_PROTOCOL,
+            code="protocol_error",
+            message=TRANSIENT_STOP_MESSAGE,
+            hint="",
+            reason="",
+            stderr="",
+        )
+        # 前提：单看类型它是 BskProtocolError，而 BskProtocolError 默认不可重试 ——
+        # 所以"按类型一刀切"会把这条真实故障一起排除掉，必须按文本识别。
+        self.assertIsInstance(exc, BskProtocolError)
+        self.assertFalse(exc.retryable)
+        self.assertTrue(_is_transient_stop_error(exc))
+
+    def test_background_cleanup_marker_alone_is_transient(self) -> None:
+        """标记词单独出现也认（不依赖整句原文完全一致）。"""
+        exc = errors.classify(
+            exit_code=errors.EXIT_BROWSER,
+            code="",
+            message="Background execution cleanup timed out",
+            hint="",
+            reason="",
+            stderr="",
+        )
+        self.assertTrue(_is_transient_stop_error(exc))
+
+    def test_timeout_type_is_transient(self) -> None:
+        self.assertTrue(
+            _is_transient_stop_error(
+                errors.classify(
+                    exit_code=errors.EXIT_TIMEOUT,
+                    code="",
+                    message="命令超时",
+                    hint="",
+                    reason="",
+                    stderr="",
+                )
+            )
+        )
+
+    def test_busy_type_is_transient(self) -> None:
+        self.assertTrue(
+            _is_transient_stop_error(
+                errors.classify(
+                    exit_code=errors.EXIT_USER_ERROR,
+                    code="session_busy",
+                    message="busy",
+                    hint="",
+                    reason="",
+                    stderr="",
+                )
+            )
+        )
+
+    def test_not_installed_is_never_transient(self) -> None:
+        """bsk 没装 → 重试无意义。"""
+        self.assertFalse(
+            _is_transient_stop_error(
+                BskNotInstalled("找不到 bsk", code="bsk_not_installed")
+            )
+        )
+
+    def test_version_mismatch_is_never_transient(self) -> None:
+        """版本不匹配 → 重试无意义，必须让用户升级。"""
+        self.assertFalse(
+            _is_transient_stop_error(
+                errors.classify(
+                    exit_code=errors.EXIT_VERSION,
+                    code="",
+                    message="version mismatch",
+                    hint="",
+                    reason="",
+                    stderr="",
+                )
+            )
+        )
+
+    def test_not_installed_wins_over_marker_text(self) -> None:
+        """★ 顺序保证：不可重试类别优先于文本标记。
+
+        万一 bsk 的错误文本里恰好含 "cleanup timed out" 之类的字样，
+        ``BskNotInstalled`` 仍然不能被重试（重试只会白等）。
+        """
+        self.assertFalse(
+            _is_transient_stop_error(
+                BskNotInstalled(
+                    f"找不到 bsk（{TRANSIENT_STOP_MESSAGE}）",
+                    code="bsk_not_installed",
+                )
+            )
+        )
+
+    def test_outcome_unknown_is_never_transient(self) -> None:
+        """★ 铁律：任何 outcome_unknown 类错误都不重试（不给将来抄到写操作的口子）。"""
+        self.assertFalse(
+            _is_transient_stop_error(
+                errors.classify(
+                    exit_code=errors.EXIT_BROWSER,
+                    code="",
+                    message=f"扩展断连（{TRANSIENT_STOP_MESSAGE}）",
+                    hint="",
+                    reason="extension_disconnected",
+                    stderr="",
+                )
+            )
+        )
+
+    def test_plain_protocol_error_without_marker_is_not_transient(self) -> None:
+        """没有瞬时标记的协议错误（我们自己发错命令）→ 不重试。"""
+        exc = errors.classify(
+            exit_code=errors.EXIT_PROTOCOL,
+            code="",
+            message="unexpected argument '--foo' found",
+            hint="",
+            reason="",
+            stderr="error: unexpected argument",
+        )
+        self.assertIsInstance(exc, BskProtocolError)
+        self.assertFalse(_is_transient_stop_error(exc))
+
+    def test_arbitrary_exception_is_not_transient(self) -> None:
+        """非 bsk 异常（例如管道炸了）默认不重试。"""
+        self.assertFalse(_is_transient_stop_error(RuntimeError("管道炸了")))
+
+
+class TestStopRetry(SessionTestCase):
+    """★ ``_stop_session_id`` 的有界重试 —— 会话泄漏的第一道防线。"""
+
+    async def test_first_failure_then_success_retries_once(self) -> None:
+        """★ 首次失败、第二次成功 → 返回 True，且 stop 恰好被调用 2 次。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop", fail("", exit_code=errors.EXIT_TIMEOUT)
+        )
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        stop_calls = self.runner.calls_for("session stop")
+        self.assertEqual(len(stop_calls), 2, "应当重试一次")
+        # 两次都是同一个精确 id 的位置参数（绝不是 --all）。
+        self.assertEqual(stop_calls[0], ["session", "stop", "mnaa"])
+        self.assertEqual(stop_calls[1], ["session", "stop", "mnaa"])
+        for call in stop_calls:
+            self.assertNotIn("--all", call)
+            self.assertNotIn("--session", call)
+
+    async def test_counters_record_retry_and_recovery(self) -> None:
+        """重试与"靠重试救回来"都要能在 stats() 里看到。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("", exit_code=errors.EXIT_TIMEOUT))
+
+        await manager.release("umo-1")
+
+        counters = manager.stats()["counters"]
+        self.assertEqual(counters["stop_retries"], 1)
+        self.assertEqual(counters["stop_recovered"], 1)  # 旧代码会在这里泄漏
+        self.assertEqual(counters["stopped"], 1)
+        self.assertEqual(counters["stop_failed"], 0)
+
+    async def test_gives_up_after_max_attempts(self) -> None:
+        """★ 一直失败 → 返回 False，且调用次数**恰好**是 STOP_MAX_ATTEMPTS。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        # 排 10 个失败：如果实现里有无限重试，这个用例会挂住而不是"多调几次"。
+        self.runner.queue(
+            "session stop", *(fail("", exit_code=errors.EXIT_TIMEOUT) for _ in range(10))
+        )
+
+        self.assertFalse(await manager.release("umo-1"))
+
+        stop_calls = self.runner.calls_for("session stop")
+        self.assertEqual(len(stop_calls), STOP_MAX_ATTEMPTS)
+        counters = manager.stats()["counters"]
+        self.assertEqual(counters["stop_failed"], 1)
+        self.assertEqual(counters["stopped"], 0)
+        self.assertEqual(counters["stop_retries"], STOP_MAX_ATTEMPTS - 1)
+        self.assertEqual(counters["stop_recovered"], 0)
+        self.assertTrue(manager.stats()["recent_stop_errors"])
+
+    async def test_max_attempts_is_not_unbounded(self) -> None:
+        """重试次数是**常量**决定的硬上限，不是一个会自己长大的循环。"""
+        self.assertGreaterEqual(STOP_MAX_ATTEMPTS, 2)
+        self.assertLessEqual(STOP_MAX_ATTEMPTS, 5)  # 总量级必须留在"几秒内"
+        self.assertGreater(STOP_RETRY_DELAY_SEC, 0)
+
+    async def test_production_time_budget_is_bounded(self) -> None:
+        """★ 生产默认值下的总时间上界必须落在"几十秒"内，不能失控。
+
+        上界完全由常量决定（不依赖运行期测量）：
+        ``总预算 = 单次超时 + runner 超时后的固有开销 + 重试预算``。
+        把这条等式与量级一起钉死，防止将来有人调大某个常量却没人注意到
+        ``terminate()`` 被拖长了。
+        """
+        from bsk.session import (
+            STOP_ATTEMPT_OVERHEAD_SEC,
+            STOP_RETRY_BUDGET_SEC,
+            STOP_TIMEOUT_SEC,
+            STOP_TOTAL_BUDGET_SEC,
+        )
+
+        self.assertEqual(
+            STOP_TOTAL_BUDGET_SEC,
+            STOP_TIMEOUT_SEC
+            + STOP_ATTEMPT_OVERHEAD_SEC
+            + STOP_RETRY_BUDGET_SEC,
+        )
+        # 上界必须 ≥ 首次尝试的正常最坏耗时，否则等于掐断 runner 的清理流程。
+        self.assertGreaterEqual(
+            STOP_TOTAL_BUDGET_SEC, STOP_TIMEOUT_SEC + STOP_ATTEMPT_OVERHEAD_SEC
+        )
+        # 且必须停在"几十秒"内 —— terminate() 不该让用户等出分钟级。
+        self.assertLess(STOP_TOTAL_BUDGET_SEC, 60.0)
+
+    async def test_deadline_bounds_every_attempt_and_wait(self) -> None:
+        """★ 把总预算压小，验证**整次调用**确实被它卡住。
+
+        单次超时与兜底都设得**远大于**总预算：如果实现是"每次尝试各用各的常量"，
+        这里就会等满 10 秒 × 次数；只有"每次都从剩余预算反推"才会立刻收敛。
+        """
+        self.runner = _HangingStopRunner()
+        manager = self.make_manager(
+            stop_max_attempts=5,
+            stop_retry_delay_sec=0.01,
+            stop_retry_budget_sec=0.3,
+            stop_timeout_sec=10.0,           # 远大于总预算
+            stop_attempt_overhead_sec=0.0,   # 假 runner 不做真实清理
+            stop_total_budget_sec=0.3,       # ← 唯一真正的约束
+            stop_attempt_backstop_sec=10.0,  # 同上
+        )
+        await manager.acquire("umo-1")
+
+        started = time.monotonic()
+        self.assertFalse(await manager.release("umo-1"))
+        elapsed = time.monotonic() - started
+
+        # 总预算 0.3s；允许调度抖动与 Windows 定时器粒度，但必须远小于 10s。
+        self.assertLess(elapsed, 2.0, f"总预算没有生效：{elapsed:.2f}s")
+
+    async def test_transient_error_text_triggers_retry(self) -> None:
+        """★ 用**实测报错原文**作为失败原因 → 必须发生重试。
+
+        刻意用 ``EXIT_PROTOCOL`` 让它分类成 ``BskProtocolError``（默认不可重试）：
+        如果实现改成"按异常类型一刀切排除 ProtocolError"，这个用例就会失败。
+        """
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            fail(
+                "protocol_error",
+                exit_code=errors.EXIT_PROTOCOL,
+                message=TRANSIENT_STOP_MESSAGE,
+            ),
+        )
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        stop_calls = self.runner.calls_for("session stop")
+        self.assertEqual(len(stop_calls), 2, "实测的瞬时故障必须触发重试")
+        self.assertEqual(manager.stats()["counters"]["stop_retries"], 1)
+        self.assertEqual(manager.stats()["counters"]["stop_recovered"], 1)
+
+    async def test_transient_error_repeated_still_bounded(self) -> None:
+        """瞬时故障一直持续时也必须收敛到 STOP_MAX_ATTEMPTS 次。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            *(
+                fail(
+                    "protocol_error",
+                    exit_code=errors.EXIT_PROTOCOL,
+                    message=TRANSIENT_STOP_MESSAGE,
+                )
+                for _ in range(8)
+            ),
+        )
+
+        self.assertFalse(await manager.release("umo-1"))
+        self.assertEqual(
+            len(self.runner.calls_for("session stop")), STOP_MAX_ATTEMPTS
+        )
+
+    async def test_plain_protocol_error_is_not_retried(self) -> None:
+        """没有瞬时标记的协议错误（我们发错命令）→ **只调用 1 次**。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            fail(
+                "protocol_error",
+                exit_code=errors.EXIT_PROTOCOL,
+                message="unexpected argument '--foo' found",
+                stderr="error: unexpected argument",
+            ),
+        )
+
+        self.assertFalse(await manager.release("umo-1"))
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+        self.assertEqual(manager.stats()["counters"]["stop_retries"], 0)
+
+    async def test_not_installed_is_not_retried(self) -> None:
+        """★ bsk 未安装 → stop 只调用 1 次（重试毫无意义，只会浪费 terminate 时间）。"""
+        self.runner = _NotInstalledStopRunner()
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+
+        self.assertFalse(await manager.release("umo-1"))
+
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+        counters = manager.stats()["counters"]
+        self.assertEqual(counters["stop_retries"], 0)
+        self.assertEqual(counters["stop_failed"], 1)
+
+    async def test_version_mismatch_is_not_retried(self) -> None:
+        """明确版本不匹配 → 只调用 1 次。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop", fail("", exit_code=errors.EXIT_VERSION)
+        )
+
+        self.assertFalse(await manager.release("umo-1"))
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+        self.assertEqual(manager.stats()["counters"]["stop_retries"], 0)
+
+    async def test_not_found_is_still_success_on_first_attempt(self) -> None:
+        """★ ``not_found`` 仍视为成功（重试逻辑没有破坏这个语义），且**不重试**。"""
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("not_found"))
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+        counters = manager.stats()["counters"]
+        self.assertEqual(counters["stopped"], 1)
+        self.assertEqual(counters["stop_retries"], 0)
+        self.assertEqual(counters["stop_failed"], 0)
+
+    async def test_not_found_after_retry_is_success(self) -> None:
+        """★ "重试 stop 是安全的"这一推理的直接验证。
+
+        第一次报瞬时故障，第二次 bsk 回 ``not_found``（说明会话其实已经停了）
+        → 必须**当成成功**，而不是失败。
+        """
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            fail("", exit_code=errors.EXIT_TIMEOUT),  # 第 1 次：瞬时故障
+            fail("not_found"),                        # 第 2 次：bsk 说已经没了
+        )
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        counters = manager.stats()["counters"]
+        self.assertEqual(len(self.runner.calls_for("session stop")), 2)
+        self.assertEqual(counters["stopped"], 1)
+        self.assertEqual(counters["stop_failed"], 0)
+        self.assertEqual(counters["stop_recovered"], 1)
+
+    async def test_retry_waits_between_attempts(self) -> None:
+        """★ 重试要**真的等**一小会儿再发，不能不留恢复窗口地连发。
+
+        与既有 ``test_session_busy_retry_actually_waits`` 同样的做法：
+        不量墙钟（Windows 定时器粒度约 15.6ms，断言会偶发失败），
+        而是把 ``asyncio.sleep`` 换成只记录请求时长的替身。
+        """
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            *(fail("", exit_code=errors.EXIT_TIMEOUT) for _ in range(3)),
+        )
+
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float, *args: Any, **kwargs: Any) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)
+
+        with mock.patch("bsk.session.asyncio.sleep", fake_sleep):
+            self.assertFalse(await manager.release("umo-1"))
+
+        # 3 次尝试之间有 2 次等待，每次都是约定的延迟。
+        self.assertEqual(sleeps, [FAST_STOP_KWARGS["stop_retry_delay_sec"]] * 2)
+
+    async def test_budget_exhaustion_stops_retrying(self) -> None:
+        """★ 预算耗尽时**主动放弃**剩余重试（止损），而不是死等。
+
+        预算设成 0.5s、单次尝试固定花 0.4s：第 1 次失败后只剩约 0.1s 预算，
+        低于 ``STOP_RETRY_MIN_TIMEOUT_SEC`` → 应当直接放弃，不再发第 2 次。
+        """
+        manager = self.make_manager(
+            stop_max_attempts=3,
+            stop_retry_delay_sec=0.01,
+            stop_retry_budget_sec=0.5,
+            stop_timeout_sec=1.0,
+            stop_attempt_overhead_sec=0.0,  # 假 runner 不做真实清理
+            stop_total_budget_sec=1.0,
+            stop_attempt_backstop_sec=1.0,
+        )
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            *(
+                fail("", exit_code=errors.EXIT_TIMEOUT)
+                for _ in range(4)
+            ),
+        )
+
+        # 让每次尝试都真的花掉 0.4s（占满预算）。
+        original = self.runner.run_or_raise
+
+        async def slow_run(args: list[str], **kwargs: Any) -> BskResult:
+            if list(args)[:2] == ["session", "stop"]:
+                await asyncio.sleep(0.4)
+            return await original(args, **kwargs)
+
+        self.runner.run_or_raise = slow_run  # type: ignore[method-assign]
+
+        started = time.monotonic()
+        self.assertFalse(await manager.release("umo-1"))
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+        self.assertEqual(
+            manager.stats()["counters"]["stop_retry_budget_skips"], 1
+        )
+        # 严格小于"3 次尝试 × 0.4s"——证明它没有硬着头皮把次数用满。
+        self.assertLess(elapsed, 1.2, "预算耗尽后不该继续等待")
+
+
+class TestStopRetryJournal(TestJournalIntegration):
+    """★ journal 语义**必须**与加重试之前完全一致（第二道防线不能被削弱）。"""
+
+    async def test_success_after_retry_removes_record(self) -> None:
+        """重试后成功 → 删记录（与"一次就成功"同等对待）。"""
+        manager = self.make_journal_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("", exit_code=errors.EXIT_TIMEOUT))
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_exhausted_retries_keep_record(self) -> None:
+        """★ 重试用尽仍失败 → **刻意保留**记录，留给下次启动的 recover_orphans。"""
+        manager = self.make_journal_manager(**FAST_STOP_KWARGS)
+        session = await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop", *(fail("", exit_code=errors.EXIT_TIMEOUT) for _ in range(8))
+        )
+
+        self.assertFalse(await manager.release("umo-1"))
+
+        self.assertEqual(self.journal_ids(), [session.session_id])
+        self.assertEqual(
+            len(self.runner.calls_for("session stop")), STOP_MAX_ATTEMPTS
+        )
+
+    async def test_transient_then_not_found_removes_record(self) -> None:
+        """瞬时故障后 bsk 回 not_found → 视为成功，记录也要删。"""
+        manager = self.make_journal_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue(
+            "session stop",
+            fail("", exit_code=errors.EXIT_TIMEOUT),
+            fail("not_found"),
+        )
+
+        self.assertTrue(await manager.release("umo-1"))
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_not_found_first_attempt_removes_record(self) -> None:
+        """★ ``not_found`` 仍视为成功且删记录（重试逻辑没有破坏它）。"""
+        manager = self.make_journal_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("not_found"))
+
+        self.assertTrue(await manager.release("umo-1"))
+        self.assertEqual(self.journal.load(), [])
+        self.assertEqual(len(self.runner.calls_for("session stop")), 1)
+
+    async def test_release_all_removes_records_after_retries(self) -> None:
+        """release_all 路径上的重试成功后，所有记录都要清掉。"""
+        manager = self.make_journal_manager(**FAST_STOP_KWARGS)
+        for i in range(3):
+            await manager.acquire(f"umo-{i}")
+        self.runner.queue(
+            "session stop",
+            *(fail("", exit_code=errors.EXIT_TIMEOUT) for _ in range(3)),
+        )
+
+        self.assertEqual(await manager.release_all(), 3)
+        self.assertEqual(self.journal.load(), [])
+
+
+class TestReleaseAllStopRetry(SessionTestCase):
+    """★ 重试**绝不能**拖慢 ``terminate()``（``release_all`` 是它的落地路径）。"""
+
+    async def test_release_all_retries_concurrently_not_serially(self) -> None:
+        """★★ 3 个会话都 stop 失败时，重试必须**并发**做。
+
+        先断言确定性的证据（并发重叠峰值 == 3），再给一个宽松的墙钟上限 ——
+        串行的话耗时约 3 倍，会明显越过它。
+        """
+        self.runner = _OverlapStopRunner(stop_delay=0.15)
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        for i in range(3):
+            await manager.acquire(f"umo-{i}")
+
+        started = time.monotonic()
+        released = await manager.release_all()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(released, 0)  # 3 个都没停成功
+        # ★ 确定性断言：3 个会话的 stop 确实同时在飞（串行实现峰值只会是 1）。
+        self.assertEqual(
+            self.runner.peak_stop_in_flight,
+            3,
+            "release_all 必须并发 stop，不能一个接一个地等",
+        )
+        # 并发：每个会话 3 次尝试 × 0.15s + 2 次 10ms 间隔 ≈ 0.47s。
+        # 串行则是 3 倍 ≈ 1.41s。阈值取 1.2s：既宽松又能把两者区分开。
+        self.assertLess(elapsed, 1.2, f"release_all 太慢了：{elapsed:.2f}s")
+        self.assertEqual(len(self.runner.calls_for("session stop")), 9)
+
+    async def test_release_all_bounded_when_stop_hangs(self) -> None:
+        """★★ ``terminate()`` 路径不挂住：stop 永远不返回也要在有界时间内结束。
+
+        ``_stop_session_id`` 除了 runner 自身的超时，还有一道墙钟兜底；
+        本用例把兜底调到 0.15s，证明最坏情况下 3 个会话 × 3 次尝试仍然是**秒级**
+        收敛，而不是无限挂起。
+        """
+        self.runner = _HangingStopRunner()
+        manager = self.make_manager(
+            stop_max_attempts=3,
+            stop_retry_delay_sec=0.01,
+            stop_retry_budget_sec=5.0,
+            stop_timeout_sec=0.05,
+            stop_attempt_overhead_sec=0.0,  # 假 runner 不做真实清理
+            stop_total_budget_sec=1.5,
+            stop_attempt_backstop_sec=0.15,
+        )
+        for i in range(3):
+            await manager.acquire(f"umo-{i}")
+
+        started = time.monotonic()
+        released = await manager.release_all()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(released, 0)
+        self.assertEqual(manager.stats()["sessions"], 0)
+        # 上界 = 3 次尝试 × (0.15s 兜底 + 0.01s 间隔) ≈ 0.5s，给到 5s 极宽松。
+        self.assertLess(elapsed, 5.0, f"release_all 被挂住了：{elapsed:.2f}s")
+        # 每个会话都各自用满了 3 次尝试（每次都被兜底掐断）。
+        self.assertEqual(
+            len(self.runner.calls_for("session stop")), 3 * 3
+        )
+        self.assertEqual(manager.stats()["counters"]["stop_failed"], 3)
+
+    async def test_close_also_bounded_when_stop_hangs(self) -> None:
+        """``close()`` 与 ``release_all`` 走同一条路，同样必须有界返回。"""
+        self.runner = _HangingStopRunner()
+        manager = self.make_manager(
+            stop_max_attempts=2,
+            stop_retry_delay_sec=0.01,
+            stop_retry_budget_sec=5.0,
+            stop_timeout_sec=0.05,
+            stop_attempt_overhead_sec=0.0,  # 假 runner 不做真实清理
+            stop_total_budget_sec=1.0,
+            stop_attempt_backstop_sec=0.1,
+        )
+        await manager.acquire("umo-1")
+
+        started = time.monotonic()
+        await manager.close()  # 绝不抛、绝不挂
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 5.0)
+        self.assertTrue(manager.stats()["closed"])
+
+    async def test_release_all_still_never_uses_stop_all(self) -> None:
+        """★ 红线复检：重试路径里也不许出现 ``--all``。"""
+        self.runner = _OverlapStopRunner(stop_delay=0.0)
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        for i in range(3):
+            await manager.acquire(f"umo-{i}")
+
+        await manager.release_all()
+        await manager.release("umo-0")  # 未知 key，不发命令
+        for call in self.runner.calls:
+            self.assertNotIn("--all", call, f"出现了 --all：{call}")
+
+    async def test_retry_uses_same_exact_id_every_attempt(self) -> None:
+        """★ 每次重试都带**同一个精确 id**（位置参数），绝不放宽成 --all。"""
+        self.runner = _OverlapStopRunner(stop_delay=0.0)
+        manager = self.make_manager(**FAST_STOP_KWARGS)
+        await manager.acquire("umo-1")
+
+        await manager.release_all()
+
+        stop_calls = self.runner.calls_for("session stop")
+        self.assertEqual(len(stop_calls), STOP_MAX_ATTEMPTS)
+        self.assertEqual(stop_calls, [["session", "stop", "mnaa"]] * STOP_MAX_ATTEMPTS)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

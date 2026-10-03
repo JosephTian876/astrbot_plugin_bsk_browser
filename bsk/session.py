@@ -29,6 +29,12 @@
    daemon 与那些会话却还活着 —— 用户桌面上就留下了没人管的浏览器窗口。
    对策是 ``journal.py`` 的持久化所有权记录：建会话时落盘、正常 stop 后删掉、
    下次 ``initialize()`` 时按记录**精确**回收（见 ``recover_orphans``）。
+10. ``session stop`` 会**间歇性**失败（实测 bsk 0.3.2 报
+    ``Background execution cleanup timed out``，此时会话其实**还活着**）。
+    因此 stop 走**有界重试**：只对**瞬时**故障最多试 ``STOP_MAX_ATTEMPTS`` 次，
+    且总耗时受预算约束 —— ``terminate()`` 绝不能被拖住。
+    分工：本次运行内的重试是**第一道**防线，journal + ``recover_orphans``
+    是**第二道**（下次启动时兜底）。
 
 设计约束（写代码时请勿破坏）：
 
@@ -53,16 +59,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .errors import (
+    EXIT_TIMEOUT,
     OUTCOME_UNKNOWN_REASONS,
     BskError,
+    BskNotInstalled,
     BskOutcomeUnknown,
     BskProtocolError,
     BskSessionBusy,
     BskSessionGone,
+    BskTimeout,
+    BskVersionError,
 )
 from .journal import JournalEntry, SessionJournal
 from .models import BrowserInstance, BskResult, BskSession
-from .runner import BskRunner
+from .runner import DEFAULT_CANCEL_GRACE_SEC, DRAIN_TIMEOUT_SEC, BskRunner
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查期存在，运行时不 import
     # config.py 由另一路并行开发，可能存在也可能不存在。
@@ -77,6 +87,11 @@ __all__ = [
     "BUSY_RETRY_DELAY_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
     "DEFAULT_MAX_SESSIONS",
+    "STOP_MAX_ATTEMPTS",
+    "STOP_RETRY_BUDGET_SEC",
+    "STOP_RETRY_DELAY_SEC",
+    "STOP_TIMEOUT_SEC",
+    "STOP_TOTAL_BUDGET_SEC",
 ]
 
 
@@ -106,7 +121,160 @@ START_TIMEOUT_FLOOR_SEC = 30.0
 """``session start`` 的超时下限。首次 start 要等浏览器扩展连接，不能给太短。"""
 
 STOP_TIMEOUT_SEC = 15.0
-"""``session stop`` 的超时。stop 要等浏览器归还标签页，但也不能无限等。"""
+"""``session stop`` 单次尝试的超时。stop 要等浏览器归还标签页，但也不能无限等。
+
+首次尝试总是拿满它（除非总预算已经不够，见 ``STOP_RETRY_BUDGET_SEC``）。
+"""
+
+STOP_MAX_ATTEMPTS = 3
+"""``session stop`` 最多尝试几次（**含首次**）。硬上限，别改成无限循环。
+
+为什么是 3 而不是 2：实测 bsk 0.3.2 在"曾经有 navigate 失败过"的会话上会间歇性
+报 ``Background execution cleanup timed out``（此时会话**其实还活着**），而
+**紧接一次重试就能成功** —— 说明是瞬时状态。给两次重试机会是为了覆盖
+"连续两次都撞上同一个瞬时窗口"这种低概率情形，同时仍把最坏耗时钉死。
+"""
+
+STOP_RETRY_DELAY_SEC = 0.5
+"""两次 ``session stop`` 之间的固定等待时长（秒）。
+
+固定而不是递增：实测瞬时窗口极短（紧接一次重试即成功），递增带来的额外等待
+只会拖长 ``terminate()``，换不来更高的成功率。
+"""
+
+STOP_RETRY_BUDGET_SEC = 5.0
+"""``_stop_session_id`` **额外**留给重试的时间预算（秒）。
+
+★ 它与前两项一起构成整次调用的**总时间上限**（见 ``STOP_TOTAL_BUDGET_SEC``）：
+
+    总上限 = STOP_TIMEOUT_SEC + STOP_ATTEMPT_OVERHEAD_SEC + STOP_RETRY_BUDGET_SEC
+           = 15 + 17 + 5 = 37 秒
+
+前两项覆盖"首次尝试的正常最坏耗时"（bsk 真的卡满 15 秒超时，再加 runner 自己的
+优雅取消与收管道），**不做任何削减** —— 否则等于把 runner 的清理流程掐断，
+反而更可能留下一个 bsk 子进程。这一项是**额外**多给的，专门用来重试。
+
+为什么这 5 秒给得起：实测那条 ``cleanup timed out`` 是**毫秒级快速失败**，
+根本用不到 15 秒超时，所以重试实际只花几十毫秒 —— 5 秒是几百倍的余量；
+而它换来的是"不再泄漏一个用户桌面上的浏览器窗口"。
+"""
+
+STOP_RETRY_MIN_TIMEOUT_SEC = 1.0
+"""一次尝试至少要有这么多剩余预算才值得发。
+
+只剩 0.2 秒预算的 stop 几乎必然超时，发了也只是白花时间、白记一条错误。
+低于这个值就直接放弃（计 ``stop_retry_budget_skips``）。
+"""
+
+STOP_ATTEMPT_OVERHEAD_SEC = DEFAULT_CANCEL_GRACE_SEC + DRAIN_TIMEOUT_SEC
+"""单次 stop 在**超时之后**还可能多花的时间：runner 的优雅取消费 + 收管道。
+
+``BskRunner.run`` 的内部最坏耗时是 ``timeout + cancel_grace + DRAIN_TIMEOUT_SEC``
+（超时后先关 stdin 给 15 秒宽限，再 kill，然后有界地收管道 —— 见 ``runner.py``）。
+本模块把这个开销显式计入自己的墙钟上界，否则"上界"就是假的。
+"""
+
+STOP_TOTAL_BUDGET_SEC = (
+    STOP_TIMEOUT_SEC + STOP_ATTEMPT_OVERHEAD_SEC + STOP_RETRY_BUDGET_SEC
+)
+"""``_stop_session_id`` 整次调用的墙钟总上限（秒）= 15 + 17 + 5 = 37。
+
+这是**唯一**的截止时刻，所有尝试与等待都从它反推剩余额度：
+
+- 每次尝试的超时 = ``min(单次上限, 剩余)``；
+- 每次尝试的兜底 = ``clamp(兜底上限, 尝试超时, 剩余)``；
+- 每次重试前的等待 = ``min(重试延迟, 剩余)``；剩余不够就不发。
+
+于是"整次调用不会越过这个上限"可以**逐条推出来**，而不是靠各处常量互相心算。
+超了就放弃并记 ``stop_failed`` —— 绝不能把 ``terminate()`` 挂住。
+"""
+
+STOP_ATTEMPT_BACKSTOP_MARGIN_SEC = 5.0
+"""墙钟兜底计时器的额外余量（秒），刻意给得**宽松**。
+
+兜底值 = ``timeout + overhead + 本余量``，比 ``BskRunner`` 的理论最坏耗时再多 5 秒，
+用来吸收它**没算进那两个常量**的开销（创建子进程、Windows 上杀软扫描 bsk.exe、
+负载高时的调度延迟）。
+
+为什么宁大勿小：兜底触发时会 ``cancel`` 掉正在执行的 ``BskRunner.run``，而那是
+**可能留下一个 bsk 子进程**的操作。所以它的定位是"runner 彻底失控时的最后一道
+保险丝"，而不是常规控制流 —— 正常路径永远不该碰到它。
+（同理，它一旦触发，我们会把它翻译成 ``BskTimeout`` 并**照常重试**，而不是直接放弃。）
+"""
+
+STOP_TRANSIENT_ERROR_MARKERS: tuple[str, ...] = (
+    # ↓↓ 实测原文（bsk 0.3.2）：
+    # extension rejected tool.session_stop: RpcError {
+    #     code: ProtocolError, message: "Background execution cleanup timed out" }
+    # 此时会话**仍然活着**（Agent Window 还开着），而紧接一次重试就能成功。
+    "background execution cleanup",
+    "cleanup timed out",
+    # bsk 侧 RPC 层的报错外壳。注意与 ``BskProtocolError``（那个是**我们**发错命令
+    # 或输出不是 JSON）区分开：这里匹配的是**错误文本里**的 bsk 内部标记。
+    "rpcerror",
+    "protocolerror",
+    # 扩展拒绝了这次 stop：可能是瞬时状态（清理还没收尾），也可能是权限。
+    # 宁可多花一秒重试，也不要漏掉一次可以救回来的停止（漏掉 = 用户桌面留一个窗口）。
+    "extension rejected",
+    # 理论上会先被 errors.classify 归成 BskSessionBusy，这里只是文本兜底。
+    "session_busy",
+)
+"""错误文本里出现任意一项，就认为 stop 失败是**瞬时**的、值得重试。
+
+为什么按**文本**而不是按异常类型判定：实测那个失败在插件侧是
+``BskError``（甚至可能是 ``BskProtocolError``），与"我们自己参数写错"完全同类，
+**按类型一刀切会把这条唯一有实测证据的瞬时故障一起排除掉**。
+反过来说，类型只用来认那些**与文本无关**的瞬时类别（超时、忙）。
+"""
+
+
+def _is_transient_stop_error(exc: BaseException) -> bool:
+    """这次 ``session stop`` 失败是否**值得重试**。
+
+    判定依据（按优先级）：
+
+    1. **明确不可重试的类别直接否掉** —— ``BskNotInstalled``（bsk 没装）、
+       ``BskVersionError``（CLI 与扩展版本对不上）：这两类重试多少次结果都一样，
+       只会白等。它们放在最前面是为了防止"错误文本里恰好含某个标记"导致误判。
+    2. **``outcome_unknown`` 类错误不重试** —— 这是本模块的铁律（见 ``errors.py`` 的
+       ``OUTCOME_UNKNOWN_REASONS``）。stop 本身是幂等的、重试其实安全，但这里刻意
+       不开这个口子：一旦给"结果未知"开了重试，将来很容易被照着抄到 click/fill
+       这类**重放会出事**的动作命令上。这类失败的兜底手段是 journal + 下次启动的
+       ``recover_orphans``。
+    3. **文本含 ``STOP_TRANSIENT_ERROR_MARKERS`` 之一 → 是瞬时故障，重试**。
+       这是实测那条 ``Background execution cleanup timed out`` 的判定路径。
+    4. **类型本身就是瞬时类别 → 重试**：``BskTimeout``（超时；stop 幂等，重放安全）、
+       ``BskSessionBusy``（会话上有 in-flight 命令，等一小会儿再来）。
+    5. 其余一律**不重试**（包括没有瞬时标记的 ``BskProtocolError``、``BskBrowserError``、
+       普通 ``BskError``、以及任何非 bsk 异常）。宁可少试一次，也不要把
+       ``terminate()`` 的时间浪费在注定失败的重试上。
+
+    Note:
+        **重试 stop 是安全的**：如果会话其实已经停了，bsk 会回 ``not_found``，
+        而 ``_stop_session_id`` 已经把 ``not_found`` 当成"目的已达成"的成功处理。
+        所以"多停一次"最多多花一次往返，不会误判、也不会伤到别人的会话
+        （命令里带的是**精确 id**，绝不是 ``--all``）。
+
+    Args:
+        exc: ``run_or_raise`` 抛出的异常（也可能是任何别的异常）。
+
+    Returns:
+        True 表示应当重试。
+    """
+    if isinstance(exc, (BskNotInstalled, BskVersionError)):
+        return False
+
+    reason = getattr(exc, "reason", "")
+    if reason in OUTCOME_UNKNOWN_REASONS:
+        return False
+
+    haystack = f"{exc}".lower()
+    for marker in STOP_TRANSIENT_ERROR_MARKERS:
+        if marker in haystack:
+            return True
+
+    return isinstance(exc, (BskTimeout, BskSessionBusy))
+
 
 RECOVER_LIST_TIMEOUT_SEC = 5.0
 """恢复时 ``session list`` 的超时。
@@ -263,10 +431,28 @@ class SessionManager:
             :meth:`recover_orphans` 能在下一个进程里认出遗留会话。
             不传（None）时所有 journal 动作都变成无操作 —— 现有调用方
             与测试因此完全不受影响。
+        stop_max_attempts: ``session stop`` 的最多尝试次数（含首次）。
+            默认取模块常量 ``STOP_MAX_ATTEMPTS``。抽成参数**只为测试**能把
+            次数与延迟调小，避免每个用例真的 sleep 半秒；生产代码不要传它。
+        stop_retry_delay_sec: 两次 stop 之间的等待时长。默认 ``STOP_RETRY_DELAY_SEC``。
+        stop_retry_budget_sec: 重试阶段的墙钟总预算。默认 ``STOP_RETRY_BUDGET_SEC``。
+        stop_timeout_sec: 单次 stop 的超时。默认 ``STOP_TIMEOUT_SEC``。
+        stop_total_budget_sec: 整次 ``_stop_session_id`` 的墙钟总上限。
+            ``None``（默认）时按
+            ``stop_timeout_sec + stop_attempt_overhead_sec + stop_retry_budget_sec``
+            推导（生产值 37 秒），保证"首次尝试的正常最坏耗时"不被削减。
+        stop_attempt_overhead_sec: 单次尝试**超时之后** runner 还要花的清理时间。
+            默认 ``STOP_ATTEMPT_OVERHEAD_SEC``（= 优雅取消宽限 + 收管道，17 秒）。
+            测试用假 runner 时把它调成 0，因为假 runner 不做真实清理。
+        stop_attempt_backstop_sec: 单次尝试的硬性墙钟兜底上限。``None``（默认）时
+            按 ``stop_timeout_sec + 本开销 + 余量`` 自动推导。
+            抽成参数同样**只为测试**能把兜底调小，不必真的等 30 秒。
 
     Attributes:
         _clock: ``time.monotonic`` 的接缝，单元测试可替换成假时钟来验证
             LRU 与空闲回收，避免测试里真的 sleep。生产代码不要动它。
+            ⚠️ stop 的重试预算**不用**它（假时钟不会自己走，会把预算变成永不
+            到期）；见 ``_stop_session_id`` 里的说明。
     """
 
     def __init__(
@@ -276,10 +462,65 @@ class SessionManager:
         *,
         browser_probe: BrowserProbe | None = None,
         journal: SessionJournal | None = None,
+        stop_max_attempts: int = STOP_MAX_ATTEMPTS,
+        stop_retry_delay_sec: float = STOP_RETRY_DELAY_SEC,
+        stop_retry_budget_sec: float = STOP_RETRY_BUDGET_SEC,
+        stop_timeout_sec: float = STOP_TIMEOUT_SEC,
+        stop_total_budget_sec: float | None = None,
+        stop_attempt_overhead_sec: float = STOP_ATTEMPT_OVERHEAD_SEC,
+        stop_attempt_backstop_sec: float | None = None,
     ) -> None:
         self._runner = runner
         self._browser_probe = browser_probe
         self._journal = journal
+
+        # stop 重试的可调参数。**只给测试用**：生产路径一律用模块常量的默认值。
+        # 非法值（<=0、非数字）一律回退到常量，避免调用方传 0 导致
+        # "预算为 0 → 永远不重试"或"次数为 0 → 一次都不试"这种静默失效。
+        attempts = _as_int(stop_max_attempts, STOP_MAX_ATTEMPTS)
+        self._stop_max_attempts = attempts if attempts >= 1 else STOP_MAX_ATTEMPTS
+        delay = _as_float(stop_retry_delay_sec, STOP_RETRY_DELAY_SEC)
+        self._stop_retry_delay_sec = delay if delay >= 0 else STOP_RETRY_DELAY_SEC
+        budget = _as_float(stop_retry_budget_sec, STOP_RETRY_BUDGET_SEC)
+        self._stop_retry_budget_sec = budget if budget > 0 else STOP_RETRY_BUDGET_SEC
+        timeout = _as_float(stop_timeout_sec, STOP_TIMEOUT_SEC)
+        self._stop_timeout_sec = timeout if timeout > 0 else STOP_TIMEOUT_SEC
+        # runner 超时后的清理开销：生产用 runner.py 的真实常量（17s），
+        # 测试用假 runner 时传 0（假 runner 不做任何真实清理）。
+        overhead = _as_float(stop_attempt_overhead_sec, STOP_ATTEMPT_OVERHEAD_SEC)
+        self._stop_attempt_overhead_sec = (
+            overhead if overhead >= 0 else STOP_ATTEMPT_OVERHEAD_SEC
+        )
+        # 整次调用的总上限：显式传值就用它（测试用），否则按"首次尝试的正常最坏
+        # 耗时 + 重试预算"推导。**首次那一份不做削减**，否则等于掐断 runner 的
+        # 清理流程（见 STOP_RETRY_BUDGET_SEC 的说明）。
+        if stop_total_budget_sec is None:
+            self._stop_total_budget_sec = (
+                self._stop_timeout_sec
+                + self._stop_attempt_overhead_sec
+                + self._stop_retry_budget_sec
+            )
+        else:
+            total = _as_float(stop_total_budget_sec, 0.0)
+            self._stop_total_budget_sec = (
+                total if total > 0 else self._stop_timeout_sec
+            )
+        # 墙钟兜底：显式传值就用它（测试用），否则按 runner 的理论最坏耗时推导。
+        if stop_attempt_backstop_sec is None:
+            self._stop_attempt_backstop_sec = (
+                self._stop_timeout_sec
+                + self._stop_attempt_overhead_sec
+                + STOP_ATTEMPT_BACKSTOP_MARGIN_SEC
+            )
+        else:
+            backstop = _as_float(stop_attempt_backstop_sec, 0.0)
+            self._stop_attempt_backstop_sec = (
+                backstop if backstop > 0 else self._stop_timeout_sec
+            )
+        # 兜底永远不该晚于总预算生效：否则"总耗时有界"就不再成立。
+        self._stop_attempt_backstop_sec = min(
+            self._stop_attempt_backstop_sec, self._stop_total_budget_sec
+        )
 
         self._max_sessions = max(
             1, _as_int(_setting(settings, "max_sessions", DEFAULT_MAX_SESSIONS),
@@ -322,6 +563,17 @@ class SessionManager:
             "reaped": 0,
             "uncertain_blocks": 0,
             "not_found_rebuilds": 0,
+            # --- stop 重试的可观测性（见 _stop_session_id）---
+            #
+            # stop_retries：实际发生的 stop 重试次数（不含首次尝试）。
+            #     用来诊断"瞬时故障有多常见"。
+            # stop_recovered：靠重试才停成功的次数。这是本次修复**直接救回来**的
+            #     会话数 —— 它 > 0 就说明旧代码会在这里泄漏一个浏览器窗口。
+            # stop_retry_budget_skips：因重试预算耗尽而**主动放弃**剩余重试的次数
+            #     （不是失败，是止损）。
+            "stop_retries": 0,
+            "stop_recovered": 0,
+            "stop_retry_budget_skips": 0,
         }
         self._recent_stop_errors: list[str] = []
 
@@ -476,6 +728,18 @@ class SessionManager:
 
         先一次性把本地记录全部摘除（只做同步操作，不给并发留窗口），
         再并发 stop。任何一个 stop 失败都不影响其他会话的清理，也不会抛异常。
+
+        ★ **时间上界**（``terminate()`` 绝不能被拖住，这是硬要求）：
+        :meth:`_shutdown_entries` 用 ``asyncio.gather`` **并发**停所有会话，
+        所以总耗时 ≈ **单个**会话的最坏耗时，而**不是**会话数 × 单次耗时。
+        单个会话的最坏耗时又有明确上界：
+
+            RELEASE_WAIT_SEC（等在飞命令，5s）
+          + STOP_TIMEOUT_SEC + STOP_RETRY_BUDGET_SEC（stop 含重试，15 + 5s）
+
+        这个上界**不随会话数增长**。相比加重试之前（单个会话 5 + 15s），
+        这里多出的只有 5 秒重试预算 —— 换来的是"不再泄漏用户桌面上的浏览器窗口"，
+        而实测那条瞬时故障是毫秒级返回的，实际上根本用不到这 5 秒。
         """
         entries: list[_Entry] = []
         for key in list(self._entries.keys()):
@@ -869,13 +1133,54 @@ class SessionManager:
         return await self._stop_session_id(entry.session.session_id)
 
     async def _stop_session_id(self, session_id: str) -> bool:
-        """按 id 停掉一个会话。**绝不抛异常**。
+        """按 id 停掉一个会话，**对瞬时故障做有界重试**。绝不抛异常。
 
-        Note:
-            这里**故意不**去清空 ``entry.session.session_id``：``acquire()`` 返回给
-            调用方的就是这个对象，抹掉 id 会毁掉外面的句柄（测试与 /bskstatus
-            都要读它）。"槽位已无会话"这个事实由 ``_start_into`` 负责表达，
-            以及槽位被摘除（``entry.closed``）来保证。
+        ★ 为什么必须重试（实测缺陷）：bsk 0.3.2 会间歇性地对 ``session stop`` 返回
+
+            extension rejected tool.session_stop: RpcError {
+                code: ProtocolError, message: "Background execution cleanup timed out" }
+
+        此时会话**仍然活着**（Agent Window 还开着），而旧实现只试一次就放弃 ——
+        会话于是泄漏在 daemon 里，直到 bsk 自己 5 分钟后回收，**且回收不保证归还
+        借用的标签页**，用户桌面上会留下没关的浏览器窗口。实测（本机真实浏览器）
+        "曾经 navigate 失败过"的会话 48 轮泄漏 6 轮（≈12.5%），而**紧接一次重试
+        就能成功**，说明这是瞬时状态 —— 重试正是对症的修法。
+
+        ★ **重试 stop 是安全的**，理由有两条：
+
+        1. **幂等**：如果会话其实已经停了，bsk 会回 ``not_found``，而本方法已经把
+           ``not_found`` 当作"目的已达成"处理（见下面的 ``except BskSessionGone``）。
+           所以"多停一次"最多多花一次往返，不会误判。
+        2. **不碰别人的会话**：命令里带的是**精确 id**，永远不是
+           ``session stop --all``（红线，见模块文档第 3 条与既有守护测试）。
+
+        ★ **时间上界**（``terminate()`` 绝不能被拖住）：整次调用只有**一个**截止
+        时刻，在进入循环前算好：
+
+            总上限 = STOP_TIMEOUT_SEC + STOP_RETRY_BUDGET_SEC = 15 + 5 = 20 秒
+
+        每次尝试的超时取 ``min(单次上限, 剩余预算)``，每次等待也取
+        ``min(重试延迟, 剩余预算)``，所以**再怎么写都不会越过这 20 秒**。
+        实测那条 ``cleanup timed out`` 是**毫秒级快速失败**，根本用不到 15 秒超时，
+        因此重试实际只花几十毫秒；多给的 5 秒预算换来的是"不再泄漏一个窗口"。
+        多会话并发时由 ``release_all`` 用 ``asyncio.gather`` 并发跑，总耗时不随
+        会话数线性累加（见 ``release_all`` 的说明）。
+
+        ★ **与 journal 的分工**：这里的重试是**本次运行内**的第一道防线；
+        ``journal.py`` + ``recover_orphans()``（下次启动时按记录精确回收）是
+        **第二道**。两道防线互补：重试解决"进程还活着但这一次 stop 撞上瞬时故障"，
+        journal 解决"进程被强杀、根本没有机会 stop"。所以下面对 journal 的
+        增删语义**必须**与旧实现一致：
+
+        - stop **成功** → 删记录；
+        - stop 报 **not_found** → 也删（bsk 已确认会话不存在）；
+        - stop **失败（含重试用尽）** → **刻意保留**记录，留给下次启动兜底。
+
+        Args:
+            session_id: bsk 会话 id。空串直接当成功（没有会话可停）。
+
+        Returns:
+            True 表示 bsk 侧确认该会话已不存在（stop 成功，或本来就没了）。
         """
         if not session_id:
             return True
@@ -883,30 +1188,191 @@ class SessionManager:
         # ★ id 是位置参数！这是 bsk 里唯一的例外（其余命令都用 --session）。
         # ★ 绝不用 `session stop --all`：那会停掉别的程序（如用户的 DSH）的会话。
         args = ["session", "stop", session_id]
-        try:
-            await self._runner.run_or_raise(
-                args, timeout=STOP_TIMEOUT_SEC, expect_json=False
-            )
-        except BskSessionGone:
-            # bsk 说它已经不存在了 —— 对我们来说目的已达成，不算失败。
-            self._counters["stopped"] += 1
-            self._journal_remove(session_id)
-            logger.debug("会话 %s 已不存在，无需停止", session_id)
-            return True
-        except Exception as exc:  # noqa: BLE001 - 清理路径吞掉一切
-            self._counters["stop_failed"] += 1
-            self._record_stop_error(f"{session_id}: {exc}")
-            logger.warning("停止会话 %s 失败：%r", session_id, exc)
-            # 刻意**不删** journal 记录：这次没停掉，会话可能还活着，
-            # 留着记录能让下一次启动的 recover_orphans 再试一次。
-            return False
 
-        self._counters["stopped"] += 1
-        # 已确认停掉，立刻从 journal 里移除 —— 否则下次启动会去停一个已经
-        # 不存在的 id，白白多一次往返（虽然比对逻辑会挡住误停）。
-        self._journal_remove(session_id)
-        logger.info("已停止浏览器会话 %s", session_id)
-        return True
+        # ★ 整次调用的**唯一**截止时刻（单调钟）。所有尝试与等待都必须落在它之内，
+        #   于是"总耗时有界"这件事是可证明的，而不是靠各处常量互相心算。
+        #
+        #   刻意用 time.monotonic() 而不是 self._clock：self._clock 是给 LRU/空闲
+        #   回收用的接缝，单元测试里会被换成不会自己走的假时钟，拿它做超时预算会
+        #   导致重试永不停止。_wait_idle 也是同样的选择。
+        deadline = time.monotonic() + self._stop_total_budget_sec
+        last_exc: BaseException | None = None
+        attempt = 0
+
+        # ★ 循环次数硬上限 = self._stop_max_attempts（生产值 STOP_MAX_ATTEMPTS），
+        #   且每个分支要么 return、要么 break，所以不存在无限重试的可能。
+        for attempt in range(1, self._stop_max_attempts + 1):
+            # ★ 每次尝试的两条时限都从**剩余总预算**反推，而不是各用各的固定常量。
+            #
+            #   关键点：一次尝试的完整耗时是 ``attempt_timeout + 超时后的清理开销``
+            #   （runner 要先关 stdin 给宽限、再 kill、再收管道）。所以必须先把这份
+            #   开销**预留出来**，再决定这次能拿多少超时 —— 否则我们会把 runner 的
+            #   清理流程从中间掐断，反而更可能留下一个 bsk 子进程。
+            #
+            #   于是每次尝试的耗时有上界 ``min(剩余, attempt_timeout + 开销)``，
+            #   "整次调用不超过 deadline"因此可以逐条推出来。
+            remaining = max(0.0, deadline - time.monotonic())
+            budget_for_timeout = remaining - self._stop_attempt_overhead_sec
+            attempt_timeout = min(self._stop_timeout_sec, max(0.0, budget_for_timeout))
+            # "值得再试一次"的门槛：正常情况下是 STOP_RETRY_MIN_TIMEOUT_SEC（1s），
+            # 但若单次超时本身就被配得比它还小，门槛必须跟着降下来 ——
+            # 否则会出现"每次尝试本来就只给 0.05s，却要求剩余预算 ≥ 1s"的矛盾，
+            # 让重试永远发不出去（把配置值当成错误来用）。
+            min_worthwhile = min(
+                STOP_RETRY_MIN_TIMEOUT_SEC, self._stop_timeout_sec
+            )
+            if attempt > 1 and attempt_timeout < min_worthwhile:
+                # 剩余额度已经不够"一次有意义的尝试 + 它的清理开销"了。
+                # 再发一次只会立刻超时，纯粹浪费 terminate() 的时间。
+                # 首次尝试不走这个判断（它的额度由总预算本身保证）。
+                self._counters["stop_retry_budget_skips"] += 1
+                logger.warning(
+                    "停止会话 %s 的剩余预算 %.2fs 不足以再试一次，放弃重试",
+                    session_id,
+                    remaining,
+                )
+                break
+            if attempt == 1 and attempt_timeout < min_worthwhile:
+                # 走到这里说明总预算被外部配得异常小（只可能出现在测试里）。
+                # 首次尝试仍然要发一次，但额度绝不越过剩余总预算。
+                attempt_timeout = min(remaining, min_worthwhile)
+            if attempt > 1:
+                # 只在**真的要再发一次**时记数，这样 stop_retries 的含义是
+                # "实际发出的重试次数"，而不是"打算重试的次数"。
+                self._counters["stop_retries"] += 1
+
+            # 兜底的三条约束取最小：
+            #   ① 兜底常量 —— "runner 彻底失控"时保险丝的长度；
+            #   ② remaining —— 绝不越过总截止时刻（保证总耗时有界）；
+            #   ③ 本次超时 + 清理开销 + 余量 —— 对守约的 runner 永不触发。
+            # 因为 attempt_timeout ≤ remaining - 开销（上面的预留保证了这点），
+            # 三者取最小后仍 **≥ runner 的合法最坏耗时**（attempt_timeout + 开销），
+            # 所以兜底不会抢在 runner 自己的超时之前动手 —— 那会把正常的
+            # BskTimeout 变成一个语义更差的兜底错误。
+            backstop = min(
+                self._stop_attempt_backstop_sec,
+                remaining,
+                attempt_timeout
+                + self._stop_attempt_overhead_sec
+                + STOP_ATTEMPT_BACKSTOP_MARGIN_SEC,
+            )
+            # 兜底至少要 ≥ 本次超时，否则 wait_for 会立刻超时（等于不执行）。
+            backstop = max(backstop, attempt_timeout)
+            try:
+                await self._stop_once(args, session_id, attempt_timeout, backstop)
+            except BskSessionGone:
+                # bsk 说它已经不存在了 —— 对我们来说目的已达成，不算失败。
+                self._counters["stopped"] += 1
+                self._journal_remove(session_id)
+                if attempt > 1:
+                    # 靠重试救回来的（上一次报了 not_found 之外的错，这次 bsk 说
+                    # 会话没了）—— 单列一个计数器，便于诊断"瞬时故障有多常见"。
+                    self._counters["stop_recovered"] += 1
+                    logger.info(
+                        "会话 %s 在第 %d 次尝试时确认已停止", session_id, attempt
+                    )
+                else:
+                    logger.debug("会话 %s 已不存在，无需停止", session_id)
+                return True
+            except Exception as exc:  # noqa: BLE001 - 清理路径吞掉一切
+                last_exc = exc
+                remaining = deadline - time.monotonic()
+
+                if attempt >= self._stop_max_attempts:
+                    break  # 次数用尽
+                if not _is_transient_stop_error(exc):
+                    # 重试无意义（bsk 没装 / 版本不匹配 / 命令本身有问题）。
+                    # 立刻放弃，别浪费 terminate() 的时间预算。
+                    logger.debug(
+                        "停止会话 %s 失败且不属于瞬时故障，不再重试：%r",
+                        session_id,
+                        exc,
+                    )
+                    break
+                # 预算检查与 stop_retries 记数统一放在循环开头（各只有一处），
+                # 这里只负责打日志并等待。
+                logger.warning(
+                    "停止会话 %s 第 %d 次失败（瞬时故障），%.2fs 后重试：%r",
+                    session_id,
+                    attempt,
+                    self._stop_retry_delay_sec,
+                    exc,
+                )
+                # 等待时长也受预算约束：绝不会睡过 deadline。
+                await asyncio.sleep(
+                    min(self._stop_retry_delay_sec, max(0.0, remaining))
+                )
+                continue
+            else:
+                self._counters["stopped"] += 1
+                # 已确认停掉，立刻从 journal 里移除 —— 否则下次启动会去停一个已经
+                # 不存在的 id，白白多一次往返（虽然比对逻辑会挡住误停）。
+                self._journal_remove(session_id)
+                if attempt > 1:
+                    self._counters["stop_recovered"] += 1
+                    logger.info(
+                        "会话 %s 在第 %d 次尝试时停止成功（瞬时故障已恢复）",
+                        session_id,
+                        attempt,
+                    )
+                else:
+                    logger.info("已停止浏览器会话 %s", session_id)
+                return True
+
+        self._counters["stop_failed"] += 1
+        self._record_stop_error(f"{session_id}: {last_exc}")
+        logger.warning(
+            "停止会话 %s 失败（共尝试 %d 次，上限 %d）：%r",
+            session_id,
+            attempt,
+            self._stop_max_attempts,
+            last_exc,
+        )
+        # 刻意**不删** journal 记录：这次没停掉，会话可能还活着，
+        # 留着记录能让下一次启动的 recover_orphans 再试一次。
+        return False
+
+    async def _stop_once(
+        self, args: list[str], session_id: str, attempt_timeout: float, backstop: float
+    ) -> None:
+        """发**一次** ``session stop`` 命令，成功即返回，失败即抛。
+
+        单独抽出来只为一件事：把"硬性墙钟兜底"与业务重试逻辑分开，让
+        :meth:`_stop_session_id` 的重试循环保持可读。
+
+        兜底的必要性：``BskRunner.run`` 自己就有超时，正常情况这一层永远不触发。
+        但只要 runner 因为任何原因（bug、Windows 上进程卡在不可中断的系统调用）
+        不返回，兜底保证 ``terminate()`` 仍然能在有限时间内结束 —— 那是硬要求。
+
+        Args:
+            args: 完整参数列表（``["session", "stop", <id>]``）。
+            session_id: 仅用于错误信息。
+            attempt_timeout: 本次尝试的超时（已按剩余总预算收敛过）。
+            backstop: 本次尝试的硬性墙钟上限（同样已按剩余总预算收敛过，
+                且严格大于 ``attempt_timeout``）。
+
+        Raises:
+            BskError: 原样抛出 runner 的分类异常；
+                兜底触发时抛出 ``code="stop_backstop_timeout"`` 的 ``BskTimeout``
+                （刻意不是裸 ``TimeoutError``：后者没有 ``friendly`` 中文提示，
+                进 ``recent_stop_errors`` 也只是一句空话，排查时毫无指向性）。
+        """
+        try:
+            await asyncio.wait_for(
+                self._runner.run_or_raise(
+                    args, timeout=attempt_timeout, expect_json=False
+                ),
+                timeout=backstop,
+            )
+        except asyncio.TimeoutError as exc:
+            # 走到这里说明 runner **没有**遵守自己的超时约定（正常路径永远到不了）。
+            raise BskTimeout(
+                f"session stop {session_id} 超过 {backstop:.1f}s 未返回"
+                "（runner 未遵守自身超时约定）",
+                friendly="关闭浏览器会话超时了，稍后会自动重试。",
+                code="stop_backstop_timeout",
+                exit_code=EXIT_TIMEOUT,
+            ) from exc
 
     async def _shutdown_entries(self, entries: list[_Entry]) -> int:
         """并发停掉一批会话，返回成功数量。任何失败都不会传播。"""
