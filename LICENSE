@@ -1,0 +1,78 @@
+astrbot_plugin_bsk_browser — 双许可声明
+=========================================
+
+版权所有 (c) 2026 astrbot_plugin_bsk_browser 贡献者
+
+本软件采用 **双许可（dual license）** 发布。你可以**任选其一**遵守：
+
+  (A) MIT 许可证 —— 见本文件下方全文（宽松，允许闭源使用）
+  (B) GNU Affero 通用公共许可证 v3.0 或更新版本 —— 见 LICENSE-AGPL
+      （SPDX 标识符：AGPL-3.0-or-later）
+
+--------------------------------------------------------------------------
+为什么用双许可？
+--------------------------------------------------------------------------
+
+本插件是 AstrBot 的第三方插件。AstrBot 本身以 AGPL-3.0 发布，而 AstrBot
+通过同进程 `__import__` 动态加载插件——这在法律上是否构成"衍生作品"，
+业界**没有定论**（无判例，FSF 持保守解释，而大量插件实践并不遵守）。
+
+双许可的用意是让两个方向都成立：
+
+* 如果你的使用场景希望更宽松的条款（例如与 MIT 项目混用、闭源分发），
+  按 **(A) MIT** 遵守即可——此时你不需要满足 AGPL 的任何额外义务。
+* 如果你或下游希望采取最保守的合规立场（例如认为插件确实是衍生作品），
+  按 **(B) AGPL-3.0-or-later** 遵守即可——此时 Copyleft 义务得到满足。
+
+无论选哪一个，都是完整且有效的授权。这是 WordPress、Nextcloud 等生态
+长期使用的成熟做法。
+
+--------------------------------------------------------------------------
+第三方组件声明
+--------------------------------------------------------------------------
+
+本插件**不包含**、也**不再分发**下列任何软件：
+
+* **Tencent/BrowserSkill（`bsk` CLI 与浏览器扩展）** —— 版权归腾讯及其贡献者
+  所有，以 MIT 许可证发布。本项目仅通过命令行**调用**用户自行安装的 `bsk`，
+  属于独立程序之间的互操作，不构成对其代码的复制或再分发。
+  项目地址：https://github.com/Tencent/BrowserSkill
+* **AstrBot** —— 版权归 Soulter 及贡献者所有，以 AGPL-3.0 发布。
+  本项目仅通过其公开插件 API（`astrbot.api`）进行互操作，未复制其源代码。
+  项目地址：https://github.com/AstrBotDevs/AstrBot
+
+"BrowserSkill" 是腾讯的项目名称。本项目与腾讯公司**没有任何隶属、赞助或
+背书关系**，并刻意避免将该名称用作自身产品名。
+
+--------------------------------------------------------------------------
+(A) MIT 许可证全文
+--------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 astrbot_plugin_bsk_browser contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+(B) AGPL-3.0-or-later
+--------------------------------------------------------------------------
+
+全文见同目录下的 `LICENSE-AGPL` 文件。
+也可从 https://www.gnu.org/licenses/agpl-3.0.txt 获取。

@@ -35,10 +35,8 @@ import io
 import itertools
 import os
 import re
-import struct
 import time
 from pathlib import Path
-from typing import Any
 
 from .models import Screenshot
 
@@ -129,20 +127,6 @@ def _format_magic(head: bytes) -> str:
     return " ".join(f"{b:02X}" for b in head[:8])
 
 
-def _to_bytes(value: str | bytes | bytearray, encoding: str = "ascii") -> bytes:
-    """把 str / bytes 统一成 bytes，用于前缀比较。
-
-    ``encoding="ascii"`` 时非 ASCII 字符会编码失败，此时返回 ``b""``：
-    这样的值**永远不可能**匹配魔数，正好是我们要的结果（函数式魔数是 ASCII）。
-    """
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    try:
-        return value.encode(encoding)
-    except (UnicodeEncodeError, AttributeError):
-        return b""
-
-
 def _read_head(path: str | Path, size: int = SNIFF_BYTES) -> bytes:
     """读取文件头若干字节；读不到（不存在、没权限、是目录）就返回空 bytes。"""
     try:
@@ -153,78 +137,9 @@ def _read_head(path: str | Path, size: int = SNIFF_BYTES) -> bytes:
         with open(path, "rb") as fp:
             # 只读 limit 字节：文件可能几十 MB，绝不能 read() 全量。
             return fp.read(limit)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError：路径里含空字节之类，Python 在进 OS 之前就会抛。
         return b""
-
-
-def _png_size(head: bytes) -> tuple[int, int] | None:
-    """从 PNG 头部解析出 ``(宽, 高)``。
-
-    PNG 的 IHDR 结构固定：偏移 0 是 8 字节签名，接着 4 字节长度 + 4 字节类型 ``IHDR``，
-    因此宽高分别在偏移 16 和 20 处（大端 4 字节无符号）。只要 24 字节就能拿到。
-    """
-    if len(head) < 24 or not head.startswith(MAGIC_PNG) or head[12:16] != b"IHDR":
-        return None
-
-    try:
-        width, height = struct.unpack(">II", head[16:24])
-    except struct.error:  # pragma: no cover - len 检查已经挡住了
-        return None
-    return width, height
-
-
-def _jpeg_size(head: bytes) -> tuple[int, int] | None:
-    """从 JPEG 的 SOF 段解析出 ``(宽, 高)``。
-
-    需要一路跳过可变长的段（每段是 ``FF <marker> <2字节长度> <载荷>``），所以光靠
-    文件头那十几个字节是不够的，必须往后多读一些。这里会按需扩读，最多 256KB，
-    拿不到就返回 ``None`` —— 尺寸只用于给用户展示，拿不到不算错误。
-    """
-    if len(head) < 4 or not head.startswith(MAGIC_JPEG):
-        return None
-
-    index = 2  # 跳过 SOI(FFD8)
-    # 逐段前进：段头是 FF + marker，其中 FF 可以重复出现（填充）。
-    while index + 9 <= len(head):
-        if head[index] != 0xFF:
-            index += 1
-            continue
-        marker = head[index + 1]
-        if marker == 0xFF:  # 填充字节
-            index += 1
-            continue
-        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
-            # 无载荷的独立标记（TEM/RSTn），只占 2 字节。
-            index += 2
-            continue
-        if marker == 0xD9:  # EOI，图像结束了还没见到 SOF
-            return None
-        if index + 4 > len(head):  # 长度字段都读不全
-            return None
-        segment_length = int.from_bytes(head[index + 2 : index + 4], "big")
-        if segment_length < 2:  # 长度非法，防死循环
-            return None
-        # SOF0..SOF15 里的 0xC4(DHT)/0xC8(JPG)/0xCC(DAC) 不是 SOF。
-        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            if index + 9 > len(head):
-                return None
-            height = int.from_bytes(head[index + 5 : index + 7], "big")
-            width = int.from_bytes(head[index + 7 : index + 9], "big")
-            if width <= 0 or height <= 0:
-                return None
-            return width, height
-        index += 2 + segment_length
-    return None
-
-
-def _image_size(path: str | Path, sniffed: str) -> tuple[int, int] | None:
-    """尽力解析图片尺寸，失败返回 ``None``（调用方要能接受拿不到）。"""
-    if sniffed == "png":
-        return _png_size(_read_head(path, 32))
-    if sniffed == "jpeg":
-        # 最多 256KB：足够覆盖元数据段很多的 JPEG，又不至于把大图整个读进来。
-        return _jpeg_size(_read_head(path, 262144))
-    return None
 
 
 # --- 公开 API -----------------------------------------------------------------
@@ -292,13 +207,15 @@ def verify_shot(shot: Screenshot) -> tuple[bool, str]:
     path = Path(shot.path)
     try:
         stat_result = path.stat()
-    except OSError as exc:
+        is_file = path.is_file()
+    except (OSError, ValueError) as exc:
+        # ValueError：路径含空字节等非法字符，Python 在系统调用之前就会抛。
         return False, (
             f"截图文件不存在或无法访问（{path}）：{exc}。"
             "可能是文件被清理掉了，请重新截图。"
         )
 
-    if not path.is_file():
+    if not is_file:
         return False, f"截图路径不是文件（{path}），请重新截图。"
 
     # 检查 2：大小。byte_size <= 0 说明 bsk 没报大小，这时跳过比较而不是误判失败。
@@ -446,33 +363,28 @@ def cleanup_shots(
     if not root.is_dir():
         return 0
 
-    entries: list[os.DirEntry[str]] = []
-    try:
-        with os.scandir(root) as it:  # 用 scandir：一次遍历同时拿到名字和 stat
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        sub = entry.path
-                        try:
-                            with os.scandir(sub) as sub_it:
-                                entries.extend(sub_it)
-                        except OSError:
-                            continue  # 子目录读不了就跳过它，别影响其它目录
-                    elif entry.is_file(follow_symlinks=False):
-                        entries.append(entry)
-                except OSError:
-                    continue
-    except OSError:
-        return 0
+    # make_shot_path 把文件放在 <directory>/shots/<session_id>/ 下，比 directory 深两层，
+    # 所以要递归。但**只递归 shots 子目录**，root 下平级的其它文件一律不碰
+    # （否则用户放在同级的文件会被误删）。
+    # 兼容另一种调用方式：有人可能直接把 shots 目录本身传进来，那就从它开始扫。
+    shots_root = root / "shots"
+    scan_root = shots_root if shots_root.is_dir() else root
+
+    entries: list[str] = []
+    # onerror 吞掉单个目录的权限错误：某个子目录读不了不该让整轮清理失败。
+    for current, _dirs, files in os.walk(scan_root, onerror=lambda _e: None):
+        current_path = Path(current)
+        for name in files:
+            entries.append(str(current_path / name))
 
     now = time.time()
     stats: dict[str, tuple[float, float]] = {}  # path -> (mtime, size)
-    for entry in entries:
+    for file_path in entries:
         try:
-            info = entry.stat(follow_symlinks=False)
+            info = os.stat(file_path)
         except OSError:
             continue  # 文件在遍历过程中被删掉了，正常现象
-        stats[entry.path] = (info.st_mtime, info.st_size)
+        stats[file_path] = (info.st_mtime, info.st_size)
 
     # 排序键用 (mtime, 路径)：路径只用来在 mtime 相同时保证顺序稳定，不参与业务判断。
     ordered = sorted(stats.items(), key=lambda kv: (kv[1][0], kv[0]), reverse=True)
