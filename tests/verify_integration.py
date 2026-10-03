@@ -206,20 +206,75 @@ async def run() -> int:
         except Exception as exc:  # noqa: BLE001
             record("诊断信息可用", False, repr(exc))
 
-        # --- 10. 错误路径：不存在的会话应归类为可重建 ---
+        # --- 10. ★ 会话过期 → 自动重建 → 重试成功（真实 daemon）---
+        #
+        # 这是**最有价值的真实用例**：模拟"会话空闲 5 分钟被 bsk 回收"后，
+        # 插件能否自动重建并让调用方无感。
+        #
+        # 做法：先正常建一个会话，然后**绕过管理器**用 runner 直接把它停掉
+        # （于是管理器仍以为它活着），接着发一条命令 —— 必然收到 not_found，
+        # 触发重建 + 重试。
+        #
+        # ⚠️ 早先这里写的是"用假 session id 让命令失败"，那是**错的**：
+        #    execute 会先按 key 懒创建一个**真实**会话，而我们用假 id 去 observe
+        #    得到的 not_found 并不是"我们的会话死了"，于是重建时不会去停旧会话
+        #    （按设计 not_found 路径不 stop 旧会话，因为 bsk 说它不存在了），
+        #    结果那个真实会话被遗弃 → 泄漏。
+        #    真实代码的 args builder 永远用传入的 sid，所以上述写法纯属测试自身
+        #    的构造错误。改用"真的让会话过期"才既真实又无泄漏。
         try:
             from bsk.errors import BskSessionGone
 
-            await service.sessions.execute(
-                "never-created-key",
-                lambda sid: ["observe", "--session", "zzzz", "--json"],
-                timeout=5.0,
+            stale_key = "integration-test:expired"
+            stale = await service.sessions.acquire(stale_key)
+            stale_id = stale.session_id
+            created_session_ids.add(stale_id)
+
+            # 绕过管理器直接停掉它 —— 管理器并不知道，仍持有它的 id。
+            out_of_band = await service.runner.run(
+                ["session", "stop", stale_id, "--json"], timeout=20
             )
-            record("错误路径分类", False, "本应抛错却成功了")
-        except BskSessionGone:
-            record("错误路径分类", True, "not_found 正确归类为 BskSessionGone")
+            record(
+                "构造会话过期场景（绕过管理器停掉它）",
+                out_of_band.exit_code == 0,
+                f"停掉了 {stale_id!r}",
+            )
+
+            # 现在发一条命令：应当先收到 not_found，然后自动重建并成功。
+            before_rebuild = (service.sessions.stats().get("counters") or {}).get(
+                "not_found_rebuilds", 0
+            )
+            observation = await service.observe(stale_key)
+            after_rebuild = (service.sessions.stats().get("counters") or {}).get(
+                "not_found_rebuilds", 0
+            )
+            new_session = await service.sessions.acquire(stale_key)
+            created_session_ids.add(new_session.session_id)
+
+            record(
+                "★ 会话过期后自动重建并重试成功",
+                after_rebuild > before_rebuild
+                and bool(observation.text or observation.title),
+                f"重建次数 {before_rebuild}→{after_rebuild}，"
+                f"新会话={new_session.session_id!r}，标题={observation.title!r}",
+            )
+            record(
+                "重建后拿到**不同**的会话 id",
+                new_session.session_id != stale_id,
+                f"{stale_id!r} → {new_session.session_id!r}",
+            )
+        except BskSessionGone as exc:
+            record(
+                "★ 会话过期后自动重建并重试成功",
+                False,
+                f"重建后仍然 not_found（重试已用尽）：{exc.friendly}",
+            )
         except Exception as exc:  # noqa: BLE001
-            record("错误路径分类", False, f"意外的异常类型：{type(exc).__name__}: {exc}")
+            record(
+                "★ 会话过期后自动重建并重试成功",
+                False,
+                f"意外异常：{type(exc).__name__}: {exc}",
+            )
 
     finally:
         # --- 清理：必须显式 stop，且只用精确 id ---
@@ -235,6 +290,19 @@ async def run() -> int:
             #   从而误报。这里用 daemon 的实际会话清单做差集比对。
             remaining_ids = await _daemon_session_ids(service)
             leaked = remaining_ids & created_session_ids
+
+            # ★ 兜底强清：万一管理器漏掉了某个我们创建的会话（例如上面那个
+            #   "绕过管理器停掉"的用例留下的尾巴），这里按**精确 id** 补刀。
+            #   绝不能因为"管理器说它已清空"就相信真的清空了 —— daemon 才是
+            #   事实来源。补刀同样只用精确 id，绝不使用 --all。
+            if leaked:
+                for sid in sorted(leaked):
+                    await service.runner.run(
+                        ["session", "stop", sid, "--json"], timeout=20
+                    )
+                remaining_ids = await _daemon_session_ids(service)
+                leaked = remaining_ids & created_session_ids
+
             record(
                 "清理后本测试的会话无残留",
                 not leaked,

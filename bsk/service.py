@@ -401,14 +401,42 @@ class BskService:
         Note:
             这是只读操作，所以 ``allow_uncertain=True``：即使上一次操作结果未知，
             看一眼页面也是安全的，而且正是用户判断"到底发生了什么"所需要的。
+
+        Note:
+            ★ 如果这条命令触发了**会话重建**（原会话被 bsk 空闲回收），
+            返回的页面会是**空白页** —— 实测确认：重建后 ``RootWebArea``
+            没有标题、``text`` 只剩几十个字符、``ref_count=0``。
+
+            这一点必须让模型知道，否则它会把"空白页"当成"这个网页本来就
+            没内容"来回答用户。所以重建时往 ``text`` 前面插一句明确提示
+            （``text`` 是模型唯一会读到的字段）。
         """
+        counters_before = self.sessions.stats().get("counters", {})
+        rebuilds_before = counters_before.get("not_found_rebuilds", 0)
+
         result = await self.sessions.execute(
             key,
             lambda sid: ["observe", "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_OBSERVE),
             allow_uncertain=True,
         )
-        return parse_observation(result.data if isinstance(result.data, dict) else {})
+        observation = parse_observation(
+            result.data if isinstance(result.data, dict) else {}
+        )
+
+        counters_after = self.sessions.stats().get("counters", {})
+        rebuilds_after = counters_after.get("not_found_rebuilds", 0)
+        if rebuilds_after > rebuilds_before:
+            # 会话是刚刚重建的，页面状态没有恢复 —— 补一句让模型别误判。
+            observation.text = (
+                "（注意：浏览器会话刚刚因空闲过久被回收并自动重建，"
+                "当前是**新开的空白页**，之前打开的网页和填过的内容已经丢失。"
+                "如果用户之前在浏览某个页面，需要重新用 bsk_open 打开那个网址。）\n"
+                + observation.text
+            )
+            logger.info("会话 %s 在读取时被重建，已在返回内容里标注页面已重置", key)
+
+        return observation
 
     def render_page(self, observation: PageObservation) -> str:
         """把页面观察渲染成给模型看的文本，并做长度限制。"""
