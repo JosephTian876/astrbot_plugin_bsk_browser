@@ -218,42 +218,68 @@ L1 page
 
 ## 6. 测试策略
 
-**分四层，缺一不可**。前两层不需要任何外部依赖，后两层需要真实环境。
+**分四层 + 专项验证**。前两层不需要任何外部依赖，后两层需要真实环境。
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机 | ❌ | ❌ | `tests/test_*.py` |
-| L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `tests/verify_astrbot_contract.py` |
-| L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发用例 | ✅ | ✅ | `tests/verify_integration.py` |
-| L4 工具层端到端 | **直接 await `main.py` 里的 6 个工具函数**，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `tests/verify_tools_e2e.py` |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机 | ❌ | ❌ | `tests/test_*.py`（468 个用例） |
+| L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
+| L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与**会话过期自动重建** | ✅ | ✅ | `verify_integration.py` |
+| L4 工具层端到端 | **直接 await `main.py` 里的 6 个工具函数**，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
 
 **为什么必须有 L4**：L2 只证明工具"注册成功"，L3 只走到服务层。工具函数内部那层
 （URL 校验、权限判定、`bsk_screenshot` 的 async generator、异常是否被吞掉）
 只有 L4 能覆盖 —— 而那正是最容易出 bug、且出错时用户直接看到堆栈的地方。
+
+**专项验证**（各自针对一类"单元测试覆盖不到"的风险）：
+
+| 脚本 | 针对的风险 | 需要浏览器 |
+|---|---|---|
+| `verify_tool_execution_chain.py` | 走 **AstrBot 真实工具执行器**（`call_local_llm_tool` + partial 绑定 + async generator 消费），而非直接调函数 | ✅ |
+| `verify_restart_real.py` | **跨进程**验证"强杀后重启自愈"，含他人会话干扰项 | ✅ |
+| `verify_recover_real.py` | journal 恢复逻辑对**真实 daemon** 的行为（含碰撞防护） | ✅ |
+| `verify_journal_safety.py` | 碰撞防护：id 相同但窗口号不同时**一条 stop 都不发** | ❌ |
+| `verify_browser_ambiguity.py` | 多浏览器歧义：1 个免配置 / ≥2 报错 / 已配置尊重配置 | ❌ |
+| `verify_config_pipeline.py` | 配置从文件 → `AstrBotConfig` → `Settings` → **实际 bsk 命令行参数**的完整贯通 | ❌ |
+| `verify_config_type.py` / `verify_config_consistency.py` | 配置来源形态（dict vs `AstrBotConfig` 对象）、schema 与代码默认值一致 | ❌ |
+| `verify_install.py` | 从**已提交文件**导出干净副本并加载，验证"别人拿到仓库能用" | ❌ |
+| `verify_discovery.py` | AstrBot **自己的插件发现函数**能否找到本插件 | ❌ |
+| `verify_failure_ux.py` | 环境未就绪时的提示质量（不能是 Python 堆栈） | ❌ |
+| `verify_stop_timing_real.py` | `session stop` 真实耗时（为超时预算提供数据依据） | ✅ |
+| `verify_wait_navigation_real.py` | 新增暴露的 `wait_for_navigation` 动作真实可用且只读 | ✅ |
+| `verify_release_ready.py` | 发布前自检（34 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
 
 **运行方式**（用 AstrBot 自带解释器，因为插件就跑在它上面）：
 
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser
-& $py -m unittest discover -s tests        # L1
+& $py -m unittest discover -s tests        # L1（468 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）
-& $py tests\verify_config_consistency.py   # 配置默认值一致性
+& $py tests\verify_release_ready.py        # 发布前自检
 ```
 
 **注意**：本机 `pytest` 不可用（`ModuleNotFoundError`），全部测试用 `unittest`。
 
-**L3/L4 的强制安全边界**（这两个脚本会真的操作浏览器）：
+**L3/L4 的强制安全边界**（这些脚本会真的操作浏览器）：
 只访问 `example.com`；**绝不**借用用户标签页；不做 click/fill/press/upload/download/evaluate；
 **绝不**使用 `session stop --all`（会误停用户的 DSH 会话）；结束时按精确 id 清理自己的会话。
 断言"自己的会话没了"时，**只比对自己创建的 session id**，不能断言"浏览器会话数为 0"
-（那会把别人的会话算进来而误报）。
+（那会把别人的会话算进来而误报）。并且**以 daemon 为事实来源**：清理后再查一次
+`session list`，必要时按精确 id 补刀，不要只信管理器自述"已清空"。
 
 **L2/L4 的路径前提**：AstrBot 用 `__import__("data.plugins.<目录>.main")` 加载插件，
 所以脚本需要把 `~/.astrbot` 放进 `sys.path`，且插件要真的安装在
 `~/.astrbot/data/plugins/astrbot_plugin_bsk_browser/` 下。脚本已自行处理路径。
+
+**★ 所有 import astrbot 的测试脚本必须先 `os.environ.setdefault("ASTRBOT_ROOT", ...)`**：
+AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当前工作目录**
+（`astrbot_path.py:29-35`），会在项目里生成 `data/cmd_config.json`
+（AstrBot 主配置，含 provider API 密钥与管理员 QQ 号）—— 而本仓库是要公开发布的。
+这个坑**栽过 3 次**，现已由 `verify_release_ready.py` 静态扫描（AST 解析真实 import
+语句）自动拦截。
 
 ---
 
@@ -269,6 +295,22 @@ cd D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser
 | 4 | **截图清理失效** | `cleanup_shots` 只下探一层，而文件写在 `shots/<session>/` 两层 | 清理永远返回 0，磁盘无限增长 | `test_shots.py` |
 | 5 | **配置项形同虚设** | 各命令硬编码超时，忽略用户的 `command_timeout_sec` | 用户调大超时对慢页面毫无帮助 | `test_service.py` |
 | 6 | **权限提示与实现相反** | `validate_settings` 的文案说白名单"不生效"，实际是白名单优先 | 用户按提示操作得到相反结果 | `test_config.py` |
+| 7 | **多浏览器时静默随机选** | `probe_browser` 只在恰好 1 个时自动选，多个时返回空 → 交 bsk 自选；且 README 已承诺"会报错"但代码没做 | 用户连了 2 个浏览器时"有时候对有时候不对"，无从排查 | `verify_browser_ambiguity.py` |
+| 8 | **测试自身泄漏会话** | 某用例把假 id `"zzzz"` 写进 args builder，导致懒创建的真实会话在重建时被遗弃 | 全量回归后 daemon 残留会话 | `verify_integration.py` 的差集断言 + 兜底强清 |
+| 9 | **README 与实现方向相反** | `session_scope:"user"` 说"跨群共用"，实际键含 umo → 跨群独立 | 用户按文档理解会误判资源占用 | README 核对报告 |
+
+### 6.2 已确认的**固有行为**（不是 bug，但必须如实告知）
+
+这些是 bsk / 浏览器的固有性质，改不掉，只能让用户和模型都知道：
+
+| 行为 | 实测证据 | 应对 |
+|---|---|---|
+| **会话回收重建后，页面状态丢失** | 新会话停在空白页（`RootWebArea` 无标题、`text` 仅 61 字符、`ref_count=0`） | README 如实描述；`service.observe()` 检测到重建时在返回文本前插入提示，避免模型把空白页当成"网页没内容" |
+| **`session stop` 偶发瞬时失败** | bsk 0.3.2 会返回 `RpcError{ProtocolError,"Background execution cleanup timed out"}` | 已加有界重试（3 次）；journal + `recover_orphans()` 兜底 |
+| `label` 常为空字符串 | `bsk browsers --json` 的 `label: ""` | 只用 `instance_id` 指定浏览器；展示时回退 `browser_name` |
+| `snapshot` 与 `observe` 输出等价 | 实测逐字节相同且都不带截图 | 只用 `observe`，避免多花一倍时间 |
+| `observe` 无独立 title/url 字段 | 只能从 `RootWebArea "..."` 正则提取 | `bsk/pages.py` 负责解析 |
+| observe 视口 ≠ 截图像素 | 910x604 vs 1850x1208（DPR≈2） | 不要用 observe 坐标点截图位置 |
 
 ---
 
