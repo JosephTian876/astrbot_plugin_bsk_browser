@@ -78,7 +78,12 @@ DEFAULT_BROWSER_INSTANCE_ID = ""
 """目标浏览器实例 ID。空 = 自动选择唯一已连接的浏览器。"""
 
 DEFAULT_COMMAND_TIMEOUT_SEC = 60.0
-"""单条 bsk 命令的超时（秒）。必须 < 120，见 ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``。"""
+"""所有 bsk 命令的超时（秒）。必须 < 120，见 ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``。
+
+它是**全局**超时：每个命令还有一个内置的下限建议值（见 ``service.py`` 的
+``TIMEOUT_*``），最终超时 = ``max(内置下限, 本项)``。所以调大它一定能生效，
+调小它则不会把慢命令压到下限以下。
+"""
 
 DEFAULT_MAX_SESSIONS = 3
 """同时可存在的浏览器会话数上限。"""
@@ -108,9 +113,14 @@ DEFAULT_MAX_PAGE_CHARS = 3000
 ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC = 120.0
 """AstrBot 单次工具调用的时间上限（秒）。
 
-这是**框架侧**的硬限制：到点就会掐断本次工具调用。
-所以我们自己的 ``command_timeout_sec`` 必须明显小于它，让 bsk 先超时、
-由我们把超时翻译成一句模型能看懂的中文，而不是被框架从外面打断。
+这是**框架侧**的默认限制（``core/agent/run_context.py:19``、
+``core/config/agent_runner.py:33``；可调项 ``agent_runner.config.misc.tool_call_timeout``）：
+到点就会掐断本次工具调用，抛 ``tool <name> execution timeout``。
+
+它**不是**本插件的 ``command_timeout_sec`` 的上界来源（那是
+``COMMAND_TIMEOUT_MAX_SEC``），而是"用户还得去把框架这一侧也放宽"的另一处开关：
+全页截图的内置下限是 180 秒（见 ``service.TIMEOUT_FULLPAGE``），而本项默认 120 秒，
+所以框架不放宽的话，全页截图一定会先被框架掐断。
 """
 
 BSK_SESSION_RECLAIM_SEC = 300.0
@@ -126,6 +136,10 @@ COMMAND_TIMEOUT_MAX_SEC = 110.0
 
 上界取 110 而不是 119：留 10 秒余量给 AstrBot 侧的结果处理与网络往返，
 避免出现"bsk 刚好返回、框架已经掐断"的临界情况。
+
+在新语义（最终超时 = ``max(内置下限, 本项)``）下这个上界仍然合理：
+它必须**严格小于** ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``（120），这样即便用户把它
+拉满，插件内部也总有时间把超时翻译成中文提示，而不是被框架从外面打断。
 """
 
 IDLE_RELEASE_MIN_SEC = 60.0
@@ -325,7 +339,10 @@ class Settings:
     """目标浏览器的 instance_id。空字符串 = 自动选择唯一已连接的浏览器。"""
 
     command_timeout_sec: float
-    """单条 bsk 命令的超时（秒）。"""
+    """所有 bsk 命令的超时（秒）。
+
+    最终超时 = ``max(该命令的内置下限建议值, 本项)``，见 ``service.BskService._timeout``。
+    """
 
     max_sessions: int
     """同时可存在的浏览器会话数上限。"""
@@ -428,10 +445,13 @@ def validate_settings(s: Settings) -> list[str]:
     if timeout is not None and timeout >= ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC:
         problems.append(
             f"`command_timeout_sec` 设成了 {timeout:g} 秒，超过了 AstrBot 单次工具调用"
-            f"的 {ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC:g} 秒上限。AstrBot 会在命令返回之前就掐断"
-            "这次调用，机器人只会看到一句失败，而浏览器那边可能还在动。"
+            f"的 {ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC:g} 秒上限。这一项是所有 bsk 命令的"
+            "统一超时，值得再大也没用：AstrBot 会在命令返回之前就掐断这次调用，"
+            "机器人只会看到一句失败，而浏览器那边可能还在动。"
             f"建议改到 {DEFAULT_COMMAND_TIMEOUT_SEC:g} 秒左右"
-            "（插件最多只接受 110 秒）；整页截图这类耗时操作请拆成多步。"
+            "（插件最多只接受 110 秒）；整页截图这类耗时操作还需要同时把 AstrBot 的"
+            "`agent_runner.config.misc.tool_call_timeout`（默认 120 秒）一起调大，"
+            "否则只调本项仍然会在 120 秒处被打断。"
         )
 
     idle = _num(s.idle_release_sec)

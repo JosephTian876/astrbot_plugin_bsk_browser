@@ -458,13 +458,25 @@ async def group_permission() -> None:
         f"items={items!r} exc={gen_exc!r}",
     )
 
-    # --- 1.8 权限拒绝不产生任何会话（再确认一次）---
+    # --- 1.8 只有 1.4 那一次放行产生了会话，其余拒绝路径一个都不许有 ---
+    # 注意：1.4 是**故意**真实打开一次浏览器的（证明 admin_only=False 确实放行），
+    # 所以这里允许且仅允许它那一个会话出现，其余 key 必须始终为空。
     final = await daemon_session_ids()
+    allowed_sid = session_id_for(inst_open, UMO_NONADMIN)
+    expected_new = {allowed_sid} if allowed_sid else set()
+    unexpected = final - before - expected_new
+    denied_keys_empty = all(
+        not session_id_for(inst, key) for key in (UMO_BROWSER,)
+    ) and not session_id_for(inst_wl, UMO_BROWSER)
     record(
-        "1.8 整组权限用例未产生额外会话",
-        final == before,
-        f"before={sorted(before)} after={sorted(final)}",
+        "1.8 除 1.4 的放行外，所有拒绝路径都没产生会话",
+        not unexpected and denied_keys_empty,
+        f"before={sorted(before)} after={sorted(final)}；"
+        f"1.4 放行的会话={allowed_sid or '(无)'}；意外新增={sorted(unexpected) or '无'}",
     )
+
+    # 收尾：把 1.4 打开的那个会话关掉，不留到后面（只按 key 精确关闭）。
+    await call(inst_open.bsk_close, ev_nonadmin)
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +601,12 @@ async def group_real_browser() -> None:
         )
         # 顺序保证：图片先 yield（会被框架 set_result 发给用户），文本后 yield（回灌模型）
         if image_items and text_items:
+            img_idx = min(items.index(i) for i in image_items)
+            txt_idx = max(items.index(i) for i in text_items)
             record(
                 "3.7 图片先于文本 yield（符合框架消费顺序）",
-                items.index(image_items[0]) < len(items) - 1 - items[::-1].index(text_items[-1]),
+                img_idx < txt_idx,
+                f"图片下标={img_idx}，文本下标={txt_idx}，"
                 f"顺序={[type(i).__name__ for i in items]}",
             )
 
@@ -865,6 +880,13 @@ async def cleanup() -> None:
 
     ★ 断言只比对"**本测试创建的** session id 是否还在 daemon 里"，
       不断言 daemon 会话数为 0 —— 那会把用户自己的 DSH 会话算进来而误报。
+
+    这里分两步记录，刻意不把两者混为一谈：
+
+    1. **7.1**：插件的 ``terminate()`` 有没有留下残留 —— 这是对**被测代码**的断言，
+       失败了就是真实的健壮性问题，如实报出来。
+    2. **7.2**：测试自己兜底清理（按精确 id 重试 stop）的结果 —— 这是**测试的卫生要求**，
+       保证跑完不给用户留浏览器窗口。它通过**不代表** 7.1 的缺陷不存在。
     """
     banner("清理：关闭本测试创建的所有会话")
 
@@ -875,21 +897,56 @@ async def cleanup() -> None:
         with contextlib.suppress(Exception):
             await inst.terminate()
 
+    # --- 7.1 插件自身 terminate() 的清理结果 ---
     try:
         remaining = await daemon_session_ids()
-        leaked = remaining & CREATED_SESSION_IDS
-        record(
-            "7.1 清理后本测试创建的会话无残留",
-            not leaked,
-            (
-                f"泄漏 {sorted(leaked)}"
-                if leaked
-                else f"已全部关闭（daemon 里还有 {len(remaining - CREATED_SESSION_IDS)} 个"
-                "不属于本测试的会话）"
-            ),
-        )
     except Exception as exc:  # noqa: BLE001
-        record("7.1 清理后本测试创建的会话无残留", False, repr(exc))
+        record("7.1 插件 terminate() 后本测试的会话无残留", False, repr(exc))
+        return
+
+    leaked = remaining & CREATED_SESSION_IDS
+    record(
+        "7.1 插件 terminate() 后本测试的会话无残留",
+        not leaked,
+        (
+            f"残留 {sorted(leaked)}（terminate() 未能停掉）"
+            if leaked
+            else f"已全部关闭（daemon 里还有 {len(remaining - CREATED_SESSION_IDS)} 个"
+            "不属于本测试的会话）"
+        ),
+    )
+
+    if not leaked:
+        return
+
+    # --- 7.2 测试兜底清理：逐个按精确 id 重试 stop（绝不用 --all）---
+    still_leaked: set[str] = set()
+    for sid in sorted(leaked):
+        for attempt in range(1, 4):
+            try:
+                result = await RUNNER.run(["session", "stop", sid], timeout=30)
+                if result.ok:
+                    break
+                note(f"第 {attempt} 次 stop {sid} 失败：{result.stderr[:150]}")
+            except Exception as exc:  # noqa: BLE001
+                note(f"第 {attempt} 次 stop {sid} 异常：{exc!r}")
+            await asyncio.sleep(1.0)
+        else:
+            still_leaked.add(sid)
+
+    with contextlib.suppress(Exception):
+        final = await daemon_session_ids()
+        still_leaked |= final & CREATED_SESSION_IDS
+
+    record(
+        "7.2 测试兜底清理（按精确 id 重试 stop）成功",
+        not still_leaked,
+        (
+            f"仍残留：{sorted(still_leaked)}"
+            if still_leaked
+            else f"已按精确 id 停掉 {sorted(leaked)}"
+        ),
+    )
 
 
 def main() -> int:

@@ -1,0 +1,14 @@
+# 本插件**没有任何第三方依赖**，只使用 Python 标准库。
+#
+# 因此这个文件是空的（只有注释），这样做的原因：
+#   1. 让使用者一眼看出不需要 pip install 任何东西；
+#   2. AstrBot 会检查插件目录下的 requirements.txt 并尝试安装其中的依赖
+#      （star_manager.py:359；文件不存在时会直接跳过）。
+#      留一个空文件可以明确表达"确实没有依赖"，而不是"作者忘了写"。
+#
+# 具体用到的标准库：asyncio、contextlib、dataclasses、json、logging、
+# os、re、shutil、subprocess、tempfile、threading、time、typing、pathlib
+#
+# 唯一的外部程序依赖是 `bsk`（腾讯 BrowserSkill 的命令行工具），
+# 但它**不是** Python 包，必须由用户自行安装，本插件不捆绑、不分发。
+# 安装方式见 README 第 3 节。

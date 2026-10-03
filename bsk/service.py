@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -47,33 +48,51 @@ logger = logging.getLogger(__name__)
 __all__ = ["BskService", "ActionResult", "ShotPayload"]
 
 
-# --- 各命令的超时（秒）---
+# --- 各命令的**内置下限建议值**（秒）---
+#
+# 语义：这些值回答的是"这条命令**至少**需要多久"，它们是**下限**，不是最终超时。
+# 最终超时只有一个来源 —— ``BskService._timeout()``，规则也只有一条：
+#
+#     最终超时 = max(内置下限, 用户配置的 command_timeout_sec)
 #
 # 依据：ARCHITECTURE §5 D6 与实机耗时（observe 0.06-0.09s、navigate 0.62-1.44s）。
-# 原则是**外层超时必须大于 bsk 自身的 --timeout**，否则我们会先把它掐掉，
-# 而它其实正要成功返回。
+# 下限的第一条原则是**外层超时必须大于 bsk 自身的 --timeout**，否则我们会先把它
+# 掐掉，而它其实正要成功返回。
 
 TIMEOUT_QUICK = 5.0
-"""status / browsers / session list 这类只读命令。"""
+"""status / browsers / session list 这类只读命令的下限（它们本身几乎是瞬时的）。"""
 
 TIMEOUT_OBSERVE = 15.0
-"""observe。实测极快，但复杂页面会慢，留足余量。"""
+"""observe 的下限。实测极快，但复杂页面会慢，留足余量。"""
 
 TIMEOUT_ACTION = 30.0
-"""click / fill / press 等交互。与 bsk 自身默认 --timeout 30s 对齐。"""
+"""click / fill / press 等交互的下限。与 bsk 自身默认 --timeout 30s 对齐。"""
 
 TIMEOUT_NAVIGATE = 45.0
-"""navigate。必须 **大于** bsk 自身默认的 30s。"""
+"""navigate 的下限。必须 **大于** bsk 自身默认的 30s。"""
 
 TIMEOUT_SCREENSHOT = 30.0
-"""视口截图。"""
+"""视口截图的下限。"""
 
 TIMEOUT_FULLPAGE = 180.0
-"""全页截图。bsk 自身默认 2 分钟，外层留余量。
+"""全页截图的下限。bsk 自身默认 2 分钟，外层留余量。
 
-注意：这**超过** AstrBot 工具调用的 120 秒上限，所以全页截图必须由用户
-显式调大 ``command_timeout_sec`` 才可能成功；否则框架会先掐断。
-这一点已写进 README 的已知限制。
+⚠️ **光把本插件的 ``command_timeout_sec`` 调大是不够的**，全页截图要真正跑通，
+需要用户**两处一起调大**：
+
+1. 本插件的 ``command_timeout_sec``（WebUI → 插件配置，最多只能填 110 秒）；
+2. **AstrBot 的 ``tool_call_timeout``** —— 默认 **120 秒**，见源码
+   ``core/agent/run_context.py:19`` 与 ``core/config/agent_runner.py:33``；
+   它是可调的，配置项位于 ``agent_runner.config.misc.tool_call_timeout``。
+
+第 2 条才是真正的卡点：本插件给全页截图准备的下限是 180 秒，而
+``command_timeout_sec`` 被夹在 110 秒以内（见 ``config.COMMAND_TIMEOUT_MAX_SEC``），
+所以框架那 120 秒不放宽的话，bsk 永远没机会跑完 —— 用户看到的会是框架自己抛的
+``tool ... execution timeout``，而不是我们那句"网页响应太慢"的友好提示。
+
+注意这**不代表**这里的 180 会被框架的 120 改小：两者是"谁先到点谁说了算"，
+我们只能保证自己不提前掐断，框架侧的上限必须由用户自己放宽。
+这一点已写进 README 的已知限制与 ``_conf_schema.json`` 的配置说明。
 """
 
 
@@ -133,13 +152,50 @@ class BskService:
     # 基础设施
     # ------------------------------------------------------------------
 
+    def _timeout(self, builtin: float) -> float:
+        """把内置建议值与用户配置合成最终超时。
+
+        规则只有一条（见模块顶部 ``TIMEOUT_*`` 的说明）::
+
+            最终超时 = max(builtin, settings.command_timeout_sec)
+
+        - ``builtin`` 是"这个命令至少需要多久"（下限），例如 ``navigate`` 是 45 秒，
+          必须大于 bsk 自身的 ``--timeout`` 30 秒，否则我们会先把它掐掉。
+        - ``settings.command_timeout_sec`` 是"用户愿意等多久"，已经由
+          :mod:`bsk.config` 夹取到 ``[5, 110]``。
+        - 取较大值，两者都不会被违背。
+
+        Args:
+            builtin: 该命令的内置下限建议值（``TIMEOUT_*`` 之一）。
+
+        Returns:
+            实际传给子进程的超时秒数。
+
+        Note:
+            这里用 ``getattr`` 而不是 ``self.settings.command_timeout_sec``：
+            配置对象可能是测试桩、旧版本的 ``Settings``、或任何"同名属性"的
+            鸭子类型对象（``SessionManager`` 出于同样的理由也这么做）。
+            缺属性时**回退到内置下限**，绝不让超时变成 0 或抛 ``AttributeError``
+            ——那会把一条本来能成功的命令直接掐死在起点。
+        """
+        configured = getattr(self.settings, "command_timeout_sec", None)
+        if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+            # True/False 当超时没有意义；字符串/None 也不可信（正常入口
+            # parse_settings 已经把它们收敛成 float 了，这里只是兜底）。
+            return float(builtin)
+        configured = float(configured)
+        if not math.isfinite(configured) or configured <= 0:
+            # nan / inf 参与 max() 的结果不可靠（inf 会变成"永不超时"）。
+            return float(builtin)
+        return max(float(builtin), configured)
+
     async def list_browsers(self) -> list[BrowserInstance]:
         """列出已连接的浏览器实例。
 
         用于：配置校验、错误提示里告诉用户有哪些可选实例。
         """
         result = await self.runner.run_or_raise(
-            ["browsers", "--json"], timeout=TIMEOUT_QUICK
+            ["browsers", "--json"], timeout=self._timeout(TIMEOUT_QUICK)
         )
         raw = result.data
         if not isinstance(raw, list):
@@ -164,7 +220,7 @@ class BskService:
             proc = subprocess.run(
                 [exe, "browsers", "--json"],
                 capture_output=True,
-                timeout=TIMEOUT_QUICK,
+                timeout=self._timeout(TIMEOUT_QUICK),
                 check=False,
             )
             if proc.returncode != 0:
@@ -206,7 +262,7 @@ class BskService:
         nav_result = await self.sessions.execute(
             key,
             lambda sid: ["navigate", url, "--session", sid, "--json"],
-            timeout=TIMEOUT_NAVIGATE,
+            timeout=self._timeout(TIMEOUT_NAVIGATE),
         )
         nav = NavigateResult.from_json(nav_result.data)
 
@@ -230,7 +286,7 @@ class BskService:
         result = await self.sessions.execute(
             key,
             lambda sid: ["observe", "--session", sid, "--json"],
-            timeout=TIMEOUT_OBSERVE,
+            timeout=self._timeout(TIMEOUT_OBSERVE),
             allow_uncertain=True,
         )
         return parse_observation(result.data if isinstance(result.data, dict) else {})
@@ -299,7 +355,7 @@ class BskService:
         result = await self.sessions.execute(
             key,
             lambda sid: [*args, "--session", sid, "--json"],
-            timeout=TIMEOUT_ACTION,
+            timeout=self._timeout(TIMEOUT_ACTION),
             # 写类动作绝不允许在不确定态下执行 —— 那可能造成重复点击/重复提交。
             allow_uncertain=False,
         )
@@ -426,7 +482,7 @@ class BskService:
         directory = self.settings.screenshot_dir or self._default_shot_dir()
         out_path = make_shot_path(directory, key)
 
-        timeout = TIMEOUT_FULLPAGE if full_page else TIMEOUT_SCREENSHOT
+        timeout = self._timeout(TIMEOUT_FULLPAGE if full_page else TIMEOUT_SCREENSHOT)
         argv = ["screenshot", "--out", str(out_path)]
         if full_page:
             argv.append("--full-page")
@@ -472,7 +528,10 @@ class BskService:
             parts.append(f"{shot.byte_size / 1024:.0f} KB")
         text = "，".join(parts) + "。图片已直接发给你。"
         if full_page:
-            text += "（全页截图较慢，若经常超时可在插件配置里调大命令超时。）"
+            text += (
+                "（全页截图较慢。若经常超时，需要同时调大两处：插件配置里的"
+                "「单条命令超时」，以及 AstrBot 主配置里的 tool_call_timeout。）"
+            )
         return text
 
     def _default_shot_dir(self) -> str:
@@ -523,7 +582,7 @@ class BskService:
 
         try:
             result = await self.runner.run_or_raise(
-                ["status", "--json"], timeout=TIMEOUT_QUICK
+                ["status", "--json"], timeout=self._timeout(TIMEOUT_QUICK)
             )
             data = result.data if isinstance(result.data, dict) else {}
             info["daemon"] = {
@@ -572,7 +631,7 @@ class BskService:
         result = await self.sessions.execute(
             key,
             lambda sid: ["console", "--since", str(int(since)), "--session", sid, "--json"],
-            timeout=TIMEOUT_QUICK,
+            timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
         )
         return ConsoleLog.from_json(result.data if isinstance(result.data, dict) else {})
@@ -586,7 +645,7 @@ class BskService:
         result = await self.sessions.execute(
             key,
             lambda sid: ["network", "--since", str(int(since)), "--session", sid, "--json"],
-            timeout=TIMEOUT_QUICK,
+            timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
         )
         return ConsoleLog.from_json(result.data if isinstance(result.data, dict) else {})
