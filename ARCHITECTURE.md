@@ -183,34 +183,92 @@ L1 page
 
 工具返回给 LLM 的字符串必须包含**下一步该怎么做**（例如"会话已过期，已自动重建，请重试"），而不是抛裸异常。
 
-### D6：超时分层，外层必须大于内层
+### D6：超时采用「取较大值」的单一规则
 
-| 命令 | 建议超时 |
+**规则一句话**：`command_timeout_sec` 是所有 bsk 命令的超时；每个命令的内置值是**下限**，
+最终值 = `max(内置下限, command_timeout_sec)`。
+
+- 内置下限 = "这个命令至少需要多久"。例如 `navigate` 必须 **大于** bsk 自身的 `--timeout`
+  30s，否则我们会先把它掐掉、而它正要成功返回。
+- 用户配置 = "我愿意等多久"。
+- 取较大值，两者都不被违背。
+
+| 命令 | 内置下限 |
 |---|---|
-| status/browsers/session list/console/network | 5s |
+| status / browsers / session list / console / network | 5s |
 | observe | 15s |
 | session start | 30s |
 | navigate | 45s（必须 > bsk 自身默认 30s） |
 | screenshot 视口 | 30s |
 | screenshot --full-page | 180s |
 
-且必须**小于 AstrBot 工具调用上限 120s**，所以默认 `command_timeout_sec` 取 60，长截图场景需用户自行调大并知晓上限。
+**为什么不做更复杂的规则**（例如"快命令取 min、慢命令取 max"）：本插件的使用者是
+编程新手，配置项的行为必须能用一句话说清。复杂规则会带来解释成本和"为什么调了没用"
+的困惑 —— 而这正是改进前的老问题。
+
+**AstrBot 侧的上限**：AstrBot 的 `tool_call_timeout` 默认 **120 秒**
+（源码 `core/agent/run_context.py:19` 与 `core/config/agent_runner.py:33`），
+超时后框架会抛 `tool <name> execution timeout`。
+**但它是可调的**（`agent_runner.config.misc.tool_call_timeout`），
+所以全页截图（内置下限 180s）并非不可能，只是需要用户**两处一起调大**：
+本插件的 `command_timeout_sec` 与 AstrBot 的 `tool_call_timeout`。
+这一点必须写进 README 的已知限制里，否则用户会以为插件有 bug。
 
 ---
 
 ## 6. 测试策略
 
-**分三层，缺一不可**：
+**分四层，缺一不可**。前两层不需要任何外部依赖，后两层需要真实环境。
 
-| 层 | 范围 | 是否需要 AstrBot | 是否需要浏览器 |
-|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机 | ❌ | ❌ |
-| L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具成功注册、docstring schema 正确 | ✅ | ❌ |
-| L3 集成测试 | 真实调用 bsk：开→导航→读→截图→关，含并发与超时用例 | ✅ | ✅ |
+| 层 | 范围 | AstrBot | 浏览器 | 脚本 |
+|---|---|---|---|---|
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机 | ❌ | ❌ | `tests/test_*.py` |
+| L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `tests/verify_astrbot_contract.py` |
+| L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发用例 | ✅ | ✅ | `tests/verify_integration.py` |
+| L4 工具层端到端 | **直接 await `main.py` 里的 6 个工具函数**，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `tests/verify_tools_e2e.py` |
 
-L1 用 `pytest`，对 `runner` 用假的可执行文件（stub script）模拟各类退出码与编码，**不依赖真实 bsk**。
-L2 用 `D:\AstrBot\backend\python\python.exe` + `PYTHONPATH=D:\AstrBot\backend\app`。
-L3 需用户授权，且**必须**：只访问 `example.com`、不借用用户标签页、不用 `--all`、结束显式清理。
+**为什么必须有 L4**：L2 只证明工具"注册成功"，L3 只走到服务层。工具函数内部那层
+（URL 校验、权限判定、`bsk_screenshot` 的 async generator、异常是否被吞掉）
+只有 L4 能覆盖 —— 而那正是最容易出 bug、且出错时用户直接看到堆栈的地方。
+
+**运行方式**（用 AstrBot 自带解释器，因为插件就跑在它上面）：
+
+```powershell
+$py = "D:\AstrBot\backend\python\python.exe"
+cd D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser
+& $py -m unittest discover -s tests        # L1
+& $py tests\verify_astrbot_contract.py     # L2
+& $py tests\verify_integration.py          # L3（需要浏览器）
+& $py tests\verify_tools_e2e.py            # L4（需要浏览器）
+& $py tests\verify_config_consistency.py   # 配置默认值一致性
+```
+
+**注意**：本机 `pytest` 不可用（`ModuleNotFoundError`），全部测试用 `unittest`。
+
+**L3/L4 的强制安全边界**（这两个脚本会真的操作浏览器）：
+只访问 `example.com`；**绝不**借用用户标签页；不做 click/fill/press/upload/download/evaluate；
+**绝不**使用 `session stop --all`（会误停用户的 DSH 会话）；结束时按精确 id 清理自己的会话。
+断言"自己的会话没了"时，**只比对自己创建的 session id**，不能断言"浏览器会话数为 0"
+（那会把别人的会话算进来而误报）。
+
+**L2/L4 的路径前提**：AstrBot 用 `__import__("data.plugins.<目录>.main")` 加载插件，
+所以脚本需要把 `~/.astrbot` 放进 `sys.path`，且插件要真的安装在
+`~/.astrbot/data/plugins/astrbot_plugin_bsk_browser/` 下。脚本已自行处理路径。
+
+---
+
+## 6.1 已修复的真实 bug（回归测试守护，勿回退）
+
+记录这些是因为它们都属于"只有真实环境才暴露"的类型，改动相关代码时容易重新引入。
+
+| # | 缺陷 | 根因 | 表现 | 守护测试 |
+|---|---|---|---|---|
+| 1 | **stdin 自杀式取消** | `communicate()` 会在读取前关掉 stdin，而环境变量设了 `BSK_CANCEL_ON_STDIN_CLOSE=1`，bsk 把"stdin 被关"当成用户按 Ctrl-C | 随机的 `tool dispatch cancelled after extension cleanup`；并发 8 个 observe 只有 5 个成功 | `test_runner.py` + L3 的并发用例 |
+| 2 | **GBK 编码崩溃** | Windows 下 Python 默认用 cp936 解码，页面含阿拉伯文/俄文时抛 `UnicodeDecodeError`，且异常在 reader 线程抛出，主线程只看到 `None` | 读取任何多语言页面即崩，且报错信息毫无指向性 | `test_runner.py::TestEncoding` |
+| 3 | **VOM ref 前缀丢失** | 正则捕获组漏了 `e`，`@e1` 被存成 `"1"` | 传给 bsk `--ref` 的值非法，所有元素操作失效 | `test_pages.py` |
+| 4 | **截图清理失效** | `cleanup_shots` 只下探一层，而文件写在 `shots/<session>/` 两层 | 清理永远返回 0，磁盘无限增长 | `test_shots.py` |
+| 5 | **配置项形同虚设** | 各命令硬编码超时，忽略用户的 `command_timeout_sec` | 用户调大超时对慢页面毫无帮助 | `test_service.py` |
+| 6 | **权限提示与实现相反** | `validate_settings` 的文案说白名单"不生效"，实际是白名单优先 | 用户按提示操作得到相反结果 | `test_config.py` |
 
 ---
 
