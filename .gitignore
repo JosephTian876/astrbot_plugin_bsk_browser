@@ -26,6 +26,9 @@ runtime/
 shots/
 *.log
 
+# 真机实测报告（tests/verify_real_astrbot.py 的运行产物，不属于源码）
+test-reports/
+
 # 编辑器与系统
 .vscode/
 .idea/

@@ -2,7 +2,7 @@
 
 > 版本：v0.1.0 设计稿
 > 目标读者：实现该插件的工程师（含 subagent）
-> 依据：`D:\UwU\Documents\dshworkdir\astrbot-browserskill\research\` 下的 6 份调研报告
+> 依据：本仓库外的调研资料（6 份调研报告，未随仓库分发）
 
 ---
 
@@ -372,7 +372,7 @@ if not evaluation.ok:           # ← 不能省
 
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
-cd D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser
+cd <插件目录>                                 # 即本仓库根目录
 & $py -m unittest discover -s tests        # L1（580 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
@@ -437,7 +437,7 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当�
 
 ## 7. 版本控制
 
-- 仓库根 = `D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser\`（插件目录本身即仓库根，便于直接 clone 进 `data/plugins/`）
+- 仓库根 = 本仓库根目录（插件目录本身即仓库根，便于直接 clone 进 `data/plugins/`）
 - 分支模型：`main` 为稳定分支，功能在 `feat/*` 分支开发
 - 提交规范：Conventional Commits（`feat:` / `fix:` / `test:` / `docs:` / `chore:`）
 - 每个可工作状态打 tag（`v0.1.0` 等）

@@ -7,7 +7,7 @@
 1. 插件从 `~/.astrbot/data/plugins/` 被加载（AstrBot 真正读的那个目录）
 2. 用 AstrBot **自己的发现函数**确认它能被找到
 3. 用 AstrBot **自己的执行器**调用每一个工具
-4. 把结果落成一份可读的实测报告，供用户审阅（要求 #9）
+4. 把结果落成一份可读的实测报告（写入仓库内 `test-reports/`），供用户审阅（要求 #9）
 
 覆盖 7 个工具，包含两个新增的高风险/新配置能力（bsk_evaluate、全页截图超时）。
 
@@ -37,6 +37,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
 TESTS = PROJECT / "tests"
+REPORT_DIR = PROJECT / "test-reports"  # 运行产物，已在 .gitignore 中排除
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
 
@@ -332,8 +333,9 @@ async def main() -> int:
     # ------------------------------------------------------------------
     # 写入实测报告（供审阅，要求 #9）
     # ------------------------------------------------------------------
-    report_path = PROJECT.parent / "astrbot-browserskill" / "实测报告-AstrBot真机.md"
+    report_path = REPORT_DIR / "实测报告-AstrBot真机.md"
     try:
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
         failed = [r for r in RESULTS if not r[1]]
         lines = [
             "# AstrBot 真机实测报告",
