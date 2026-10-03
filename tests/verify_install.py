@@ -3,7 +3,7 @@
 验证的是**别人拿到这个仓库后能不能用起来**，而不是我本机能不能跑：
 1. 从一个干净的副本安装（排除开发产物），确认没有"只在源目录才能跑"的隐含依赖；
 2. 目录结构符合 AstrBot 发现规则（main.py 在插件目录根）；
-3. 用 AstrBot 的加载方式 import，6 个工具全部注册；
+3. 用 AstrBot 的加载方式 import，必需工具全部注册（并拒绝意料之外的工具名）；
 4. 实例化 + 生命周期可用；
 5. 不残留任何运行期目录（尤其不能生成 data/）。
 
@@ -183,7 +183,8 @@ print("__RESULT__" + json.dumps(out, ensure_ascii=False))
     else:
         c = payload["checks"]
         check("干净副本可加载", True, "")
-        expected = {
+        # ★ 必须存在的工具（少一个就是回归）。
+        required = {
             "bsk_open",
             "bsk_read",
             "bsk_act",
@@ -191,10 +192,24 @@ print("__RESULT__" + json.dumps(out, ensure_ascii=False))
             "bsk_close",
             "bsk_status",
         }
+        # 允许存在的额外工具（新增功能会加工具，不该让这个断言失败）。
+        #
+        # 为什么不用 `set(tools) == required`：那样的精确相等断言会在**每次
+        # 新增工具**时失败，把正常的功能演进报成回归（本文件初版就是如此，
+        # 加了 bsk_evaluate 之后必然误报）。但也**不能**只写成子集判断 ——
+        # 那样工具名写错（例如 bsk_clsoe）就检测不到了。
+        # 所以两边都查：required 必须齐全，且不能出现意料之外的名字。
+        allowed = required | {"bsk_evaluate"}
+        actual = set(c["tools"])
         check(
-            "6 个工具全部注册",
-            set(c["tools"]) == expected,
-            f"实际：{c['tools']}",
+            "6 个必需工具全部注册",
+            required.issubset(actual),
+            f"缺少：{sorted(required - actual)}" if not required.issubset(actual) else f"实际：{sorted(actual)}",
+        )
+        check(
+            "无意料之外的工具名（改名/拼错会被抓到）",
+            actual.issubset(allowed),
+            f"多出：{sorted(actual - allowed)}" if not actual.issubset(allowed) else "",
         )
         check("无 __del__（C3）", c["no_del"], "")
         check("有 terminate（C4）", c["has_terminate"], "")

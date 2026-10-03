@@ -343,24 +343,49 @@ def main() -> int:
     )
 
     # ---------------------------------------------------------------
-    # 6. 打包体积（插件市场对 zip 有上限，源码本身应远小于它）
+    # 6. 打包体积
     # ---------------------------------------------------------------
+    # 插件市场对上传 zip 有 16MB 上限。本检查的真正价值是**抓住"误提交大文件"**
+    # （例如把测试截图、视频、bsk 二进制提交进来），而不是卡一个好看的源码体积。
+    #
+    # 早先这里用 "< 1MB" 的硬阈值 —— 那是我当初拍的数，在合法的插件图标
+    # （logo.png，AstrBot 要求必须叫这个名字，约 92KB）存在后就会误报。
+    # 与其把阈值抬高了事，不如分成两条更有指向性的检查：
+    #   ① 相对**真实上限**留足余量（这才是市场会拒的原因）
+    #   ② 单个文件不得过大（真正导致体积失控的是某个大文件，不是文件数量）
     print("\n--- 打包体积 ---")
+    MARKET_ZIP_LIMIT_MB = 16.0
     total = 0
     file_count = 0
+    largest: tuple[str, int] = ("", 0)
     skip_dirs = {".git", "__pycache__", ".pytest_cache"}
     for path in PROJECT.rglob("*"):
         if not path.is_file():
             continue
         if any(part in skip_dirs for part in path.parts):
             continue
-        total += path.stat().st_size
+        size = path.stat().st_size
+        total += size
         file_count += 1
+        if size > largest[1]:
+            largest = (path.relative_to(PROJECT).as_posix(), size)
     mb = total / (1024 * 1024)
+
+    # ① 相对真实上限：留 8 倍余量（2MB），足够宽松又能在真出问题时报警
     check(
-        "源码体积合理（< 1MB，市场 zip 上限 16MB）",
-        mb < 1.0,
-        f"{file_count} 个文件，共 {mb:.2f} MB",
+        f"总体积远低于市场 zip 上限（{MARKET_ZIP_LIMIT_MB:.0f}MB）",
+        mb < 2.0,
+        f"{file_count} 个文件，共 {mb:.2f} MB（上限 {MARKET_ZIP_LIMIT_MB:.0f}MB）",
+    )
+
+    # ② 单文件检查：任何单个文件超过 1MB 都值得警惕（图标/许可文本都远小于它）
+    largest_mb = largest[1] / (1024 * 1024)
+    check(
+        "无异常大的单文件（>1MB 通常是误提交了产物）",
+        largest[1] < 1024 * 1024,
+        f"最大文件：{largest[0]}（{largest_mb:.2f} MB）"
+        if largest[0]
+        else "",
     )
 
     # ---------------------------------------------------------------

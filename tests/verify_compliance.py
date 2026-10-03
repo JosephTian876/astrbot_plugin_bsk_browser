@@ -208,9 +208,9 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------
-    # 10. 危险能力未开放
+    # 10. 危险能力的开放边界
     # ------------------------------------------------------------------
-    print("\n--- 10. 危险能力未暴露给模型 ---")
+    print("\n--- 10. 危险能力的开放边界 ---")
     source_files = [
         f
         for f in files
@@ -218,12 +218,45 @@ def main() -> int:
     ]
     all_src = "\n".join((PROJECT / f).read_text(encoding="utf-8") for f in source_files)
 
-    # evaluate（任意 JS）不应出现在任何发给模型的工具里
-    has_evaluate_tool = '"evaluate"' in all_src
+    # evaluate（在用户已登录页面里执行任意 JS）是**受控开放**的能力：
+    # 它确实存在（用户明确要求要），但必须满足三个条件才算合规：
+    #   1. 有独立开关，且**默认关闭**
+    #   2. 有"强制管理员"开关，且**默认开启**
+    #   3. 是独立工具，可以被 AstrBot 原生的 tool_permissions 单独控制
+    #      （如果把它塞进 bsk_act 的动作列表里，就无法单独管控了）
+    #
+    # 注意：这里**不能**再用 '"evaluate"' not in all_src 这种断言 ——
+    # 那是"功能不存在"的写法。功能现在是存在的、只是默认关着。
+    # 断言要跟着设计意图走，否则会把"按要求实现"判成"违规"。
+    import json as _json
+
+    schema = _json.loads((PROJECT / "_conf_schema.json").read_text(encoding="utf-8"))
+    eval_switch = schema.get("enable_evaluate", {})
+    eval_admin = schema.get("evaluate_require_admin", {})
+
     check(
-        "未向模型暴露 evaluate（执行任意 JS）",
-        not has_evaluate_tool,
-        "未在工具/动作清单中出现 evaluate",
+        "evaluate 有独立开关且默认关闭",
+        eval_switch.get("default") is False,
+        f"enable_evaluate 默认={eval_switch.get('default')!r}",
+    )
+    check(
+        "evaluate 有强制管理员开关且默认开启",
+        eval_admin.get("default") is True,
+        f"evaluate_require_admin 默认={eval_admin.get('default')!r}",
+    )
+    check(
+        "evaluate 是独立工具（非 bsk_act 的动作）",
+        "bsk_evaluate" in main_src,
+        "以独立 llm_tool 形式注册，可被框架原生 tool_permissions 单独管控",
+    )
+    # 独立工具意味着它必须自己出现在工具清单里、且 docstring 声明了参数
+    check(
+        "evaluate 的配置项写明了风险（不是只说'启用 JS 执行'）",
+        any(
+            kw in str(eval_switch.get("hint", "")) + str(eval_switch.get("description", ""))
+            for kw in ("已登录", "任意", "风险", "敏感")
+        ),
+        "配置说明中必须让用户明白它能在已登录页面里做任意事",
     )
 
     # ★ 检查 "session stop --all" 是否被**真的调用**。
