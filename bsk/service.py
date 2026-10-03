@@ -557,7 +557,8 @@ class BskService:
             friendly=(
                 f"不支持的动作「{action}」。可用的有："
                 "click / fill / press / select / hover / scroll_to / wheel / "
-                "focus / blur / navigate_back / navigate_forward / reload。"
+                "focus / blur / navigate_back / navigate_forward / reload / "
+                "wait_for_navigation。"
             ),
         )
 

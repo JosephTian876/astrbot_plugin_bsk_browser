@@ -355,10 +355,12 @@ class BskBrowserPlugin(Star):
         """在当前浏览器页面上执行一个操作（点击、输入、按键、滚动等）。
 
         操作完成后建议调用 bsk_read 确认结果，因为页面变化后元素编号会变。
+        如果页面正在加载（点了会跳转的链接、提交表单后），可以先用
+        wait_for_navigation 等它加载完，再去读取，否则可能读到旧页面。
 
         Args:
-            action(string): 要执行的动作，可选值：click(点击)、fill(输入文字)、press(按键)、select(下拉框选择)、hover(鼠标悬停)、scroll_to(滚动到元素)、wheel(滚动页面)、focus(聚焦)、blur(失焦)、reload(刷新)、navigate_back(后退)、navigate_forward(前进)
-            target(string): 元素编号（如 @e3）或 CSS 选择器。click/fill/select/hover/scroll_to/focus/blur 必填；press 可选（填了就表示先聚焦该元素再按键）
+            action(string): 要执行的动作，可选值：click(点击)、fill(输入文字)、press(按键)、select(下拉框选择)、hover(鼠标悬停)、scroll_to(滚动到元素)、wheel(滚动页面)、focus(聚焦)、blur(失焦)、reload(刷新)、navigate_back(后退)、navigate_forward(前进)、wait_for_navigation(等待页面加载完成)
+            target(string): 元素编号（如 @e3）或 CSS 选择器。click/fill/select/hover/scroll_to/focus/blur 必填；press 可选（填了就表示先聚焦该元素再按键）；wait_for_navigation 不需要
             value(string): fill 要输入的文字，或 select 要选中的选项值
             key_spec(string): press 要按的键，例如 Enter、Escape、Tab、Ctrl+A、ArrowDown
             delta_y(number): wheel 的垂直滚动量，正数向下、负数向上，单位像素，例如 500

@@ -213,6 +213,7 @@ bsk --version
 | `reload` | 刷新当前页面 | — |
 | `navigate_back` | 后退 | — |
 | `navigate_forward` | 前进 | — |
+| `wait_for_navigation` | 等页面加载完成（点了会跳转的链接、提交表单之后用它，避免读到旧页面） | — |
 
 `target` 可以填两种东西：**元素编号**（`@e3`，来自 `bsk_read` 的输出），或 **CSS 选择器**（如 `#search`、`.submit-btn`，懂前端的话可以用）。
 
