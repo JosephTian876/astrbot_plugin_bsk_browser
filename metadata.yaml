@@ -1,5 +1,5 @@
 name: astrbot_plugin_bsk_browser
-display_name: 浏览器操作 (bsk)
+display_name: 我会用浏览器
 short_desc: 让机器人操控你已登录的真实浏览器 —— 打开网页、点击、填表、截图。
 desc: |
   把本机的 bsk 命令行工具包装成机器人可以直接调用的工具，让机器人操作你**真实已登录**的浏览器：
@@ -22,7 +22,7 @@ desc: |
   使用本插件仍需遵守 bsk 自身的许可条款。
 
   本项目采用 MIT OR AGPL-3.0-or-later 双许可发布。
-author: yourname
-repo: https://github.com/yourname/astrbot_plugin_bsk_browser
+author: KazusaUwU
+repo: https://github.com/JosephTian876/astrbot_plugin_bsk_browser
 version: 0.1.0
 astrbot_version: ">=4.16"
