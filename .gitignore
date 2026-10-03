@@ -37,3 +37,14 @@ Thumbs.db
 local_config.json
 *.local.json
 .commitmsg
+
+# ★ AstrBot 运行期数据目录 —— 绝不属于插件源码，绝不能提交
+#
+# 为什么会有这个：验证脚本在项目根目录下 import astrbot 时，AstrBot 会以
+# 「当前工作目录」为 root 去解析数据路径（core/utils/astrbot_path.py 的
+# get_astrbot_root），于是在项目里凭空生成一个 data/ 目录，里面是
+# cmd_config.json（AstrBot 主配置，可能含 API 密钥与管理员 QQ 号）
+# 和 t2i_templates/ 模板。
+#
+# 这些内容一旦提交就会泄露用户的密钥，而且会让插件体积虚增。
+data/
