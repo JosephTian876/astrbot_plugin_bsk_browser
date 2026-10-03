@@ -398,6 +398,59 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check(".gitignore 检查", False, repr(exc))
 
+    # ★ 静态扫描：所有会 import astrbot 的测试脚本都必须先钉住 ASTRBOT_ROOT。
+    #
+    # 这是一个**反复复发**的问题：AstrBot 用「当前工作目录」当 root 解析数据
+    # 路径（astrbot_path.py:35），任何在项目目录下 import astrbot 的脚本都会
+    # 就地生成 data/cmd_config.json（AstrBot 主配置，含 API 密钥）。
+    # 已经栽过 3 次，所以改成自动检查而不是靠人记得。
+    #
+    # 注意：只认**真实的 import 语句**，不能用关键字搜索 ——
+    # 注释里提到 "AstrBotConfig" 会被误判（初版即如此，误报了 test_config.py）。
+    def _imports_astrbot(tree: ast.AST) -> bool:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(a.name.split(".")[0] == "astrbot" for a in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and node.module.split(".")[0] == "astrbot":
+                    return True
+            elif isinstance(node, ast.Call):
+                # 覆盖 importlib.import_module("astrbot...") 这类动态导入
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name == "import_module":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            if arg.value.split(".")[0] == "astrbot":
+                                return True
+        return False
+
+    offenders: list[str] = []
+    for py_file in sorted((PROJECT / "tests").glob("*.py")):
+        try:
+            content = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(content)
+        except Exception:  # noqa: BLE001
+            continue
+        if not _imports_astrbot(tree):
+            continue
+        guards_root = "ASTRBOT_ROOT" in content and "setdefault" in content
+        # 只复制 git 已跟踪文件并放进临时目录的脚本不受影响
+        uses_temp_root = "fake_root" in content or "tmp_root" in content
+        if not (guards_root or uses_temp_root):
+            offenders.append(py_file.name)
+    check(
+        "所有 import astrbot 的测试脚本都钉住了 ASTRBOT_ROOT",
+        not offenders,
+        (
+            f"未设防的脚本：{offenders} —— 它们会在项目目录里生成 "
+            "data/cmd_config.json（含 AstrBot 主配置与 API 密钥）"
+        )
+        if offenders
+        else "",
+    )
+
     # ---------------------------------------------------------------
     # 汇总
     # ---------------------------------------------------------------

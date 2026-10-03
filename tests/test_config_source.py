@@ -27,6 +27,19 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
+# ★ 必须钉住 AstrBot 的 root，且要在**任何** astrbot import 之前生效。
+#
+# AstrBot 解析数据路径时优先读 ASTRBOT_ROOT，否则普通模式用**当前工作目录**
+# （core/utils/astrbot_path.py:29-35）。本测试要 import AstrBotConfig，
+# 不设置就会在项目目录里生成 data/cmd_config.json —— AstrBot 的**主配置**，
+# 含 provider API 密钥与管理员 QQ 号，而本仓库是要公开发布的。
+#
+# 注意：这个设置必须在 unittest 收集阶段就生效，所以放在模块顶层
+# （不能挪进 setUpClass）。
+os.environ.setdefault(
+    "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
+)
+
 from bsk.config import parse_settings  # noqa: E402
 
 SCHEMA_PATH = PROJECT / "_conf_schema.json"
