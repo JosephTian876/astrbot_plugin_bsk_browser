@@ -46,6 +46,37 @@ DEFAULT_CANCEL_GRACE_SEC = 15.0
 # 宽限期的下限：低于这个值就基本等于直接 kill，失去优雅取消的意义。
 MIN_CANCEL_GRACE_SEC = 1.0
 
+# 进程退出后，等待 stdout/stderr 抽取任务收尾的上限（秒）。
+#
+# 为什么需要：Windows 上 bsk 自动拉起的 daemon 会继承 stdout/stderr 的管道句柄，
+# 导致子进程退出后管道**仍然不关闭**，读取端永远等不到 EOF。
+# 没有这个上限的话，命令会在已经成功之后卡住不返回。
+DRAIN_TIMEOUT_SEC = 2.0
+
+
+async def _drain(stream: asyncio.StreamReader | None, sink: list[bytes]) -> None:
+    """把子进程的一个输出管道读到 EOF 或出错为止。
+
+    单独抽出来是因为要**并发**读 stdout 和 stderr —— 顺序读会在其中一个
+    缓冲区写满时死锁（经典管道死锁）。
+
+    Args:
+        stream: 管道；为 None 时直接返回。
+        sink: 读到的字节块追加到这里。
+    """
+    if stream is None:
+        return
+    try:
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                break
+            sink.append(chunk)
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        # 读取失败不该让整条命令失败：已经读到的部分仍然有效
+        # （例如进程被 kill 时管道会先断）。
+        return
+
 
 def _build_env() -> dict[str, str]:
     """构造子进程环境变量。
@@ -53,6 +84,12 @@ def _build_env() -> dict[str, str]:
     - ``BSK_CANCEL_ON_STDIN_CLOSE=1`` —— **Windows 上必需**。
       没有它，关闭 stdin 不会触发 bsk 的取消逻辑，我们的优雅取消就形同虚设，
       最后只能硬 kill（会跳过浏览器端的收尾）。
+
+      ⚠️ 正因为设了它，**执行期间绝不能关 stdin**：bsk 会把"stdin 被关"
+      理解成"用户按了 Ctrl-C"，从而把正在执行的命令取消掉。
+      所以本模块不使用 ``proc.communicate()``（它会立刻关 stdin），
+      改为自己并发读取两个管道。详见 ``run()`` 的说明。
+
     - ``PYTHONIOENCODING`` / ``PYTHONUTF8`` 只是双保险：bsk 是 Rust 程序，
       本身不受影响，但万一它内部调用了 Python 工具链就有用。
     - 不设置 ``BSK_AUTO_START``：保持默认行为（允许 bsk 自动拉起 daemon）。
@@ -272,6 +309,7 @@ class BskRunner:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # stdin 保持打开（PIPE）但不写入 —— 见下面关于 communicate() 的说明。
                 stdin=asyncio.subprocess.PIPE,
                 env=_build_env(),
             )
@@ -285,13 +323,33 @@ class BskRunner:
                 code="bsk_spawn_failed",
             ) from exc
 
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        drain_out = asyncio.create_task(_drain(proc.stdout, stdout_chunks))
+        drain_err = asyncio.create_task(_drain(proc.stderr, stderr_chunks))
+
+        timed_out = False
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=effective_timeout
-            )
+            await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
         except asyncio.TimeoutError:
+            timed_out = True
             await self._cancel(proc, self.cancel_grace)
-            elapsed = time.monotonic() - started
+
+        # 进程已退出（或被我们终止）。给抽取任务一个有界的时间收尾：
+        # Windows 上 daemon 可能继承了管道句柄，导致 EOF 永远不来，
+        # 所以**必须**有上限，不能无限等。
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(
+                asyncio.gather(drain_out, drain_err, return_exceptions=True),
+                timeout=DRAIN_TIMEOUT_SEC,
+            )
+        for task in (drain_out, drain_err):
+            if not task.done():
+                task.cancel()
+
+        elapsed = time.monotonic() - started
+
+        if timed_out:
             return BskResult(
                 ok=False,
                 exit_code=errors.EXIT_TIMEOUT,
@@ -304,12 +362,10 @@ class BskRunner:
                 elapsed=elapsed,
             )
 
-        elapsed = time.monotonic() - started
-
         # ★ 必须显式指定 utf-8：Windows 中文环境下默认是 gbk，
         #   遇到阿拉伯文/俄文会抛 UnicodeDecodeError。
-        stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-        stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
         code = proc.returncode if proc.returncode is not None else -1
 
         parsed = _try_parse_json(stdout)

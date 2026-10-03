@@ -430,22 +430,30 @@ class TestValidateSettings(unittest.TestCase):
         self.assertEqual(validate_settings(parse_settings({"max_sessions": 5})), [])
 
     def test_allowed_users_with_admin_only_warns(self) -> None:
-        """白名单非空但 admin_only 开启：如实说明白名单不会生效。"""
+        """白名单非空但 admin_only 开启：如实说明实际生效规则是白名单优先。
+
+        真实的权限判定在 ``main.py`` 的 ``_denied()``：白名单命中即放行，
+        **不**再看是否为管理员。因此这两项同时配置时，白名单里的非管理员
+        确实能用 —— 这是一个值得提醒用户的安全影响，而不是"白名单不生效"。
+        """
         problems = validate_settings(
             parse_settings({"allowed_users": ["123", "456"], "admin_only": True})
         )
         self.assertTrue(any("allowed_users" in p for p in problems))
         joined = "\n".join(problems)
-        self.assertIn("不会生效", joined)
+        # 提醒必须说清楚"白名单优先"这个真实行为。
+        self.assertIn("白名单优先", joined)
         self.assertIn("admin_only", joined)
+        # 并且不能出现与实现相反的"不生效"说法。
+        self.assertNotIn("不会生效", joined)
 
     def test_allowed_users_with_admin_only_off_is_clean(self) -> None:
-        """关掉 admin_only 后白名单才有意义，此时不该再报"不生效"。"""
+        """关掉 admin_only 后，白名单不再有"绕过"含义，不该再报这条。"""
         problems = validate_settings(
             parse_settings({"allowed_users": ["123"], "admin_only": False})
         )
-        self.assertFalse(any("不会生效" in p for p in problems))
-        # 但仍然会有那条安全提醒。
+        self.assertFalse(any("白名单优先" in p for p in problems))
+        # 但仍然会有那条安全提醒（admin_only 关闭本身就该警告）。
         self.assertTrue(any("安全" in p for p in problems))
 
     def test_multiple_problems_are_all_reported(self) -> None:

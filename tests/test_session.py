@@ -429,8 +429,68 @@ class TestAcquire(SessionTestCase):
         session = await manager.acquire("umo-1")
 
         self.assertTrue(session.is_valid())
-        self.assertEqual(manager.stats()["max_sessions"], 8)
+        self.assertEqual(manager.stats()["max_sessions"], 3)
         self.assertEqual(manager.stats()["idle_release_sec"], 240.0)
+
+    async def test_fallback_defaults_match_config_module(self) -> None:
+        """★ 兜底默认值必须与 ``config.py`` 的默认值一致。
+
+        两边不一致会导致"配置对象少一个字段"时行为悄悄跑偏
+        （session.py 用 8、config.py 用 3），这种漂移极难排查。
+        """
+        try:
+            from bsk import config as config_mod
+        except ImportError:  # pragma: no cover - config.py 尚未落地时跳过
+            self.skipTest("bsk/config.py 还不存在")
+
+        from bsk import session as session_mod
+
+        self.assertEqual(
+            session_mod.DEFAULT_MAX_SESSIONS, config_mod.DEFAULT_MAX_SESSIONS
+        )
+        self.assertEqual(
+            session_mod.DEFAULT_IDLE_RELEASE_SEC, config_mod.DEFAULT_IDLE_RELEASE_SEC
+        )
+        self.assertEqual(
+            session_mod.DEFAULT_COMMAND_TIMEOUT_SEC,
+            config_mod.DEFAULT_COMMAND_TIMEOUT_SEC,
+        )
+
+    async def test_works_with_real_settings_type(self) -> None:
+        """★ 用真实的 ``bsk.config.Settings`` 跑一遍。
+
+        回归测试：session.py 是用 ``getattr`` 按**名字**读配置的，
+        名字一旦和 ``Settings`` 的字段对不上，就会静默退回默认值
+        （不报错、行为却错）。这个用例把这种漂移钉死。
+        """
+        try:
+            from bsk import config as config_mod
+        except ImportError:  # pragma: no cover - config.py 尚未落地时跳过
+            self.skipTest("bsk/config.py 还不存在")
+
+        settings = config_mod.parse_settings(
+            {
+                "bsk_path": "bsk",
+                "browser_instance_id": "real-instance-9",
+                "command_timeout_sec": 33.0,
+                "max_sessions": 3,
+                "idle_release_sec": 111.0,
+            }
+        )
+        manager = self.make_manager(settings)
+        stats = manager.stats()
+
+        self.assertEqual(stats["max_sessions"], 3)
+        self.assertEqual(stats["idle_release_sec"], 111.0)
+        self.assertEqual(stats["default_timeout_sec"], 33.0)
+
+        await manager.acquire("umo-1")
+        start_call = self.runner.calls_for("session start")[0]
+        # browser_instance_id 也必须真的被读到（退回默认值的话这里会是空）。
+        self.assertEqual(
+            self.runner.browser_instance_id_for(start_call), "real-instance-9"
+        )
+        self.assertEqual(self.runner.timeout_for("session start"), 33.0)
 
 
 # ----------------------------------------------------------------------

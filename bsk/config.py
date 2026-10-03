@@ -464,11 +464,11 @@ def validate_settings(s: Settings) -> list[str]:
     if users and s.admin_only:
         shown = "、".join(users[:5]) + ("…" if len(users) > 5 else "")
         problems.append(
-            f"`allowed_users` 里填了 {len(users)} 个用户（{shown}），但 `admin_only` "
-            "仍然是开启的。这两个条件是「取严」关系：管理员之外的人即使在白名单里，"
-            "也会先被管理员检查挡下来，所以这份白名单**不会生效**。"
-            "想让白名单里的非管理员也能用，需要把 `admin_only` 关掉"
-            "（注意上面那条安全提醒）。"
+            f"`allowed_users` 里填了 {len(users)} 个用户（{shown}），同时 `admin_only` "
+            "也是开启的。实际规则是**白名单优先**：名单里的用户会被放行，"
+            "名单外的用户即使是管理员之外的普通人也会被挡住；而 AstrBot 管理员"
+            "始终可用。也就是说，这份白名单会让名单里的**非管理员**也能操作浏览器。"
+            "如果不希望这样，请清空 `allowed_users`。"
         )
 
     return problems

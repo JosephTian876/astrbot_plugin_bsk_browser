@@ -80,8 +80,12 @@ BUSY_RETRY_DELAY_SEC = 0.1
 MAX_ATTEMPTS = 2
 """一条命令最多执行几次。2 = 首次 + 重试一次，**这是硬上限**，别改成循环重试。"""
 
-DEFAULT_MAX_SESSIONS = 8
-"""未配置时的最大并发会话数（每个会话占一个 Agent Window，别开太多）。"""
+DEFAULT_MAX_SESSIONS = 3
+"""未配置时的最大并发会话数（每个会话占一个 Agent Window，别开太多）。
+
+刻意与 ``config.py`` 的 ``DEFAULT_MAX_SESSIONS`` 保持一致：这里只是
+"配置对象缺这个字段"时的兜底，两边取值不同会变成很难查的行为漂移。
+"""
 
 DEFAULT_IDLE_RELEASE_SEC = 240.0
 """未配置时的空闲回收阈值。bsk 自己 5 分钟（300s）回收，我们取 4 分钟抢先一步，
@@ -444,8 +448,6 @@ class SessionManager:
             logger.warning("释放会话 %s 时出现意外错误：%r", key, exc)
             self._record_stop_error(f"{key}: {exc!r}")
             return False
-        finally:
-            entry.closed = True
 
     async def release_all(self) -> int:
         """关闭所有会话，返回成功关闭的数量。``terminate()`` 用。
