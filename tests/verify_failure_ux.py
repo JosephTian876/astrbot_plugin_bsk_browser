@@ -28,6 +28,17 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
+# ★ 必须钉住 AstrBot 的 root，且要在**任何** astrbot import 之前生效。
+#
+# 本脚本通过 load_plugin() 间接 import 插件，插件又 import astrbot；
+# 一旦 astrbot 被加载，AstrBot 就会按 get_astrbot_root() 解析数据路径：
+# 优先 ASTRBOT_ROOT，否则普通模式用**当前工作目录**（astrbot_path.py:29-35）。
+# 不设置的话，在项目目录下运行本脚本会在项目里生成 data/cmd_config.json
+# （AstrBot 主配置，含 API 密钥与管理员 QQ 号）—— 曾因此误提交过整个 data/。
+os.environ.setdefault(
+    "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
+)
+
 from astrbot_test_doubles import FakeEvent, make_context  # noqa: E402
 
 RESULTS: list[tuple[str, bool, str]] = []

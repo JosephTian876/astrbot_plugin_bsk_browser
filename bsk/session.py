@@ -25,14 +25,20 @@
 8. ``outcome_unknown`` 类错误（扩展断连等）**绝对不能重试** —— 动作可能已经生效。
    此时把会话标记为 ``uncertain``，此后拒绝新的**操作类**动作，除非调用方显式
    声明这是只读动作（``allow_uncertain=True``，例如 observe / 截图）。
+9. **daemon 的生命周期独立于 AstrBot**。AstrBot 被强杀时 ``terminate()`` 不会执行，
+   daemon 与那些会话却还活着 —— 用户桌面上就留下了没人管的浏览器窗口。
+   对策是 ``journal.py`` 的持久化所有权记录：建会话时落盘、正常 stop 后删掉、
+   下次 ``initialize()`` 时按记录**精确**回收（见 ``recover_orphans``）。
 
 设计约束（写代码时请勿破坏）：
 
 - **零第三方依赖**，不 import astrbot，可脱离框架单测；
 - **不自己起后台任务**：空闲回收由 ``main.py`` 定时调用 ``reap_idle()``；
 - 时间戳一律用 ``time.monotonic()``（``time.time()`` 会被系统时钟跳变影响）；
+  **例外**是 journal 的 ``created_at``，那个要跨进程比较，必须用墙钟；
 - 清理路径（``release`` / ``release_all`` / ``close``）**绝不抛异常**，
-  否则会打断 ``terminate()``，留下无人回收的 Agent Window 打扰用户。
+  否则会打断 ``terminate()``，留下无人回收的 Agent Window 打扰用户；
+- journal 是**尽力而为**的辅助机制：它的读写失败不能影响会话的正常创建/停止。
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -53,6 +60,7 @@ from .errors import (
     BskSessionBusy,
     BskSessionGone,
 )
+from .journal import JournalEntry, SessionJournal
 from .models import BrowserInstance, BskResult, BskSession
 from .runner import BskRunner
 
@@ -99,6 +107,13 @@ START_TIMEOUT_FLOOR_SEC = 30.0
 
 STOP_TIMEOUT_SEC = 15.0
 """``session stop`` 的超时。stop 要等浏览器归还标签页，但也不能无限等。"""
+
+RECOVER_LIST_TIMEOUT_SEC = 5.0
+"""恢复时 ``session list`` 的超时。
+
+实测这条命令 0.02-0.03 秒返回，5 秒是 100 倍余量；而它跑在插件启动路径上，
+**不能**让用户对着一个卡住的 daemon 干等（超时也只是退化成"清掉记录"）。
+"""
 
 RELEASE_WAIT_SEC = 5.0
 """释放会话前最多等多久让 in-flight 命令结束。超过就强行 stop（宁可命令失败，
@@ -243,6 +258,11 @@ class SessionManager:
         browser_probe: 可选。当 ``settings.browser_instance_id`` 为空时，用它
             探测一个可用浏览器（``bsk browsers`` 的薄封装）。探测失败就退化成
             不传 ``--browser``，让 bsk 用默认浏览器。
+        journal: 可选的持久化所有权记录（``bsk/journal.py``）。传了它，
+            每建一个会话就落盘、每正常停一个就删记录，从而使
+            :meth:`recover_orphans` 能在下一个进程里认出遗留会话。
+            不传（None）时所有 journal 动作都变成无操作 —— 现有调用方
+            与测试因此完全不受影响。
 
     Attributes:
         _clock: ``time.monotonic`` 的接缝，单元测试可替换成假时钟来验证
@@ -255,9 +275,11 @@ class SessionManager:
         settings: "Settings | Any",
         *,
         browser_probe: BrowserProbe | None = None,
+        journal: SessionJournal | None = None,
     ) -> None:
         self._runner = runner
         self._browser_probe = browser_probe
+        self._journal = journal
 
         self._max_sessions = max(
             1, _as_int(_setting(settings, "max_sessions", DEFAULT_MAX_SESSIONS),
@@ -497,6 +519,123 @@ class SessionManager:
         logger.info("空闲回收了 %d 个浏览器会话", count)
         return count
 
+    async def recover_orphans(self) -> int:
+        """清理**上一次进程**遗留的、仍然活着的自己的会话。
+
+        场景：AstrBot 被强杀（任务管理器结束进程 / 崩溃 / 断电）时 ``terminate()``
+        不会执行，而 bsk daemon 的生命周期**独立于 AstrBot** —— 它和那些会话都还活着，
+        用户桌面上于是留着没人管的浏览器窗口。本方法在下次 ``initialize()`` 时
+        按 journal 里的记录把它们收干净。
+
+        算法（每一步都是"只停自己的"）：
+
+        1. 读 journal；空就直接返回 0（绝大多数启动走这条路，零额外开销）；
+        2. ``bsk session list --json`` 拿当前**活着的**会话；
+        3. 逐条比对：``session_id`` **与** ``agent_window_id`` **都**匹配才停；
+        4. 清空 journal。
+
+        ★ **绝不用 ``bsk session stop --all``**：那会连带停掉**别的程序**
+        （用户自己的 DSH、他们的另一个 AI 工具）创建的会话。这里只按精确 id 停。
+
+        ★ **为什么要比对 ``agent_window_id``**：``session_id`` 只有 4 个小写字母
+        （26^4 ≈ 45.7 万空间），**存在碰撞可能** —— 我们记录的 ``mnaa`` 已经过期，
+        之后另一个程序也建了一个 ``mnaa``。此时仅凭 session_id 匹配就会误停别人的
+        会话。``agent_window_id`` 是另一扇窗口的编号，数值空间大得多，两者同时
+        相同才足以认定"这就是我们上次留下的那个"。
+
+        Note:
+            - **绝不抛异常**：它在插件启动路径上跑，抛异常会让插件加载失败；
+            - daemon 没在跑（``session list`` 失败）时不算错误：daemon 都没了，
+              会话自然也没了，直接清空 journal 即可；
+            - 停不掉某条会话时**不**阻止 journal 清空 —— 下一次启动还会再试一次
+              也没有意义（那条记录对应的进程已经死了，反复重试只会拖慢启动）。
+
+        Returns:
+            实际清理掉的会话数量。
+        """
+        journal = self._journal
+        if journal is None:
+            return 0
+
+        try:
+            recorded = journal.load()
+        except Exception as exc:  # noqa: BLE001 - journal 自身已经吞异常，这里再兜一层
+            logger.debug("读取会话 journal 失败（忽略）：%r", exc)
+            return 0
+
+        if not recorded:
+            return 0
+
+        # --- 问 daemon 现在有哪些会话 ---
+        try:
+            live = await self._list_live_sessions()
+        except Exception as exc:  # noqa: BLE001
+            # 包括"daemon 没在跑"：那不是错误，会话自然也随着 daemon 一起没了。
+            logger.debug("session list 失败，跳过孤儿会话恢复：%r", exc)
+            live = None
+
+        if live is None:
+            self._journal_clear()
+            return 0
+
+        # --- 逐条比对，只停自己的 ---
+        stopped = 0
+        skipped = 0
+        for entry in recorded:
+            matches = live.get(entry.session_id)
+            if matches is None or entry.agent_window_id not in matches:
+                # 两种情况都跳过：
+                #   - bsk 里已经没有这个 id（会话早被回收/正常停掉了）；
+                #   - 有这个 id，但 agent_window_id 对不上 —— 那是**别人的**会话，
+                #     只是恰好撞了 id。绝不能停。
+                skipped += 1
+                logger.debug(
+                    "跳过遗留会话 %s（agent_window_id=%s）：daemon 侧不匹配",
+                    entry.session_id,
+                    entry.agent_window_id,
+                )
+                continue
+            if await self._stop_session_id(entry.session_id):
+                stopped += 1
+            else:
+                skipped += 1
+
+        if stopped or skipped:
+            logger.info(
+                "恢复清理：停掉 %d 个上次遗留的浏览器会话，跳过 %d 个不匹配的",
+                stopped,
+                skipped,
+            )
+        # 无论停成功几个都清空：这些记录属于已经退出的进程，
+        # 留着只会让每次启动都重复做同一轮无用功。
+        self._journal_clear()
+        return stopped
+
+    async def _list_live_sessions(self) -> dict[str, set[int]]:
+        """``bsk session list --json`` → ``{session_id: {agent_window_id, ...}}``。
+
+        Raises:
+            BskError: daemon 没在跑或命令失败。调用方会把"失败"当成
+                "没有遗留会话"处理。
+        """
+        result = await self._runner.run_or_raise(
+            ["session", "list", "--json"], timeout=RECOVER_LIST_TIMEOUT_SEC
+        )
+        raw = result.data
+        mapping: dict[str, set[int]] = {}
+        if not isinstance(raw, list):
+            return mapping
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            session_id = _as_str(item.get("session_id"))
+            if not session_id:
+                continue
+            mapping.setdefault(session_id, set()).add(
+                _as_int(item.get("agent_window_id"), 0)
+            )
+        return mapping
+
     def stats(self) -> dict:
         """给 ``/bskstatus`` 用的运行状态摘要（同步方法，随时可调）。"""
         now = self._clock()
@@ -623,8 +762,20 @@ class SessionManager:
         进函数先把 id 清空：万一 ``start`` 失败，槽位必须**如实**报告"当前没有
         会话"，否则下次 ``execute`` 会拿着死 id 再撞一次 ``not_found``。
         """
+        previous_id = entry.session.session_id
         entry.session.session_id = ""
         fresh = await self._start()
+        # ★ 立刻落盘 —— 这是整个崩溃恢复机制的起点。
+        #   必须在这里（而不是等 acquire 返回后）写：从 start 成功到调用方拿到
+        #   会话之间有任何一处崩溃，那个会话就已经无人知晓了。
+        #   注意这条记录此时**还不属于**任何槽位，所以即使下面发现 entry 已被
+        #   摘除，也要先把记录清掉再抛异常。
+        self._journal_add(fresh)
+        if previous_id and previous_id != fresh.session_id:
+            # 这是一次"带旧 id 的重建"（``not_found`` 触发的路径**不会**去 stop
+            # 旧会话，所以那个 id 的 journal 记录还在）。把它删掉：bsk 已经确认
+            # 旧会话不存在了，留着只会让下次启动拿它去比对，白多一轮无用功。
+            self._journal_remove(previous_id)
 
         if entry.closed:
             # 极端竞态：槽位在 start 期间被 release/reap 摘走（start 慢于
@@ -739,15 +890,21 @@ class SessionManager:
         except BskSessionGone:
             # bsk 说它已经不存在了 —— 对我们来说目的已达成，不算失败。
             self._counters["stopped"] += 1
+            self._journal_remove(session_id)
             logger.debug("会话 %s 已不存在，无需停止", session_id)
             return True
         except Exception as exc:  # noqa: BLE001 - 清理路径吞掉一切
             self._counters["stop_failed"] += 1
             self._record_stop_error(f"{session_id}: {exc}")
             logger.warning("停止会话 %s 失败：%r", session_id, exc)
+            # 刻意**不删** journal 记录：这次没停掉，会话可能还活着，
+            # 留着记录能让下一次启动的 recover_orphans 再试一次。
             return False
 
         self._counters["stopped"] += 1
+        # 已确认停掉，立刻从 journal 里移除 —— 否则下次启动会去停一个已经
+        # 不存在的 id，白白多一次往返（虽然比对逻辑会挡住误停）。
+        self._journal_remove(session_id)
         logger.info("已停止浏览器会话 %s", session_id)
         return True
 
@@ -874,3 +1031,47 @@ class SessionManager:
         """记下 stop 失败原因（只留最近 5 条，供 /bskstatus 排查）。"""
         self._recent_stop_errors.append(detail)
         del self._recent_stop_errors[:-5]
+
+    # ------------------------------------------------------------------
+    # 内部：journal（全部是"尽力而为"，失败只记 debug 日志）
+    #
+    # journal 是辅助机制，不是会话生命周期的一部分。它的读写失败**绝不能**
+    # 影响会话的正常创建/停止 —— 一个只会写诊断记录的功能，不该有能力
+    # 让浏览器操作失败。
+    # ------------------------------------------------------------------
+
+    def _journal_add(self, session: BskSession) -> None:
+        """把一个刚建成的会话记进 journal。任何失败都只记 debug 日志。"""
+        if self._journal is None or not session.session_id:
+            return
+        try:
+            self._journal.add(
+                JournalEntry(
+                    session_id=session.session_id,
+                    browser_instance_id=session.browser_instance_id,
+                    agent_window_id=session.agent_window_id,
+                    # ★ 墙钟，不是 monotonic：这条记录要跨进程读。
+                    created_at=time.time(),
+                    pid=os.getpid(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 只影响可恢复性，不影响本次会话
+            logger.debug("写会话 journal 失败（忽略）：%r", exc)
+
+    def _journal_remove(self, session_id: str) -> None:
+        """会话已被正常停掉，从 journal 里移除它的记录。"""
+        if self._journal is None or not session_id:
+            return
+        try:
+            self._journal.remove(session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("清理会话 journal 记录失败（忽略）：%r", exc)
+
+    def _journal_clear(self) -> None:
+        """清空 journal。"""
+        if self._journal is None:
+            return
+        try:
+            self._journal.clear()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("清空会话 journal 失败（忽略）：%r", exc)

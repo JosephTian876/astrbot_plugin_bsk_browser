@@ -40,6 +40,7 @@ __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_SEC",
     "DEFAULT_ENABLED",
     "DEFAULT_IDLE_RELEASE_SEC",
+    "DEFAULT_JOURNAL_PATH",
     "DEFAULT_MAX_PAGE_CHARS",
     "DEFAULT_MAX_SESSIONS",
     "DEFAULT_SCREENSHOT_DIR",
@@ -102,6 +103,17 @@ DEFAULT_IDLE_RELEASE_SEC = 240.0
 
 DEFAULT_SCREENSHOT_DIR = ""
 """截图存放目录。空 = 用插件自己的数据目录。"""
+
+DEFAULT_JOURNAL_PATH = ""
+"""会话 journal 文件位置。空 = 系统临时目录下的 ``astrbot_bsk_browser/sessions.json``。
+
+journal 记录"本插件创建了哪些浏览器会话"。AstrBot 被强杀时 ``terminate()``
+不会执行，而 bsk daemon 独立于 AstrBot 继续活着 —— 那些会话（以及用户桌面上的
+浏览器窗口）就没人管了。下次启动时插件靠这份记录把它们按 id 精确停掉。
+
+刻意与 ``screenshot_dir`` 一样用"空 = 用默认位置"的语义：绝大多数用户不需要
+关心它，而真正需要排查的人可以填一个固定路径，方便直接打开看。
+"""
 
 DEFAULT_MAX_PAGE_CHARS = 3000
 """回给模型的页面文本上限（字符数），防止把整棵 VOM 树塞进上下文。"""
@@ -362,6 +374,14 @@ class Settings:
     screenshot_dir: str
     """截图存放目录。空字符串 = 用插件自己的数据目录。"""
 
+    journal_path: str
+    """会话 journal 文件位置。空字符串 = 系统临时目录下的默认位置。
+
+    journal 是"我创建了哪些浏览器会话"的落盘记录，用于 AstrBot 被强杀后
+    在下次启动时回收遗留的会话（见 ``bsk/journal.py`` 与
+    ``SessionManager.recover_orphans``）。
+    """
+
     max_page_chars: int
     """回给模型的页面文本上限（字符数）。"""
 
@@ -384,6 +404,7 @@ def parse_settings(raw: dict | None) -> Settings:
         raw = {}
 
     screenshot_dir = raw.get("screenshot_dir")
+    journal_path = raw.get("journal_path")
     return Settings(
         enabled=_as_bool(raw.get("enabled"), DEFAULT_ENABLED),
         bsk_path=_as_str(raw.get("bsk_path"), DEFAULT_BSK_PATH),
@@ -413,6 +434,8 @@ def parse_settings(raw: dict | None) -> Settings:
         # 空字符串在这里是有意义的取值（表示"用默认目录"），所以不能让
         # _as_str 把它折成默认值 —— 它的默认值本来也就是空字符串，正好一致。
         screenshot_dir=_as_str(screenshot_dir, DEFAULT_SCREENSHOT_DIR),
+        # 同上：空 = 用系统临时目录下的默认位置，与 screenshot_dir 一个套路。
+        journal_path=_as_str(journal_path, DEFAULT_JOURNAL_PATH),
         max_page_chars=int(
             _clamp(
                 _as_int(raw.get("max_page_chars"), DEFAULT_MAX_PAGE_CHARS),

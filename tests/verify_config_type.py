@@ -22,6 +22,14 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
+# ★ 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
+# AstrBot 解析数据路径时优先读 ASTRBOT_ROOT，否则普通模式下用当前工作目录
+# （core/utils/astrbot_path.py:29-35）。不设置就会在项目里凭空生成
+# data/cmd_config.json（含 AstrBot 主配置），曾经因此误提交过整个 data/ 目录。
+os.environ.setdefault(
+    "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
+)
+
 import json  # noqa: E402
 import tempfile  # noqa: E402
 

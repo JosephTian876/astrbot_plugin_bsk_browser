@@ -210,6 +210,12 @@ def _ensure_paths() -> None:
     - 插件仓库根：``import bsk``（只在需要读常量时用）
     - AstrBot 应用目录：``import astrbot``
     - ``~/.astrbot``：``import data.plugins.<插件>``（AstrBot 真实加载路径）
+
+    另外**必须**把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时
+    优先读它，否则普通模式下会用**当前工作目录**（core/utils/astrbot_path.py:29-35）。
+    不设置的话，在项目目录里运行本脚本会在项目内生成 ``data/cmd_config.json``
+    —— AstrBot 的**主配置**，含 provider API 密钥与管理员 QQ 号，
+    而这个仓库是要公开发布的。
     """
     for path in (str(HERE), str(PROJECT)):
         if path not in sys.path:
@@ -219,9 +225,11 @@ def _ensure_paths() -> None:
     if os.path.isdir(astrbot_app) and astrbot_app not in sys.path:
         sys.path.insert(0, astrbot_app)
 
+    # ★ 先"设置"再"读取"：只在没设过时才写入，避免覆盖用户显式配置。
     astrbot_root = os.environ.get(
         "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
     )
+    os.environ.setdefault("ASTRBOT_ROOT", astrbot_root)
     if os.path.isdir(astrbot_root) and astrbot_root not in sys.path:
         sys.path.insert(0, astrbot_root)
 
@@ -898,6 +906,24 @@ async def cleanup() -> None:
             await inst.terminate()
 
     # --- 7.1 插件自身 terminate() 的清理结果 ---
+    #
+    # ⚠️ 这一条是**已知会间歇性失败**的断言，而且失败是**真问题**，不是测试抖动：
+    #
+    #   ``bsk/session.py`` 的 ``_stop_session_id`` 对 ``session stop`` **只尝试一次**
+    #   （失败分支见该函数里的 ``self._counters["stop_failed"] += 1``），
+    #   任何异常都直接记 ``stop_failed`` 并返回 False —— 行号会随重构漂移，
+    #   所以这里按**函数名 + 计数器名**定位，不写死行号。实测 bsk 0.3.2 在
+    #   "**navigate 曾经失败过**的会话"上会随机返回：
+    #       extension rejected tool.session_stop: RpcError {
+    #           code: ProtocolError, message: "Background execution cleanup timed out" }
+    #   此时会话其实**还活着**（Agent Window 还开着），而插件已经放弃，
+    #   于是会话泄漏到 daemon 里，直到 bsk 自己 5 分钟后回收（且回收不保证归还标签页）。
+    #
+    #   量化（本机实测）：navigate 失败的会话 3/14 轮泄漏；同样流程但 navigate 成功 0/14。
+    #   紧接一次重试 stop 就能成功 —— 说明这是**瞬时**状态，重试是有效修复。
+    #
+    #   这里**刻意保持严格断言**（不去放水），让它继续报红，直到 bsk/session.py 修好。
+    #   7.2 才是测试自己的兜底清理。
     try:
         remaining = await daemon_session_ids()
     except Exception as exc:  # noqa: BLE001
@@ -905,11 +931,16 @@ async def cleanup() -> None:
         return
 
     leaked = remaining & CREATED_SESSION_IDS
+    stop_errors = []
+    for inst in INSTANCES:
+        with contextlib.suppress(Exception):
+            stop_errors.extend(inst.service.sessions.stats().get("recent_stop_errors") or [])
     record(
         "7.1 插件 terminate() 后本测试的会话无残留",
         not leaked,
         (
-            f"残留 {sorted(leaked)}（terminate() 未能停掉）"
+            f"残留 {sorted(leaked)}（terminate() 未能停掉；"
+            f"最近一次 stop 报错：{stop_errors[-1][:180] if stop_errors else '无'}）"
             if leaked
             else f"已全部关闭（daemon 里还有 {len(remaining - CREATED_SESSION_IDS)} 个"
             "不属于本测试的会话）"

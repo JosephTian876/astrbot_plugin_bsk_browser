@@ -1193,5 +1193,468 @@ class TestRace(SessionTestCase):
         self.assertEqual(len(set(stopped)), 5)  # 无重复 stop
 
 
+# ----------------------------------------------------------------------
+# journal 与孤儿会话恢复（recover_orphans）
+# ----------------------------------------------------------------------
+
+_USE_DEFAULT_JOURNAL: Any = object()
+"""哨兵：``make_journal_manager()`` 的默认值是"用本用例的临时 journal"。
+
+不能拿 ``None`` 当默认值 —— ``None`` 在 ``SessionManager`` 里是有含义的
+（等于"不要 journal"），两者必须能区分开。
+"""
+
+
+class TestJournalIntegration(SessionTestCase):
+    """建会话时落盘、正常停掉后删记录 —— journal 是崩溃恢复的基础。
+
+    本类**只做追加**，因此 journal 相关的 import 放在方法里而不是文件顶部，
+    以免改动既有代码。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        import os
+        import tempfile
+        import time
+
+        from bsk.journal import JournalEntry, SessionJournal
+
+        self._os = os
+        self._time = time
+        self._JournalEntry = JournalEntry
+        self._tmp = tempfile.TemporaryDirectory(prefix="bsk-session-journal-")
+        self.addCleanup(self._tmp.cleanup)
+        self.journal_path = Path(self._tmp.name) / "sessions.json"
+        self.journal = SessionJournal(self.journal_path)
+
+    def make_record(self, session_id: str, window_id: int, browser: str = "c900a3da"):
+        """往 journal 里塞一条"上一次进程留下的"记录。"""
+        entry = self._JournalEntry(
+            session_id=session_id,
+            browser_instance_id=browser,
+            agent_window_id=window_id,
+            created_at=self._time.time(),
+            pid=self._os.getpid(),
+        )
+        self.journal.add(entry)
+        return entry
+
+    def journal_ids(self) -> list[str]:
+        return [e.session_id for e in self.journal.load()]
+
+    def make_journal_manager(self, journal: Any = _USE_DEFAULT_JOURNAL, **kwargs: Any) -> SessionManager:
+        """带 journal 的 manager。
+
+        默认用本用例的临时 journal；显式传 ``journal=<对象>`` 时用那个对象
+        （例如一个只会抛异常的假 journal）。
+        """
+        if journal is _USE_DEFAULT_JOURNAL:
+            journal = self.journal
+        return self.make_manager(journal=journal, **kwargs)
+
+
+class TestJournalWrites(TestJournalIntegration):
+    """★ 会话生命周期与 journal 的联动。"""
+
+    async def test_creating_session_writes_journal(self) -> None:
+        manager = self.make_journal_manager()
+        session = await manager.acquire("umo-1")
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].session_id, session.session_id)
+        self.assertEqual(loaded[0].agent_window_id, session.agent_window_id)
+        self.assertEqual(loaded[0].browser_instance_id, session.browser_instance_id)
+        self.assertEqual(loaded[0].pid, self._os.getpid())
+        # created_at 必须是墙钟（能跨进程比较），不能是 monotonic 那种小数值。
+        self.assertAlmostEqual(loaded[0].created_at, self._time.time(), delta=60)
+
+    async def test_rebuilt_session_replaces_journal_record(self) -> None:
+        """会话失效重建后，journal 里必须是**新** id，不能留着死 id。"""
+        manager = self.make_journal_manager()
+        first = await manager.acquire("umo-1")
+        # 先取出字符串：acquire 返回的是**同一个对象**，重建会原地改写它的字段
+        # （见 session.py 的 _adopt），拿引用比等于自己跟自己比。
+        first_id = first.session_id
+
+        self.runner.queue("observe", fail("not_found"))
+        await manager.execute("umo-1", observe_builder)
+        second_id = (await manager.acquire("umo-1")).session_id
+
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(self.journal_ids(), [second_id])
+        self.assertNotIn(first_id, self.journal_ids())
+
+    async def test_release_removes_journal_record(self) -> None:
+        manager = self.make_journal_manager()
+        await manager.acquire("umo-1")
+
+        self.assertTrue(await manager.release("umo-1"))
+
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_release_all_removes_every_record(self) -> None:
+        manager = self.make_journal_manager()
+        for i in range(3):
+            await manager.acquire(f"umo-{i}")
+
+        self.assertEqual(await manager.release_all(), 3)
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_reap_idle_removes_record(self) -> None:
+        """空闲回收也是"正常停止"，同样要从 journal 里删掉。"""
+        manager = self.make_journal_manager(
+            settings=make_settings(idle_release_sec=60.0)
+        )
+        await manager.acquire("umo-1")
+        self.clock.advance(90)
+
+        self.assertEqual(await manager.reap_idle(), 1)
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_lru_eviction_removes_record(self) -> None:
+        manager = self.make_journal_manager(settings=make_settings(max_sessions=2))
+        first = await manager.acquire("umo-a")
+        self.clock.advance(1)
+        await manager.acquire("umo-b")
+        self.clock.advance(1)
+        await manager.acquire("umo-c")  # 淘汰 umo-a
+
+        ids = self.journal_ids()
+        self.assertNotIn(first.session_id, ids)
+        self.assertEqual(len(ids), 2)
+
+    async def test_failed_stop_keeps_journal_record(self) -> None:
+        """★ stop 失败时**刻意不删**记录：会话可能还活着，留着让下次启动再清一次。"""
+        manager = self.make_journal_manager()
+        session = await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("", exit_code=errors.EXIT_BROWSER))
+
+        self.assertFalse(await manager.release("umo-1"))  # 没关成功
+
+        self.assertEqual(self.journal_ids(), [session.session_id])
+
+    async def test_not_found_stop_removes_journal_record(self) -> None:
+        """bsk 说会话早没了 —— 目的已达成，记录该删。"""
+        manager = self.make_journal_manager()
+        await manager.acquire("umo-1")
+        self.runner.queue("session stop", fail("not_found"))
+
+        self.assertTrue(await manager.release("umo-1"))
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_no_journal_means_no_files_written(self) -> None:
+        """不传 journal（默认 None）时，行为与改动前完全一致。"""
+        manager = self.make_manager()
+        await manager.acquire("umo-1")
+        await manager.release("umo-1")
+
+        self.assertFalse(self.journal_path.exists())
+
+
+class TestJournalFailureIsHarmless(TestJournalIntegration):
+    """★ journal 是尽力而为的辅助机制：它的失败绝不能影响会话本身。"""
+
+    async def test_unwritable_journal_does_not_break_lifecycle(self) -> None:
+        """journal 路径的父级是个文件（永远写不进去）→ 会话照常建、照常停。"""
+        import tempfile
+
+        from bsk.journal import SessionJournal
+
+        blocker = Path(tempfile.mkdtemp(prefix="bsk-blocker-")) / "not-a-dir"
+        blocker.write_text("我是文件不是目录", encoding="utf-8")
+        self.addCleanup(lambda: blocker.unlink(missing_ok=True))
+        broken = SessionJournal(blocker / "sessions.json")
+
+        manager = self.make_journal_manager(journal=broken)
+        session = await manager.acquire("umo-1")
+        self.assertTrue(session.is_valid())
+
+        result = await manager.execute("umo-1", observe_builder)
+        self.assertTrue(result.ok)
+
+        self.assertTrue(await manager.release("umo-1"))
+        self.assertEqual(self.runner.calls_for("session stop"), [
+            ["session", "stop", session.session_id]
+        ])
+
+    async def test_readonly_journal_file_does_not_break_lifecycle(self) -> None:
+        """journal 文件被设成只读（模拟权限不足）→ 同样不影响会话。"""
+        import os
+        import stat
+
+        self.journal.add(self._JournalEntry(
+            session_id="zzzz",
+            browser_instance_id="x",
+            agent_window_id=1,
+            created_at=self._time.time(),
+            pid=os.getpid(),
+        ))
+        os.chmod(self.journal_path, stat.S_IREAD)
+        self.addCleanup(
+            lambda: os.chmod(self.journal_path, stat.S_IWRITE) if self.journal_path.exists() else None
+        )
+
+        manager = self.make_journal_manager()
+        session = await manager.acquire("umo-1")
+        self.assertTrue(session.is_valid())
+        self.assertTrue(await manager.release("umo-1"))
+        self.assertEqual(self.runner.calls_for("session stop"), [
+            ["session", "stop", session.session_id]
+        ])
+
+    async def test_exploding_journal_does_not_break_lifecycle(self) -> None:
+        """★ journal 的每个方法都抛异常时，会话创建/停止必须照常工作。"""
+
+        class ExplodingJournal:
+            def load(self):
+                raise RuntimeError("journal 炸了")
+
+            def add(self, entry):
+                raise RuntimeError("journal 炸了")
+
+            def remove(self, session_id):
+                raise RuntimeError("journal 炸了")
+
+            def clear(self):
+                raise RuntimeError("journal 炸了")
+
+        manager = self.make_journal_manager(journal=ExplodingJournal())  # type: ignore[arg-type]
+
+        session = await manager.acquire("umo-1")
+        self.assertTrue(session.is_valid())
+        result = await manager.execute("umo-1", observe_builder)
+        self.assertTrue(result.ok)
+        self.assertTrue(await manager.release("umo-1"))
+
+        # recover_orphans 也必须能扛住一个只会抛异常的 journal。
+        self.assertEqual(await manager.recover_orphans(), 0)
+
+
+class TestRecoverOrphans(TestJournalIntegration):
+    """★ ``recover_orphans``：清理上次进程遗留的、**仍然活着的自己的**会话。
+
+    最重要的性质是"只停自己的" —— 绝不能碰别的程序（用户自己的 DSH 等）
+    创建的会话。
+    """
+
+    async def test_stops_matching_session(self) -> None:
+        """session_id 与 agent_window_id 都匹配 → 停掉它。"""
+        self.make_record("abcd", 111)
+        self.runner.queue(
+            "session list",
+            ok([
+                {"session_id": "abcd", "agent_window_id": 111},
+                {"session_id": "wxyz", "agent_window_id": 222},  # 别人的，别碰
+            ]),
+        )
+        manager = self.make_journal_manager()
+
+        recovered = await manager.recover_orphans()
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(
+            self.runner.calls_for("session stop"), [["session", "stop", "abcd"]]
+        )
+        # 别人的会话一个都不能停。
+        stopped_ids = [c[2] for c in self.runner.calls_for("session stop")]
+        self.assertNotIn("wxyz", stopped_ids)
+
+    async def test_collision_with_different_window_is_skipped(self) -> None:
+        """★★ 碰撞防护：id 撞了但窗口号不同，说明那是**别人的**会话 → 必须跳过。
+
+        场景：我们记录的 ``abcd`` 已经过期，之后另一个程序也建了一个 ``abcd``。
+        仅凭 session_id 匹配就会误停别人正在用的会话。
+        """
+        self.make_record("abcd", 111)  # 我们上次那扇窗口是 111
+        self.runner.queue(
+            "session list",
+            ok([{"session_id": "abcd", "agent_window_id": 999}]),  # 别人的窗口
+        )
+        manager = self.make_journal_manager()
+
+        recovered = await manager.recover_orphans()
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(self.runner.calls_for("session stop"), [])  # 一条都没发
+
+    async def test_collision_with_missing_window_field_is_skipped(self) -> None:
+        """daemon 没给 agent_window_id（null）时也必须跳过 —— 无法确认就不能停。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd"}]))
+
+        manager = self.make_journal_manager()
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+
+    async def test_vanished_session_is_skipped(self) -> None:
+        """bsk 里已经没有这个 id（早被回收/正常停过）→ 跳过，不发 stop。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([]))
+
+        manager = self.make_journal_manager()
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+
+    async def test_daemon_not_running_is_not_an_error_and_clears_journal(self) -> None:
+        """★ daemon 没在跑：不抛异常，且 journal 被清空（会话自然也没了）。"""
+        self.make_record("abcd", 111)
+        self.runner.queue(
+            "session list", fail("daemon_not_running", exit_code=errors.EXIT_PROTOCOL)
+        )
+        manager = self.make_journal_manager()
+
+        recovered = await manager.recover_orphans()  # 不抛
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(self.journal.load(), [])  # 记录已清
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+
+    async def test_session_list_timeout_is_not_an_error(self) -> None:
+        """session list 超时同样只是"问不到"，不该报错。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", fail("", exit_code=errors.EXIT_TIMEOUT))
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_session_list_garbage_output_is_handled(self) -> None:
+        """session list 返回的不是数组（协议异常）→ 当成"没有活着的会话"。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok({"unexpected": "object"}))
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+
+    async def test_clears_journal_after_recovery(self) -> None:
+        """恢复完必须清空 journal，否则每次启动都会重复清一轮。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 1)
+        self.assertEqual(self.journal.load(), [])
+
+        # 第二次调用：没有记录可读，连 session list 都不该再发。
+        calls_before = len(self.runner.calls_for("session list"))
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(len(self.runner.calls_for("session list")), calls_before)
+
+    async def test_multiple_orphans_all_recovered(self) -> None:
+        self.make_record("aaaa", 1)
+        self.make_record("bbbb", 2)
+        self.make_record("cccc", 3)
+        self.runner.queue(
+            "session list",
+            ok([
+                {"session_id": "aaaa", "agent_window_id": 1},
+                {"session_id": "bbbb", "agent_window_id": 2},
+                {"session_id": "cccc", "agent_window_id": 3},
+                {"session_id": "dddd", "agent_window_id": 4},  # 别人的
+            ]),
+        )
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 3)
+        self.assertEqual(
+            sorted(c[2] for c in self.runner.calls_for("session stop")),
+            ["aaaa", "bbbb", "cccc"],
+        )
+
+    async def test_mixed_match_and_mismatch(self) -> None:
+        """一半匹配一半不匹配：只停匹配的那一半。"""
+        self.make_record("aaaa", 1)   # 匹配
+        self.make_record("bbbb", 2)   # 撞了 id，但窗口对不上 → 跳过
+        self.make_record("cccc", 3)   # daemon 里已经没了 → 跳过
+        self.runner.queue(
+            "session list",
+            ok([
+                {"session_id": "aaaa", "agent_window_id": 1},
+                {"session_id": "bbbb", "agent_window_id": 222},
+            ]),
+        )
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 1)
+        self.assertEqual(
+            self.runner.calls_for("session stop"), [["session", "stop", "aaaa"]]
+        )
+
+    async def test_stop_failure_still_clears_journal(self) -> None:
+        """stop 失败也不阻止清空 journal —— 那些记录属于已经退出的进程。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        self.runner.queue("session stop", fail("", exit_code=errors.EXIT_BROWSER))
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)  # 没停成功
+        self.assertEqual(self.journal.load(), [])  # 但记录清了
+
+    async def test_never_uses_stop_all(self) -> None:
+        """★ 红线：任何路径都不许出现 `session stop --all`（会停掉别的程序的会话）。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        manager = self.make_journal_manager()
+
+        await manager.recover_orphans()
+
+        for call in self.runner.calls:
+            self.assertNotIn("--all", call, f"出现了 --all：{call}")
+
+    async def test_uses_positional_session_id(self) -> None:
+        """stop 的 id 必须是位置参数（bsk 里唯一的例外），不是 --session。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        manager = self.make_journal_manager()
+
+        await manager.recover_orphans()
+
+        stop_calls = self.runner.calls_for("session stop")
+        self.assertEqual(stop_calls, [["session", "stop", "abcd"]])
+        self.assertNotIn("--session", stop_calls[0])
+
+    async def test_no_journal_is_a_noop(self) -> None:
+        """没配 journal 时 recover_orphans 直接返回 0，一条命令都不发。"""
+        manager = self.make_manager()
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.runner.calls, [])
+
+    async def test_empty_journal_makes_no_bsk_calls(self) -> None:
+        """journal 为空是绝大多数启动的情形 —— 应当零额外开销。"""
+        manager = self.make_journal_manager()
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(self.runner.calls, [])
+
+    async def test_recovered_sessions_do_not_enter_local_registry(self) -> None:
+        """恢复只停别人的旧会话，不该把它们登记成自己的在册会话。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        manager = self.make_journal_manager()
+
+        await manager.recover_orphans()
+
+        self.assertEqual(manager.stats()["sessions"], 0)
+        # 而且之后正常开一条会话不受影响。
+        session = await manager.acquire("umo-1")
+        self.assertTrue(session.is_valid())
+        self.assertEqual(session.session_id, "mnaa")
+
+    async def test_recovery_does_not_double_stop_own_live_session(self) -> None:
+        """恢复之后正常工作流仍然只 stop 自己当前那条会话一次。"""
+        self.make_record("abcd", 111)
+        self.runner.queue("session list", ok([{"session_id": "abcd", "agent_window_id": 111}]))
+        manager = self.make_journal_manager()
+
+        await manager.recover_orphans()
+        session = await manager.acquire("umo-1")
+        await manager.release("umo-1")
+
+        stops = [c[2] for c in self.runner.calls_for("session stop")]
+        self.assertEqual(stops, ["abcd", session.session_id])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

@@ -26,6 +26,7 @@ from typing import Any
 
 from .config import Settings
 from .errors import BskError
+from .journal import SessionJournal, default_journal_path
 from .models import (
     BrowserInstance,
     ConsoleLog,
@@ -129,6 +130,9 @@ class BskService:
         settings: 已解析的强类型配置。
         runner: 子进程执行器。可注入假实现以便单测。
         sessions: 会话管理器。可注入假实现以便单测。
+        journal: 会话所有权 journal（``bsk/journal.py``）。默认按
+            ``settings.journal_path`` 构造，空值时用系统临时目录下的默认位置。
+            只有显式传了 ``sessions`` 时才不会被用到。
     """
 
     def __init__(
@@ -136,17 +140,29 @@ class BskService:
         settings: Settings,
         runner: BskRunner | None = None,
         sessions: SessionManager | None = None,
+        journal: SessionJournal | None = None,
     ) -> None:
         self.settings = settings
         self.runner = runner or BskRunner(
             settings.bsk_path,
             default_timeout=settings.command_timeout_sec,
         )
+        # journal 是"尽力而为"的辅助机制：构造它本身不做任何 IO（真正的读写
+        # 发生在建/停会话和 recover_orphans 里，且那些路径全部吞异常），
+        # 所以这里即便路径不可用也不会影响插件加载。
+        self.journal = journal if journal is not None else self._make_journal()
         self.sessions = sessions or SessionManager(
             self.runner,
             settings,
             browser_probe=self.probe_browser,
+            journal=self.journal,
         )
+
+    def _make_journal(self) -> SessionJournal:
+        """按配置构造 journal；拿不到配置时退回默认位置。"""
+        configured = getattr(self.settings, "journal_path", "") or ""
+        path = configured.strip() if isinstance(configured, str) else ""
+        return SessionJournal(path or default_journal_path())
 
     # ------------------------------------------------------------------
     # 基础设施
@@ -616,6 +632,22 @@ class BskService:
     async def shutdown(self) -> int:
         """关闭全部会话。插件 ``terminate()`` 调用。"""
         return await self.sessions.release_all()
+
+    async def recover_orphans(self) -> int:
+        """清理上一次进程遗留的、仍然活着的自己的会话。
+
+        插件 ``initialize()`` 调用。对应场景：AstrBot 被强杀时 ``terminate()``
+        不会执行，而 bsk daemon 独立于 AstrBot 继续活着，于是桌面上留下没人管的
+        浏览器窗口；下次启动靠 journal 记录把它们按 id 精确停掉。
+
+        Returns:
+            实际清理掉的会话数量。
+
+        Note:
+            本方法**绝不抛异常**（转发对象的实现已经保证），所以调用方不必
+            再套一层 try/except 来防止插件加载失败。
+        """
+        return await self.sessions.recover_orphans()
 
     # ------------------------------------------------------------------
     # 页面上报（给模型一段紧凑的环境描述）

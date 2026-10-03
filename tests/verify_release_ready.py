@@ -31,6 +31,13 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
+# ★ 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
+# 本脚本要 import AstrBot 的校验器；若不同时设定 root，AstrBot 会把当前
+# 工作目录当 root（astrbot_path.py:35），就地生成含主配置的 data/ 目录。
+os.environ.setdefault(
+    "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
+)
+
 RESULTS: list[tuple[str, bool, str]] = []
 
 
@@ -355,6 +362,41 @@ def main() -> int:
         mb < 1.0,
         f"{file_count} 个文件，共 {mb:.2f} MB",
     )
+
+    # ---------------------------------------------------------------
+    # 7. 工作区卫生：不得残留 AstrBot 运行期目录
+    # ---------------------------------------------------------------
+    # AstrBot 解析数据路径时用「当前工作目录」当 root（astrbot_path.py:35），
+    # 任何在项目目录下 import astrbot 的脚本都会就地生成 data/，
+    # 里面是 AstrBot 主配置（可能含 API 密钥、管理员 QQ 号）。
+    # 这个目录**绝不能**进入版本库，也绝不该留在源码目录里。
+    print("\n--- 工作区卫生 ---")
+    runtime_dirs = ("data", "shots", "runtime")
+    present = [d for d in runtime_dirs if (PROJECT / d).exists()]
+    check(
+        "源码目录无 AstrBot 运行期产物",
+        not present,
+        (
+            f"发现 {present} —— 这是 AstrBot 在本目录 import 时生成的，"
+            "必须删除且**不要提交**；若在版本库里请立即 git rm --cached"
+        )
+        if present
+        else "",
+    )
+
+    # 这些目录必须在 .gitignore 里
+    try:
+        gitignore = (PROJECT / ".gitignore").read_text(encoding="utf-8")
+        missing_ignores = [
+            f"{d}/" for d in runtime_dirs if f"{d}/" not in gitignore
+        ]
+        check(
+            ".gitignore 已覆盖运行期目录",
+            not missing_ignores,
+            f"缺少：{missing_ignores}" if missing_ignores else "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        check(".gitignore 检查", False, repr(exc))
 
     # ---------------------------------------------------------------
     # 汇总

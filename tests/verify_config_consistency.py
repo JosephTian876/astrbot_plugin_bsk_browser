@@ -64,7 +64,7 @@ def main() -> int:
         print(f"默认值不一致：{mismatches}")
         return 1
 
-    print("结果：11 项默认值完全一致")
+    print("结果：" + f"{len(schema)} 项默认值完全一致")
     return 0
 
 

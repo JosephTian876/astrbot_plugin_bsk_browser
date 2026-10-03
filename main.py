@@ -96,6 +96,21 @@ class BskBrowserPlugin(Star):
         if self.settings.idle_release_sec > 0:
             self._reap_task = asyncio.create_task(self._idle_reaper())
 
+        # 清理上一次进程遗留的会话。AstrBot 被强杀（任务管理器结束进程、崩溃、
+        # 断电）时 terminate() 不会执行，而 bsk daemon 的生命周期独立于 AstrBot
+        # —— 它和那些会话都还活着，用户桌面上就留着没人管的浏览器窗口。
+        # 这里按 journal 记录把"仍然是自己的"那些停掉（只用精确 id，绝不用
+        # `session stop --all`，那会误停别的程序创建的会话）。
+        # 放在启动回收任务之后：这一步可能要等 bsk 子进程，不该拖慢回收任务的建立。
+        try:
+            recovered = await self.service.recover_orphans()
+            if recovered:
+                astrbot_logger.info(
+                    "[bsk_browser] 已清理 %d 个上次遗留的浏览器会话。", recovered
+                )
+        except Exception as exc:  # noqa: BLE001 - 恢复失败不能让插件加载失败
+            astrbot_logger.warning("[bsk_browser] 清理遗留会话时出错（已忽略）：%r", exc)
+
         astrbot_logger.info(
             "[bsk_browser] 已加载。bsk 路径=%s，最大会话=%d，仅管理员=%s",
             self.settings.bsk_path,
