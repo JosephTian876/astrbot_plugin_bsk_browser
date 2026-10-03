@@ -593,5 +593,493 @@ class TestBuiltinConstants(unittest.TestCase):
         self.assertIn("command_timeout_sec", {f.name for f in fields(Settings)})
 
 
+# ======================================================================
+# 5. 多浏览器歧义：**明确报错**，而不是静默随机选一个
+#
+# 背景（这次要修的**真实体验缺陷**）：``probe_browser()`` 以前只在"恰好 1 个"
+# 时返回 instance_id，其余情况一律返回空串。于是用户同时连着 Edge + Chrome
+#（或同一浏览器的两个 profile）却没配 ``browser_instance_id`` 时，插件不传
+# ``--browser``，bsk 就自己随便挑一个 —— 用户看到的现象是"有时候对这个、
+# 有时候对那个"，既不知道是哪个，也不知道为什么，无从排查。
+# 而 README 早就**声称**"连了好几个时会报错要求你指定"，代码却没实现。
+#
+# 现在的规则（三条分支必须分清，下面逐个钉住）：
+#
+#   1. 探测**失败**（bsk 没装/命令报错/输出不是 JSON）→ 返回空串，静默降级；
+#   2. **恰好 1 个** → 自动返回它的 instance_id（**免配置**，最常见的场景）；
+#   3. **≥2 个且用户没配** → 抛 ``BskBrowserAmbiguous``，列出所有实例；
+#   4. 用户**显式配了** ``browser_instance_id`` → 直接用配置的，
+#      **不做歧义检查**（用户已经明确表态了）。
+#
+# 假 subprocess：``probe_browser`` 走的是**同步** ``subprocess.run``，
+# 所以这里替换掉 ``subprocess.run`` 本身，而不是真的去执行 bsk
+#（本机可能真的有浏览器连着，测试绝不能依赖这一点，也绝不能碰到它）。
+# ======================================================================
+
+import json  # noqa: E402 - 追加段落自带 import，不改动文件上方的任何一行
+from unittest import mock  # noqa: E402
+
+from bsk.errors import (  # noqa: E402
+    CODE_BROWSER_AMBIGUOUS,
+    BskBrowserAmbiguous,
+)
+from bsk.models import BrowserInstance  # noqa: E402
+
+
+def browsers_payload(*instances: tuple[str, str]) -> list[dict[str, Any]]:
+    """造 ``bsk browsers --json`` 的载荷。
+
+    Args:
+        *instances: 若干 ``(instance_id, browser_name)`` 二元组。
+            ``label`` 一律填**空字符串** —— 实测它经常是空的，
+            而"展示时必须能兜底"正是要测的东西之一。
+    """
+    return [
+        {
+            "instance_id": instance_id,
+            "browser_name": name,
+            "browser_version": "154.0.0.0",
+            "extension_version": "0.3.2",
+            "label": "",
+            "session_count": 0,
+            "unresponsive": False,
+            "version_skew": False,
+        }
+        for instance_id, name in instances
+    ]
+
+
+def fake_subprocess_run(
+    payload: Any,
+    *,
+    returncode: int = 0,
+) -> Any:
+    """造一个 ``subprocess.run`` 替身，假装 ``bsk browsers --json`` 的返回。
+
+    Args:
+        payload: 要假装成 bsk 输出的对象（会被 JSON 序列化）。
+        returncode: 假的退出码。非 0 表示"探测本身失败"。
+    """
+
+    def _run(args: list[str], **kwargs: Any) -> Any:
+        return types.SimpleNamespace(
+            returncode=returncode,
+            stdout=json.dumps(payload).encode("utf-8"),
+            stderr=b"",
+            args=args,
+        )
+
+    return _run
+
+
+def browser_id_of(start_call: list[str]) -> str:
+    """从 ``session start`` 的参数列表里取出 ``--browser`` 的值。
+
+    返回空串表示**没传** ``--browser``（也就是"交给 bsk 自己选"）。
+    """
+    if "--browser" not in start_call:
+        return ""
+    index = start_call.index("--browser")
+    return start_call[index + 1] if index + 1 < len(start_call) else ""
+
+
+class TestPickBrowserFromProbe(unittest.TestCase):
+    """``BskService._pick_browser_from_probe``：**探测成功**之后的选浏览器规则。
+
+    单独抽出来测是因为它是个纯函数：输入 bsk 的 JSON 载荷，输出
+    instance_id 或抛歧义异常，完全不碰子进程与浏览器。
+    """
+
+    def test_zero_browsers_returns_empty_and_never_raises(self) -> None:
+        """★ 0 个浏览器 → 空串（不抛歧义），维持"交给 bsk 自己报错"的现有行为。
+
+        不能在这里报歧义：歧义的含义是"有好几个、不知道选哪个"，
+        一个都没有时报"请从下面几个里选"会让用户完全摸不着头脑。
+        """
+        self.assertEqual(BskService._pick_browser_from_probe([]), "")
+
+    def test_single_browser_is_selected_automatically(self) -> None:
+        """★★ 回归保护（本文件最重要的一条）：恰好 1 个 → 自动选中，免配置。
+
+        这是最常见的场景（实测本机就只有一个 edge），一旦这里退化成报错，
+        所有"本来不用配置就能用"的用户全部被打断 —— 那是比原缺陷更糟的倒退。
+        """
+        payload = browsers_payload(("c900a3da", "edge"))
+
+        self.assertEqual(BskService._pick_browser_from_probe(payload), "c900a3da")
+
+    def test_two_browsers_raise_ambiguous_with_both_ids(self) -> None:
+        """★ 2 个且未配置 → 抛歧义异常，且文案里**两个 instance_id 都在**。
+
+        文案里必须有两个 id：只说"有多个浏览器"用户没法照着做，
+        他需要把其中一个**原样复制**到配置里。
+        """
+        payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+
+        friendly = ctx.exception.friendly
+        self.assertIn("c900a3da", friendly)
+        self.assertIn("ab12cd34", friendly)
+        self.assertEqual(ctx.exception.code, CODE_BROWSER_AMBIGUOUS)
+        # 这是用户配置问题，重试多少次都一样 —— 不许被当成可重试的瞬时故障。
+        self.assertFalse(ctx.exception.retryable)
+
+    def test_two_browsers_message_shows_browser_name_not_only_label(self) -> None:
+        """★ label 为空时展示不能崩，且要用 ``browser_name`` 兜底。
+
+        实测 ``label`` 经常是空字符串。只依赖 label 的文案会变成
+        ``-  (c900a3da)``，用户看不出哪个是 Edge、哪个是 Chrome。
+        """
+        payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+
+        friendly = ctx.exception.friendly
+        self.assertIn("edge", friendly)
+        self.assertIn("chrome", friendly)
+        # 不能出现空名字那种"两个空格接着括号"的痕迹。
+        self.assertNotIn("-  (", friendly)
+
+    def test_label_is_preferred_when_present_but_id_still_shown(self) -> None:
+        """label 非空时用 label 做展示名，但 **instance_id 必须仍然可见**。
+
+        用户要复制的是 instance_id；只显示 "工作用的 Chrome" 等于没说。
+        """
+        line = BskService._describe_instance(
+            BrowserInstance.from_json(
+                {
+                    "instance_id": "c900a3da",
+                    "browser_name": "chrome",
+                    "label": "工作用的 Chrome",
+                }
+            )
+        )
+
+        self.assertIn("工作用的 Chrome", line)
+        self.assertIn("c900a3da", line)
+
+    def test_message_is_actionable(self) -> None:
+        """★ 文案必须可操作：说清"去哪个配置项、填什么"。
+
+        这段文字最终会经 ``main.py`` 的 ``except BskError`` 变成给模型的
+        字符串，模型要据此告诉用户去改什么配置 —— 只说"有多个浏览器"
+        模型也只能干瞪眼。
+        """
+        payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+
+        friendly = ctx.exception.friendly
+        self.assertIn("配置", friendly)
+        self.assertIn("instance_id", friendly)
+        # 配置项的真名也要出现，否则用户不知道在 WebUI 里找哪一项。
+        self.assertIn("browser_instance_id", friendly)
+
+    def test_three_browsers_all_listed(self) -> None:
+        """3 个以上时一个都不能漏 —— 漏掉的那个恰好是用户想选的就麻烦了。"""
+        payload = browsers_payload(
+            ("c900a3da", "edge"), ("ab12cd34", "chrome"), ("77889900", "brave")
+        )
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+
+        for instance_id in ("c900a3da", "ab12cd34", "77889900"):
+            with self.subTest(instance_id=instance_id):
+                self.assertIn(instance_id, ctx.exception.friendly)
+
+    def test_unresponsive_instance_is_marked_but_still_listed(self) -> None:
+        """无响应的实例**照样列出**，但明确标注"不建议选它"。
+
+        刻意不静默过滤掉它：那也是一种"替用户做决定"。它确实连着，
+        用户有权知道自己有两个实例，以及该避开哪一个。
+        """
+        payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
+        payload[1]["unresponsive"] = True
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+
+        friendly = ctx.exception.friendly
+        self.assertIn("ab12cd34", friendly)
+        self.assertIn("无响应", friendly)
+
+    def test_non_list_or_junk_payload_returns_empty(self) -> None:
+        """载荷结构不认识时返回空串（交给 bsk），不许把插件搞崩。
+
+        这是外部输入：daemon 版本不同、输出被截断都可能让它不是列表。
+        """
+        for junk in (None, {}, "oops", 42, [None, "x", 3]):
+            with self.subTest(junk=repr(junk)):
+                self.assertEqual(BskService._pick_browser_from_probe(junk), "")
+
+    def test_entries_without_instance_id_are_ignored(self) -> None:
+        """★ 没有 instance_id 的条目不算"可用的浏览器"。
+
+        instance_id 正是用户要填进配置的值：它空的既选不中也填不了，
+        拿它去凑"多个"只会报一个列不出第二个实例的歧义错误。
+        """
+        payload = browsers_payload(("c900a3da", "edge"))
+        payload.append({"browser_name": "ghost", "label": ""})
+
+        self.assertEqual(BskService._pick_browser_from_probe(payload), "c900a3da")
+
+    def test_duplicate_instance_ids_count_once(self) -> None:
+        """同一个 id 出现两次不算歧义（bsk 理论上不会这样，但别自己吓自己）。"""
+        payload = browsers_payload(("c900a3da", "edge"), ("c900a3da", "edge"))
+
+        self.assertEqual(BskService._pick_browser_from_probe(payload), "c900a3da")
+
+
+class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
+    """``probe_browser`` 经**真实** ``SessionManager`` 走的端到端行为。
+
+    这一组才是真正的回归保护：``session.py`` 的 ``_resolve_browser_instance``
+    出于容错会吞掉探测异常，所以"抛异常"本身**不足以保证**用户能看到 ——
+    必须证明它确实穿过了那一层，而不是被吞成静默降级。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 在**没有**任何补丁的情况下，绝不允许真的去执行 bsk。
+        # 任何一次真实调用都会撞上这个断言（下面的用例各自按需覆盖它）。
+        self._patchers: list[Any] = []
+        self._patch_run(mock.Mock(side_effect=AssertionError("不该真的执行 bsk")))
+
+    def _patch_run(self, replacement: Any) -> None:
+        """把 ``subprocess.run`` 换成 ``replacement``（同一用例内可反复替换）。
+
+        自己管 patcher 列表而不是用 ``mock.patch.stopall()``：后者会把
+        ``unittest`` 框架自己的补丁也一起停掉，属于误伤。
+        """
+        patcher = mock.patch("subprocess.run", replacement)
+        patcher.start()
+        self._patchers.append(patcher)
+        self.addCleanup(patcher.stop)
+
+    def patch_browsers(self, payload: Any, *, returncode: int = 0) -> None:
+        """让 ``bsk browsers --json`` 返回给定载荷。"""
+        self._patch_run(fake_subprocess_run(payload, returncode=returncode))
+
+    # --- 分支 2：恰好 1 个 → 免配置（★ 回归保护）---
+
+    async def test_single_browser_is_used_without_any_config(self) -> None:
+        """★ 未配置 + 只有 1 个浏览器 → 会话照常建立，并自动带上 --browser。
+
+        这就是"免配置体验"本身：它**绝不能**因为这次改动变成报错。
+        """
+        self.patch_browsers(browsers_payload(("c900a3da", "edge")))
+        service, runner = self.make(browser_instance_id="")
+
+        observation = await service.observe("umo-1")
+
+        self.assertTrue(observation is not None)
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "c900a3da")
+
+    # --- 分支 1：0 个 → 静默降级 ---
+
+    async def test_zero_browsers_creates_session_without_browser_flag(self) -> None:
+        """★ 0 个浏览器 → 不报歧义，照常建会话且**不传** --browser。
+
+        设计选择：这一档维持"交给 bsk 自己报错"的现有行为。bsk 那句
+        "没有已连接的浏览器"本身就是准确的诊断，插件在这里另造一句
+        只会增加不一致；而没有 ``--browser`` 正是让 bsk 说那句话的前提。
+        """
+        self.patch_browsers([])
+        service, runner = self.make(browser_instance_id="")
+
+        await service.observe("umo-1")
+
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "")
+        self.assertNotIn("--browser", start_call)
+
+    # --- 分支 3：≥2 个 → 歧义错误（★ 本次改动的主角）---
+
+    async def test_two_browsers_raise_ambiguous_through_real_manager(self) -> None:
+        """★★ 2 个且未配置 → 异常必须穿过 ``SessionManager`` 冒到调用方。
+
+        ``_resolve_browser_instance`` 里那条 ``except Exception`` 是为了
+        "探测失败不影响建会话"。歧义**不是**探测失败，如果被它一起吞掉，
+        就会退回"不传 --browser、bsk 随便选一个"的老毛病 —— 而且更隐蔽，
+        因为异常看起来"处理过了"。这条测试专门钉死这一点。
+        """
+        self.patch_browsers(browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome")))
+        service, runner = self.make(browser_instance_id="")
+
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            await service.observe("umo-1")
+
+        friendly = ctx.exception.friendly
+        self.assertIn("c900a3da", friendly)
+        self.assertIn("ab12cd34", friendly)
+        # 【反证】绝不能在报错的同时还建出了会话 —— 那说明我们其实选了某个浏览器。
+        self.assertEqual(runner.calls_for("session start"), [])
+
+    async def test_two_browsers_also_blocks_open_page(self) -> None:
+        """用户最常走的入口（打开网页）同样被挡住，而不是悄悄开一个。
+
+        ``open_page`` 内部会 navigate + observe；歧义在建会话时就该失败，
+        所以 navigate 一次都不该发出去。
+        """
+        self.patch_browsers(browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome")))
+        service, runner = self.make(browser_instance_id="")
+
+        with self.assertRaises(BskBrowserAmbiguous):
+            await service.open_page("umo-1", "https://example.com")
+
+        self.assertEqual(runner.calls_for("navigate"), [])
+
+    # --- 分支 4：配了就必须尊重配置，不做歧义检查 ---
+
+    async def test_configured_browser_wins_even_with_two_connected(self) -> None:
+        """★★ 2 个浏览器但用户配了 id → 用配置的，**不报歧义**。
+
+        用户已经明确表态了。这时再去"检测歧义"就是多管闲事，
+        而且会让他刚填好的配置失效 —— 最让人恼火的那种 bug。
+        """
+        self.patch_browsers(browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome")))
+        service, runner = self.make(browser_instance_id="ab12cd34")
+
+        await service.observe("umo-1")
+
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "ab12cd34")
+
+    async def test_configured_browser_never_even_probes(self) -> None:
+        """★ 配了 id 时**连探测都不该发生**（上面 setUp 的断言会抓住真实调用）。
+
+        这既是"尊重配置"，也顺带保证了这种场景下不多花一次子进程开销。
+        """
+        service, runner = self.make(browser_instance_id="deadbeef")
+
+        await service.observe("umo-1")
+
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "deadbeef")
+
+    # --- 分支 1 的变体：探测本身失败 → 保持原有容错语义 ---
+
+    async def test_probe_command_failure_still_creates_session(self) -> None:
+        """★ ``bsk browsers`` 报错（退出码非 0）→ 建会话**照常成功**。
+
+        这是刻意保留的容错语义：探测只是"帮用户省一步配置"的优化，
+        它失败不该让整个插件不可用。
+        """
+        self.patch_browsers(["irrelevant"], returncode=1)
+        service, runner = self.make(browser_instance_id="")
+
+        await service.observe("umo-1")
+
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "")
+        self.assertEqual(len(runner.calls_for("session start")), 1)
+
+    async def test_probe_crash_still_creates_session(self) -> None:
+        """探测抛异常（bsk 没装、超时等）→ 同样不许连累建会话。"""
+        self._patch_run(mock.Mock(side_effect=OSError("bsk 不存在")))
+        service, runner = self.make(browser_instance_id="")
+
+        await service.observe("umo-1")
+
+        start_call = runner.calls_for("session start")[0]
+        self.assertEqual(browser_id_of(start_call), "")
+
+    async def test_probe_returns_broken_json_still_creates_session(self) -> None:
+        """探测输出不是 JSON（截断/clap 报错）→ 同样静默降级。"""
+        self._patch_run(
+            lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout=b"not json at all", stderr=b""
+            )
+        )
+        service, runner = self.make(browser_instance_id="")
+
+        await service.observe("umo-1")
+
+        self.assertEqual(browser_id_of(runner.calls_for("session start")[0]), "")
+
+    # --- 调用频率：不许在热路径上多探测 ---
+
+    async def test_probe_happens_once_per_session_not_per_command(self) -> None:
+        """★ 探测次数 = 建会话次数，**不**随后续命令增长。
+
+        ``probe_browser`` 走的是同步 ``subprocess.run``，每次都有真实开销。
+        检查必须搭在"建会话的那一次探测"上，绝不能变成每条命令都探一次。
+        """
+        calls: list[list[str]] = []
+        real = fake_subprocess_run(browsers_payload(("c900a3da", "edge")))
+
+        def counting_run(args: list[str], **kwargs: Any) -> Any:
+            calls.append(list(args))
+            return real(args, **kwargs)
+
+        self._patch_run(counting_run)
+        service, _ = self.make(browser_instance_id="")
+
+        await service.observe("umo-1")
+        first = len(calls)
+        self.assertEqual(first, 1, f"建会话时应该恰好探测一次，实际 {first} 次")
+
+        # 同一个 key 上再跑三条命令：会话已存在，一次都不该再探。
+        await service.observe("umo-1")
+        await service.read_console("umo-1")
+        await service.read_network("umo-1")
+
+        self.assertEqual(len(calls), first, "后续命令不应该再触发探测（热路径开销）")
+        for call in calls:
+            with self.subTest(call=call):
+                self.assertEqual(call[1:], ["browsers", "--json"])
+
+
+class TestAmbiguousBrowserErrorShape(unittest.TestCase):
+    """歧义异常自身的形状 —— 它要能安全地经 ``main.py`` 变成给模型的字符串。"""
+
+    def _make(self) -> BskBrowserAmbiguous:
+        payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
+        with self.assertRaises(BskBrowserAmbiguous) as ctx:
+            BskService._pick_browser_from_probe(payload)
+        return ctx.exception
+
+    def test_is_a_bsk_error_so_main_py_catches_it(self) -> None:
+        """★ 必须是 ``BskError`` 子类。
+
+        ``main.py`` 只捕获 ``BskError`` 来生成给用户的中文提示；
+        不是它子类的话会掉进 ``except Exception`` 那条"未预期的错误"分支，
+        用户看到的是一句带异常类型名的内部报错。
+        """
+        from bsk.errors import BskError
+
+        self.assertIsInstance(self._make(), BskError)
+
+    def test_carries_error_code_and_friendly_text(self) -> None:
+        """``code`` 供诊断，``friendly`` 是给用户/模型看的那段中文。"""
+        exc = self._make()
+
+        self.assertEqual(exc.code, CODE_BROWSER_AMBIGUOUS)
+        self.assertTrue(exc.friendly.strip())
+        self.assertIn("\n", exc.friendly, "多实例清单需要换行才读得懂")
+
+    def test_friendly_text_explains_next_step(self) -> None:
+        """★ ``friendly`` 必须自解释：症状 + 下一步动作，模型要照着转述。"""
+        friendly = self._make().friendly
+
+        self.assertIn("检测到 2 个已连接的浏览器", friendly)
+        self.assertIn("请", friendly)
+        # 用户最终要做的那件事（去配置里填一个 instance_id）必须写清楚。
+        self.assertIn("填成", friendly)
+
+    def test_repr_and_str_do_not_crash(self) -> None:
+        """日志里会 ``%r`` 它；文案含换行与中文，别在这里出岔子。"""
+        exc = self._make()
+
+        self.assertTrue(str(exc))
+        self.assertTrue(repr(exc))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .errors import BskError
+from .errors import CODE_BROWSER_AMBIGUOUS, BskBrowserAmbiguous, BskError
 from .journal import SessionJournal, default_journal_path
 from .models import (
     BrowserInstance,
@@ -224,8 +224,25 @@ class BskService:
         只在用户没有显式配置 ``browser_instance_id`` 时才会被调用。
         返回空串表示"探测不出，让 bsk 自己选默认浏览器"。
 
+        三条分支**必须**分清楚（这是本方法存在的意义）：
+
+        - **探测本身失败**（bsk 没装、命令报错、输出不是 JSON）→ 返回空串。
+          探测是优化，不该阻止会话创建，所以这里静默降级。
+        - **恰好 1 个浏览器** → 返回它的 ``instance_id``，替用户省掉一步配置。
+          这是最常见的场景（实测本机就是这一种），必须保持免配置可用。
+        - **≥2 个浏览器** → 抛 :class:`~bsk.errors.BskBrowserAmbiguous`。
+          **绝不能**返回空串：那等于让 bsk 自己随便挑一个，用户明明连着
+          Edge + Chrome，插件却静默操作其中一个 —— 现象是"有时候对这个、
+          有时候对那个"，无从排查。宁可明确报错，把每个实例的 ``instance_id``
+          列出来让用户去配置。
+
+        Raises:
+            BskBrowserAmbiguous: 同时连着多个浏览器且用户没有指定用哪一个。
+
         Note:
-            这里刻意**不抛异常** —— 探测失败不应该阻止会话创建。
+            抛"歧义"异常的部分**刻意写在 try 之外**（见 ``_pick_browser_from_probe``）：
+            上面那个 ``except Exception`` 是给"探测失败"用的，如果歧义异常也被
+            它吞掉，就会退化成"静默随机选一个"，正是本次要消灭的行为。
         """
         try:
             # SessionManager 期望的是同步可调用对象，但我们的探测是异步的。
@@ -242,12 +259,98 @@ class BskService:
             if proc.returncode != 0:
                 return ""
             data = json.loads(proc.stdout.decode("utf-8", errors="replace") or "[]")
-            if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
-                # 只有一个浏览器时自动选中它 —— 这是最常见的情况，替用户省一步配置。
-                return str(data[0].get("instance_id") or "")
         except Exception as exc:  # noqa: BLE001 - 探测失败必须静默降级
             logger.debug("浏览器探测失败，交给 bsk 选默认：%r", exc)
-        return ""
+            return ""
+        # ★ 走到这里说明探测**成功**了，于是"多浏览器歧义"是一条确定的结论，
+        #   必须让它抛出去（下面这个方法会抛），不能和上面的失败混为一谈。
+        return self._pick_browser_from_probe(data)
+
+    @staticmethod
+    def _pick_browser_from_probe(data: Any) -> str:
+        """把 ``bsk browsers --json`` 的载荷收敛成一个可用的 ``instance_id``。
+
+        Args:
+            data: 已解析的 JSON 载荷（任意类型 —— 它是外部输入）。
+
+        Returns:
+            选定的 ``instance_id``；没有可用的浏览器（0 个，或结构不认识）时
+            返回空串，表示"不传 ``--browser``，交给 bsk 自己报错/选默认"。
+
+        Raises:
+            BskBrowserAmbiguous: 有 2 个及以上可用的浏览器实例。
+
+        Note:
+            **只有带非空 ``instance_id`` 的实例才算"可用"**：``instance_id``
+            正是用户要填进配置的那个值，空 id 既不能选中、也无法让用户填写。
+            所以"1 个可用 + N 个空 id"仍按唯一可用实例处理，而不是报一个
+            列不出第二个实例的歧义错误（那样的提示会让用户莫名其妙）。
+        """
+        if not isinstance(data, list):
+            return ""
+
+        instances: list[BrowserInstance] = []
+        seen: set[str] = set()
+        for item in data:
+            instance = BrowserInstance.from_json(item)
+            if not instance.instance_id or instance.instance_id in seen:
+                continue
+            seen.add(instance.instance_id)
+            instances.append(instance)
+
+        if not instances:
+            return ""
+        if len(instances) == 1:
+            # 只有一个浏览器时自动选中它 —— 这是最常见的情况，替用户省一步配置。
+            return instances[0].instance_id
+        raise BskService._ambiguous_browser_error(instances)
+
+    @staticmethod
+    def _ambiguous_browser_error(
+        instances: list[BrowserInstance],
+    ) -> BskBrowserAmbiguous:
+        """构造"多个浏览器，无法确定用哪一个"的可操作错误。
+
+        文案要求（面向模型，最终会由 ``main.py`` 的 ``except BskError``
+        变成给 LLM 的字符串）：必须让模型知道**去哪个配置项填哪个值**，
+        所以逐条列出 ``instance_id``，并给出配置项的名字。
+
+        Note:
+            展示用 ``BrowserInstance.display_name()``（label 为空时它自己会
+            回退到 ``browser_name`` —— 实测 ``label`` 经常是空串），但
+            ``instance_id`` 一定会出现在这一行里：label 非空时
+            ``display_name()`` 只给 label，那样用户就看不到要填的值了。
+        """
+        lines = [f"检测到 {len(instances)} 个已连接的浏览器，无法确定用哪一个："]
+        for instance in instances:
+            lines.append(f"  - {BskService._describe_instance(instance)}")
+        lines.append(
+            "请在插件配置里把「目标浏览器」（browser_instance_id）填成上面其中一个 "
+            "instance_id，然后重载插件再试。"
+        )
+        lines.append(
+            "（在 AstrBot WebUI → 插件 → 本插件 → 配置 里改；"
+            "也可以先在终端执行 `bsk browsers --json` 查看这些实例。）"
+        )
+        return BskBrowserAmbiguous(
+            "多个已连接的浏览器且未配置 browser_instance_id："
+            + "、".join(i.instance_id for i in instances),
+            friendly="\n".join(lines),
+            code=CODE_BROWSER_AMBIGUOUS,
+        )
+
+    @staticmethod
+    def _describe_instance(instance: BrowserInstance) -> str:
+        """把实例渲染成一行"名称 + instance_id"，供错误文案使用。"""
+        name = instance.display_name().strip() or "未命名浏览器"
+        if instance.instance_id not in name:
+            # ``display_name()`` 在 label 为空时已经给出 "edge (c900a3da)"；
+            # label 非空时只给 label，那样用户就看不到要填的值了，这里补上。
+            name = f"{name} ({instance.instance_id})"
+        if instance.unresponsive:
+            # 只标注、不排除：它确实"连着"，用户需要知道该避开哪一个。
+            name += "（此实例当前无响应，不建议选它）"
+        return name
 
     def doctor_hint(self) -> str:
         """环境自检提示，用于错误信息里给用户可操作的下一步。"""

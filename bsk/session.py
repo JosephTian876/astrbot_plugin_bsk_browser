@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from .errors import (
     EXIT_TIMEOUT,
     OUTCOME_UNKNOWN_REASONS,
+    BskBrowserAmbiguous,
     BskError,
     BskNotInstalled,
     BskOutcomeUnknown,
@@ -1106,8 +1107,14 @@ class SessionManager:
         """决定 ``session start`` 要指定哪个浏览器。
 
         优先用配置里的 ``browser_instance_id``；没配就用 ``browser_probe``
-        探一个；探测失败返回空串（不传 ``--browser``，让 bsk 自己选默认）。
-        任何异常都吞掉 —— 探测只是优化，不该让建会话失败。
+        探一个；探测**失败**返回空串（不传 ``--browser``，让 bsk 自己选默认）。
+
+        ★ 唯一的例外是 :class:`BskBrowserAmbiguous`：它表示"探测成功了，但
+        同时连着多个浏览器，无法确定用哪一个"——这是**用户配置问题**，
+        不是探测失败。它必须原样抛出去让用户看到，否则会被下面的
+        ``except Exception`` 吞掉，退化成"不传 --browser，让 bsk 随便选一个"
+        （正是本次要修掉的静默随机行为）。注意用户的显式配置在上面的
+        ``if`` 里已经直接返回，所以"配了就必须尊重配置"不受此影响。
         """
         if self._browser_instance_id:
             return self._browser_instance_id
@@ -1118,6 +1125,8 @@ class SessionManager:
             if inspect.isawaitable(probed):
                 probed = await probed
             return _coerce_probe_result(probed)
+        except BskBrowserAmbiguous:
+            raise
         except Exception as exc:  # noqa: BLE001 - 探测失败只是回退，不是错误
             logger.debug("browser_probe 探测失败，回退到 bsk 默认浏览器：%r", exc)
             return ""

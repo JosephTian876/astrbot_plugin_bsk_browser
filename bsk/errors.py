@@ -64,6 +64,9 @@ CODE_SESSION_BUSY = "session_busy"
 CODE_PERMISSION_DENIED = "permission_denied"
 """权限不足（例如 evaluate 试图跑在非 Agent Window 标签里）。**重试无用。**"""
 
+CODE_BROWSER_AMBIGUOUS = "browser_ambiguous"
+"""同时连着多个浏览器，而用户没有指定用哪一个。**必须改配置才能继续，重试无用。**"""
+
 # 这些 reason 出现在错误 JSON 的 data.reason 里，表示"动作可能已经生效"，
 # 此时**绝对禁止重试**，否则可能重复点击/重复提交表单。
 OUTCOME_UNKNOWN_REASONS: frozenset[str] = frozenset(
@@ -187,6 +190,28 @@ class BskBrowserError(BskError):
 
 class BskVersionError(BskError):
     """bsk CLI 与浏览器扩展版本不匹配（退出码 5）。需用户升级。"""
+
+    @property
+    def retryable(self) -> bool:
+        return False
+
+
+class BskBrowserAmbiguous(BskError):
+    """同时连着多个浏览器，而用户没有指定要用哪一个。
+
+    为什么需要**单独一个类型**（而不是让 ``probe_browser`` 返回空串了事）：
+    返回空串的后果是调用方不传 ``--browser``，于是 bsk 自己随便挑一个 ——
+    用户明明连着 Edge 和 Chrome，插件却会静默操作其中一个，而且"有时候对
+    有时候不对"，完全无从排查。这里唯一的正确做法是**明确报错**，把每个
+    已连接实例的 ``instance_id`` 都列出来，让用户填进配置。
+
+    Note:
+        这是**用户配置问题**，不是瞬时故障：重试多少次结果都一样，只有
+        改配置（或关掉多余的浏览器）才能继续。
+        ``friendly`` 里必须带上完整的实例清单与操作步骤 —— 它最终会经
+        ``main.py`` 的 ``except BskError`` 变成给模型看的字符串，
+        模型要据此告诉用户去哪里改什么。
+    """
 
     @property
     def retryable(self) -> bool:
