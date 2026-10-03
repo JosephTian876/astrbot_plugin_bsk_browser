@@ -303,6 +303,184 @@ class Screenshot:
 
 
 @dataclass(slots=True)
+class EvaluateError:
+    """``evaluate`` 里 JavaScript 抛出的错误。
+
+    ★ **关键事实（实测确认）**：JS 抛异常时 ``bsk`` 进程的**退出码仍然是 0**，
+    错误只体现在返回 JSON 的 ``ok: false`` 与这个对象里。所以判成败**绝不能
+    只看退出码**，必须检查 ``ok``。实测原文：
+
+    .. code-block:: text
+
+        $ bsk evaluate "throw new Error('boom')" --session ycvt --json
+        {
+          "ok": false,
+          "tab_id": 1398286752,
+          "error": {
+            "text": "Error: boom\\n    at <anonymous>:1:7",
+            "line": 1,
+            "column": 0
+          }
+        }
+        exit=0          ← 注意：依然是 0
+    """
+
+    text: str = ""
+    """错误的完整文本（含 ``Error:`` 前缀与 JS 堆栈）。"""
+
+    line: int = 0
+    column: int = 0
+    """出错位置。**实测常见 0**：``column`` 经常是 0，``line`` 对多行表达式才有意义，
+    所以文案里要能容忍它们没有信息量（不要写"第 0 行第 0 列"这种废话）。"""
+
+    @classmethod
+    def from_json(cls, raw: Any) -> EvaluateError:
+        """从 bsk 的 JSON 构造。容忍缺失。"""
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            text=_as_str(raw.get("text")),
+            line=_as_int(raw.get("line")),
+            column=_as_int(raw.get("column")),
+        )
+
+    def location(self) -> str:
+        """把行列渲染成可读的片段，没有信息量时返回空串。
+
+        实测 ``throw new Error('boom')`` 报的是 ``line=1, column=0``，
+        而 ``column=0`` 对用户毫无意义 —— 这种情况只给行号。
+        """
+        if self.line <= 0:
+            return ""
+        if self.column > 0:
+            return f"（第 {self.line} 行第 {self.column} 列）"
+        return f"（第 {self.line} 行）"
+
+
+@dataclass(slots=True)
+class EvaluateDialog:
+    """``evaluate`` 期间被**自动处理掉**的浏览器弹窗。
+
+    ★ 实测风险（确认存在）：``bsk evaluate`` 会自动**确认**页面的 ``confirm``
+    弹窗，也就是说 ``confirm()`` 直接返回 ``true``，用户根本看不到那个弹窗。
+    实测原文：
+
+    .. code-block:: text
+
+        $ bsk evaluate "confirm('bsk-evaluate-probe')" --session ycvt --json
+        {
+          "ok": true, "tab_id": ..., "value": true,
+          "dialogs": [{"tab_id": ..., "type": "confirm",
+                       "message": "bsk-evaluate-probe", "url": "about:blank",
+                       "default_prompt": "", "has_browser_handler": true,
+                       "handled": "accepted", "sequence": 1}]
+        }
+
+    这意味着"模型写一段 JS 就能静默越过确认框"，必须把这件事告诉模型和用户
+    （渲染时会明确写出来），不能让模型以为用户已经点过"确定"了。
+
+    Note:
+        ``dialogs`` 字段在**没有弹窗时整个不存在**（实测成功样例里就没有），
+        所以解析必须用 ``raw.get("dialogs", [])``。
+    """
+
+    type: str = ""
+    """弹窗类型：``confirm`` / ``alert`` / ``prompt`` / ``beforeunload`` 等。"""
+
+    message: str = ""
+    url: str = ""
+    handled: str = ""
+    """bsk 的处理方式。实测 ``confirm``/``alert`` 都是 ``"accepted"``。"""
+
+    tab_id: int = 0
+
+    @classmethod
+    def from_json(cls, raw: Any) -> EvaluateDialog:
+        """从 bsk 的 JSON 构造。容忍缺失。"""
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            type=_as_str(raw.get("type")),
+            message=_as_str(raw.get("message")),
+            url=_as_str(raw.get("url")),
+            handled=_as_str(raw.get("handled")),
+            tab_id=_as_int(raw.get("tab_id")),
+        )
+
+
+@dataclass(slots=True)
+class EvaluateResult:
+    """``evaluate`` 的结果 —— **成败的唯一依据是 ``ok``**。
+
+    ★ 为什么需要这个类型而不是直接看退出码：实测 JS 抛异常时 bsk 的退出码
+    依然是 **0**，只看退出码会把失败当成功，把 ``error`` 结构当返回值塞给模型。
+
+    三种实测形态：
+
+    1. **成功且有值**：``{"ok": true, "tab_id": N, "value": <任意 JSON>}``
+    2. **成功但无值**：``{"ok": true, "tab_id": N}`` —— 表达式求值成
+       ``undefined`` / ``null`` 时 **``value`` 字段整个消失**（实测
+       ``evaluate "undefined"`` 与 ``evaluate "null"`` 都是这个形态）。
+       所以 ``value`` 必须区分"没有值"与"值是 null"。
+    3. **JS 抛异常**：``{"ok": false, "tab_id": N, "error": {...}}``
+
+    Note:
+        ``value`` 可能是**任意大的 JSON**：实测
+        ``Array.from({length:2000},(_,i)=>'item-'+i)`` 的命令输出有
+        **32947 个字符**。直接塞进模型上下文会撑爆，所以渲染时必须截断
+        （见 ``service.BskService.render_evaluate``）。
+    """
+
+    ok: bool = False
+    """★ JavaScript 是否执行成功。**这是唯一的成败依据**，不是退出码。"""
+
+    value: Any = None
+    """JS 的返回值（任意 JSON 类型）。``has_value`` 为 False 时无意义。"""
+
+    has_value: bool = False
+    """返回 JSON 里是否存在 ``value`` 字段。
+
+    单独一个标志位是必要的：``null`` / ``undefined`` 会让 bsk **整个省掉**
+    ``value`` 字段（实测），而 ``null`` 与"没有这个字段"在语义上不同 ——
+    前者是"表达式就是 null"，后者是"求值成了 undefined"。
+    """
+
+    error: EvaluateError | None = None
+    dialogs: list[EvaluateDialog] = field(default_factory=list)
+    tab_id: int = 0
+
+    @classmethod
+    def from_json(cls, raw: Any) -> EvaluateResult:
+        """从 ``evaluate --json`` 的输出构造。
+
+        Note:
+            **宽容策略**：拿不到 ``ok`` 字段时（输出被截断、结构不认识）按
+            ``False`` 处理。宁可把一次成功误判成失败（模型会重试或报错给用户），
+            也不要把一次失败当成成功（模型会拿着 ``None`` 编答案）。
+        """
+        if not isinstance(raw, dict):
+            return cls()
+
+        raw_dialogs = raw.get("dialogs", [])
+        dialogs = (
+            [EvaluateDialog.from_json(d) for d in raw_dialogs]
+            if isinstance(raw_dialogs, list)
+            else []
+        )
+        raw_error = raw.get("error")
+        return cls(
+            ok=_as_bool(raw.get("ok"), False),
+            value=raw.get("value"),
+            has_value="value" in raw,
+            error=EvaluateError.from_json(raw_error)
+            if isinstance(raw_error, dict)
+            else None,
+            dialogs=dialogs,
+            tab_id=_as_int(raw.get("tab_id")),
+        )
+
+
+@dataclass(slots=True)
 class ConsoleEntry:
     """一条控制台消息（``console --json`` 的 entries 元素）。"""
 

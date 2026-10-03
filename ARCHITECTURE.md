@@ -171,9 +171,13 @@ L1 page
 - 额外支持 `allowed_users`（用户 ID 白名单），便于"只给某个人用"；
 - 同时**兼容** AstrBot 原生的 `tool_permissions`（WebUI → 扩展组件）机制，两者取严。
 
-### D3：不做 `evaluate`
+### D3：`evaluate` 单独成工具、**默认关闭**、强制管理员（原为"不做 evaluate"，v0.1.0 追加）
 
-`evaluate` 能让模型在用户已登录页面执行任意 JS，风险高于收益。v1 明确不实现，并在 README 说明。留 `# TODO` 但不暴露给模型。
+`evaluate` 能让模型在用户已登录页面执行任意 JS。**能力保留但默认关闭**，
+且独立成一个工具而不是并进 `bsk_act`，具体决策见 §5 **D7**。
+
+仍然不做的事：不把它作为 `bsk_act` 的一个 action（那样会绕过独立开关与
+AstrBot 原生的 `tool_permissions`），也不给它任何"自动降级"路径。
 
 ### D4：会话键策略
 
@@ -183,15 +187,22 @@ L1 page
 
 工具返回给 LLM 的字符串必须包含**下一步该怎么做**（例如"会话已过期，已自动重建，请重试"），而不是抛裸异常。
 
-### D6：超时采用「取较大值」的单一规则
+### D6：超时采用「取较大值 + 框架上限钳制」的规则
 
 **规则一句话**：`command_timeout_sec` 是所有 bsk 命令的超时；每个命令的内置值是**下限**，
-最终值 = `max(内置下限, command_timeout_sec)`。
+整页截图另有**专门的可配置项**；最后统一被框架上限钳一次。
+
+```
+最终超时 = min( max(内置下限, command_timeout_sec), 框架上限 - 5s )
+整页截图：内置下限换成 settings.fullpage_timeout_sec（默认 120，范围 30–600）
+```
 
 - 内置下限 = "这个命令至少需要多久"。例如 `navigate` 必须 **大于** bsk 自身的 `--timeout`
   30s，否则我们会先把它掐掉、而它正要成功返回。
 - 用户配置 = "我愿意等多久"。
 - 取较大值，两者都不被违背。
+- 最后与"框架上限 − 5s"取较小值：**保证插件在框架动手之前自己超时**（见下方"框架上限"）。
+  框架上限**读不到时不钳制** —— 拿不到事实就不该凭猜测缩短用户的等待。
 
 | 命令 | 内置下限 |
 |---|---|
@@ -199,20 +210,127 @@ L1 page
 | observe | 15s |
 | session start | 30s |
 | navigate | 45s（必须 > bsk 自身默认 30s） |
-| screenshot 视口 | 30s |
-| screenshot --full-page | 180s |
+| screenshot 视口 | 30s（**固定，不读 fullpage 配置**） |
+| screenshot --full-page | `fullpage_timeout_sec`（默认 120s，用户可调 30–600） |
+
+**为什么整页截图单独一项**：它的耗时与其余命令完全不在一个量级（实测 2.9–11.7s，
+其余命令多在 1s 内），塞进 `command_timeout_sec`（上界 110s）既不够用、又会让用户
+为了截图把"所有命令的超时"一起拉长。独立一项可以只调它。**视口截图刻意不读这一项**：
+实测只要 0.12s，跟着变成 120s 属于误伤。
 
 **为什么不做更复杂的规则**（例如"快命令取 min、慢命令取 max"）：本插件的使用者是
 编程新手，配置项的行为必须能用一句话说清。复杂规则会带来解释成本和"为什么调了没用"
 的困惑 —— 而这正是改进前的老问题。
 
-**AstrBot 侧的上限**：AstrBot 的 `tool_call_timeout` 默认 **120 秒**
-（源码 `core/agent/run_context.py:19` 与 `core/config/agent_runner.py:33`），
-超时后框架会抛 `tool <name> execution timeout`。
-**但它是可调的**（`agent_runner.config.misc.tool_call_timeout`），
-所以全页截图（内置下限 180s）并非不可能，只是需要用户**两处一起调大**：
-本插件的 `command_timeout_sec` 与 AstrBot 的 `tool_call_timeout`。
-这一点必须写进 README 的已知限制里，否则用户会以为插件有 bug。
+#### 框架上限（`tool_call_timeout`）与钳制
+
+AstrBot 的 `tool_call_timeout` 默认 **120 秒**（源码 `core/agent/run_context.py:19` 与
+`core/config/agent_runner.py:33`；本机配置文件实测值也是 120），可调项为
+`agent_runner.config.misc.tool_call_timeout`。到点后框架抛
+`tool <name> execution timeout after N seconds.`（`astr_agent_tool_exec.py:691-726`）。
+**插件能读到它**：`Context.get_config()`（`core/star/context.py:597`）→
+`bsk.config.read_framework_tool_timeout`（鸭子类型下探，任何异常都降级成 None）。
+
+**钳制的理由**：插件的全页截图预算与框架默认上限都是 120 秒。若不钳制，用户看到的
+会是框架抛的英文 `execution timeout`，而**不是插件精心写的中文提示**，并且"会话可能
+留下未完成状态"这件事被完全掩盖。钳制后（默认组合 → 115 秒）超时由插件先报出来。
+**安全余量 5 秒**的理由：框架从**它开始等**的那一刻计时，而 bsk 返回后我们还要校验截图、
+渲染中文、序列化结果、交给框架发图片 —— 这些都在同一个窗口里，留余量才不会正好撞边界。
+
+⚠️ **不要把这个钳制说成"必须两处一起调大才能用全页截图"**。实测数据（见 §6.2）：
+长页面全页截图 11.72 / 11.11 / 10.91 秒，短页面 2.91 秒，距 120 秒上限约 1/10。
+**默认配置下整页截图就能用，什么都不用改**。只有极慢的页面/网络才需要同时放宽两处，
+且顺序是"先调大框架、重启，再调大插件"——否则**只调插件不会更久**（会被钳住）。
+这一点必须写进 README 的已知限制里，否则用户要么白改配置，要么以为插件有 bug。
+
+### D7：`evaluate` —— 独立工具、默认关闭、强制管理员盖过 `admin_only`
+
+`bsk evaluate` 在用户**已登录**的页面里执行任意 JavaScript。这是 bsk 最强的
+能力（读 DOM、改页面、带 cookie 调 `fetch`），但它的风险**不是** click/fill
+的"更强版本"，而是另一种性质的东西：
+
+| | click / fill / press | evaluate |
+|---|---|---|
+| 用户能否看见 | **能**，动作显示在浏览器窗口里 | **不能**，脚本静默运行 |
+| 能读到什么 | 页面上显示的内容 | 页面上**一切**（含 token、隐藏字段、localStorage） |
+| 能发请求吗 | 只能通过点按钮触发 | 可以直接 `fetch`，带登录态 |
+| 人工兜底 | 页面的 confirm 弹窗会拦住 | **弹窗被自动确认**（实测 `handled: "accepted"`） |
+
+因此有三个决策，每个都对应上表的一行：
+
+**为什么单独成工具（而不是 `bsk_act` 的一个 action）**
+
+1. **才能被单独禁用**。动作混在一个工具里，用户就没法"保留点击、禁掉执行脚本"
+   —— 只能整块开或整块关，等于逼用户在做不到精细控制时干脆全开。
+2. **才能被 AstrBot 原生的 `tool_permissions` 单独控制**（WebUI → 扩展 → 组件）。
+   框架那一层是按**工具名**授权的；`evaluate` 藏在 `bsk_act` 里就自动继承了
+   `bsk_act` 的授权，管理员在框架侧无法把它单独摘出去。
+3. **权限判定顺序才能不同**。`bsk_act` 走 `_denied()`；`evaluate` 要在它**之前**
+   多插两道判（见下）。
+
+**为什么默认关闭（`enable_evaluate=false`）**
+
+- **升级不该凭空多出高危能力**。用户装 0.1.0 时心里那笔账是"机器人能点页面"；
+  如果新版本默认把"在你邮箱里跑任意脚本"一起打开，那是在用户不知情的情况下
+  扩大了授权。新增高危能力必须**显式开启**，这个默认值本身就是一道同意。
+- 它也**不复用** `enabled` 总开关，理由同上：总开关的语义是"插件是否工作"，
+  不是"是否开放最高危能力"，两者混在一起会让用户为了关掉一个能力而停掉整个插件。
+
+**为什么"强制管理员"要盖过 `admin_only=false`（本决策的重点）**
+
+`admin_only=false` 的语义是"我愿意把**看得见的**浏览器操作开放给其他人"
+（群里的人点按钮、填表单，用户全程能在窗口里看着）。而执行脚本是静默的。
+如果让这个**粗粒度**的宽松开关顺手把最高危能力一起放开，就产生了一条极难察觉的
+权限放大路径：管理员只想"让群里的人也能查网页"，结果同时交出了
+"在已登录页面里跑任意脚本"。
+
+所以实现上 `_evaluate_denied()` 的判定是**有序的三道**（顺序即设计）：
+
+```
+1. enabled            — 总开关
+2. enable_evaluate    — 独立开关（默认关闭）
+3. evaluate_require_admin + is_admin  ← ★ 必须在 _denied() 之前
+4. _denied()          — admin_only / allowed_users 等既有规则
+```
+
+第 3 步放在第 4 步**之前**、而不是把两者写进同一个条件表达式，是为了让
+"`admin_only=false` 不能绕过它"成为**结构性**保证而不是巧合：
+`_denied()` 里那条 `if self.settings.admin_only and not is_admin` 根本没机会执行。
+`allowed_users` 白名单同理 —— 它对别的工具是"准入"，对 evaluate 不是。
+
+放开需要**两次独立决定**：既要 `enable_evaluate=true`，又要
+`evaluate_require_admin=false`。这个"摩擦力是特性"的设计已在
+`tests/verify_evaluate_gate.py` 里按分支钉死（分支 2、2b 是核心用例）。
+
+**超时**：`TIMEOUT_EVALUATE = 45s`，遵守 D6 的单一规则。必须大于 bsk 自身的
+`--timeout`（**默认 30s**，实测帮助文本），否则我们会先把它掐掉 —— 与
+`navigate` 同一条理由。我们**不**给 bsk 传 `--timeout`，好让"bsk 内部超时"
+与"外层兜底超时"保持明确的先后关系。
+
+**★ 实现上最容易错的一点（已用测试钉死）**
+
+JS 抛异常时 **bsk 的退出码仍然是 0**，失败只体现在返回 JSON 的 `ok: false` 里。
+`SessionManager.execute` 是**按退出码**判成败的（对 bsk 其它命令都正确），
+所以这一步必须在 `service.evaluate()` 里自己做：
+
+```python
+evaluation = EvaluateResult.from_json(result.data)
+if not evaluation.ok:           # ← 不能省
+    raise BskError(..., code="evaluate_js_error")
+```
+
+只信退出码的后果是"把失败当成功"，然后拿一个不存在的值去回答用户 ——
+而模型不会知道自己错了。实测三种形态（全部 `exit=0`）：
+`throw new Error('boom')`、`ReferenceError`、`SyntaxError`。
+
+**其它实测约束**（写进代码注释与 `bsk/models.py`）：
+
+- `EXPRESSION` 是**位置参数**；
+- 求值成 `undefined` / `null` 时 `value` 字段**整个消失**（要用 `has_value`
+  区分"没有值"和"值是 null"）；
+- 没有弹窗时 `dialogs` 字段**整个消失**；
+- 返回值可以是任意大的 JSON（实测 2000 元素数组 = **32947 字符**），
+  必须截断 —— 复用 `max_page_chars`，不新增配置项。
 
 ---
 
@@ -222,7 +340,7 @@ L1 page
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机 | ❌ | ❌ | `tests/test_*.py`（468 个用例） |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制 | ❌ | ❌ | `tests/test_*.py`（580 个用例） |
 | L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
 | L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与**会话过期自动重建** | ✅ | ✅ | `verify_integration.py` |
 | L4 工具层端到端 | **直接 await `main.py` 里的 6 个工具函数**，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
@@ -242,6 +360,7 @@ L1 page
 | `verify_browser_ambiguity.py` | 多浏览器歧义：1 个免配置 / ≥2 报错 / 已配置尊重配置 | ❌ |
 | `verify_config_pipeline.py` | 配置从文件 → `AstrBotConfig` → `Settings` → **实际 bsk 命令行参数**的完整贯通 | ❌ |
 | `verify_config_type.py` / `verify_config_consistency.py` | 配置来源形态（dict vs `AstrBotConfig` 对象）、schema 与代码默认值一致 | ❌ |
+| `verify_evaluate_gate.py` | `bsk_evaluate` 的**权限门三分支**（独立开关 / 强制管理员盖过 `admin_only` 与白名单 / 放行），用假 event + 假 service，不执行任何 JS | ❌ |
 | `verify_install.py` | 从**已提交文件**导出干净副本并加载，验证"别人拿到仓库能用" | ❌ |
 | `verify_discovery.py` | AstrBot **自己的插件发现函数**能否找到本插件 | ❌ |
 | `verify_failure_ux.py` | 环境未就绪时的提示质量（不能是 Python 堆栈） | ❌ |
@@ -254,7 +373,7 @@ L1 page
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd D:\UwU\Documents\dshworkdir\astrbot_plugin_bsk_browser
-& $py -m unittest discover -s tests        # L1（468 个）
+& $py -m unittest discover -s tests        # L1（580 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）
@@ -311,6 +430,8 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当�
 | `snapshot` 与 `observe` 输出等价 | 实测逐字节相同且都不带截图 | 只用 `observe`，避免多花一倍时间 |
 | `observe` 无独立 title/url 字段 | 只能从 `RootWebArea "..."` 正则提取 | `bsk/pages.py` 负责解析 |
 | observe 视口 ≠ 截图像素 | 910x604 vs 1850x1208（DPR≈2） | 不要用 observe 坐标点截图位置 |
+| **全页截图耗时（关键数据，文档多处引用）** | 本机实测：短页面 `example.com` 视口截图 **0.12s**、全页截图 **2.91s**；长页面 Wikipedia 条目全页截图 **11.72 / 11.11 / 10.91s**（1820x11741，4.5MB） | ① 整页截图默认预算取 **120s**（约 10 倍余量），不是拍脑袋的 180s；② **"必须两处一起调大才能用整页截图"是错误说法** —— 实测只用了框架 120s 上限的约 1/10，默认配置下什么都不用改（该说法曾写在 README/ARCHITECTURE 里，已删除）；③ 真正要做的是钳制，别被框架从外面掐断（见 §5 D6） |
+| **框架超时是"每一步"的，不是"整个工具"的** | `astr_agent_tool_exec.py:691` 是 `await asyncio.wait_for(anext(wrapper), timeout=tool_call_timeout)` —— 包在**每一次 `anext`** 上 | async generator 若中途 yield，计时器会重置。`bsk_screenshot` 正是先 yield 图片再 yield 文本；**但不要依赖这一点**去绕过超时 —— 钳制仍是必需的，因为它同时保证了"超时由插件报中文"这件事 |
 
 ---
 

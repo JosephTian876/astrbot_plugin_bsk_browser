@@ -34,7 +34,12 @@ from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from .bsk.config import Settings, parse_settings, validate_settings
+from .bsk.config import (
+    Settings,
+    parse_settings,
+    read_framework_tool_timeout,
+    validate_settings,
+)
 from .bsk.errors import BskError
 from .bsk.service import BskService
 from .bsk.session import SessionManager
@@ -68,10 +73,39 @@ class BskBrowserPlugin(Star):
         super().__init__(context)
         self.settings: Settings = parse_settings(config)
 
-        self.service = BskService(self.settings)
+        # 读出框架自己的单次工具调用上限（AstrBot 主配置里的 tool_call_timeout），
+        # 交给 bsk/ 层做超时钳制。★ 这个读取**永不抛异常**（读不到就是 None），
+        # 因为它在插件加载路径上 —— 拿不到这个值最多只是少一层保护，
+        # 绝不该让插件起不来（见 bsk.config.read_framework_tool_timeout）。
+        self.framework_tool_timeout: float | None = self._read_framework_timeout()
+
+        self.service = BskService(
+            self.settings, framework_tool_timeout=self.framework_tool_timeout
+        )
 
         self._reap_task: asyncio.Task[None] | None = None
         self._closed = False
+
+    def _read_framework_timeout(self) -> float | None:
+        """从 ``context.get_config()`` 里读出框架的工具调用超时。
+
+        路径：``agent_runner`` → ``config`` → ``misc`` → ``tool_call_timeout``
+        （已用真实配置文件确认过；本机取到 120）。解析逻辑在 ``bsk/config.py``
+        里（那里不能 import astrbot，所以只接收这个鸭子类型对象）。
+
+        Returns:
+            正的浮点秒数；配置拿不到、结构不认识、值非法时一律返回 ``None``
+            （表示"未知"，插件会保持原有超时行为，不做任何钳制）。
+        """
+        try:
+            getter = getattr(self.context, "get_config", None)
+            if not callable(getter):
+                return None
+            config_obj = getter()
+        except Exception as exc:  # noqa: BLE001 - 读不到就是未知，不影响加载
+            logger.debug("读取 AstrBot 主配置失败（按未知处理）：%r", exc)
+            return None
+        return read_framework_tool_timeout(config_obj)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -82,6 +116,14 @@ class BskBrowserPlugin(Star):
         # 配置问题只提示、不阻断 —— 用户可能还没装 bsk，不该因此让插件加载失败。
         for problem in validate_settings(self.settings):
             astrbot_logger.warning("[bsk_browser] 配置提醒：%s", problem)
+
+        # 整页截图的超时预算顶到框架上限时才提示（默认组合：两边都是 120 秒，
+        # 所以本机必然出现这条）。这是**正确**的，它如实说明"预算会被钳到 115 秒"。
+        # 文案刻意写成解释而非报错（措辞由 service.startup_warnings 负责）：
+        # 默认值对实测的 11.7 秒已有约 10 倍余量，绝大多数用户什么都不用做。
+        # 框架上限读不到、或大于预算时**一条都不打印**，不制造无谓的担心。
+        for warning in self.service.startup_warnings():
+            astrbot_logger.warning("[bsk_browser] %s", warning)
 
         if not self.settings.enabled:
             astrbot_logger.info("[bsk_browser] 插件已在配置中停用，不会注册任何浏览器操作。")
@@ -217,6 +259,65 @@ class BskBrowserPlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.debug("is_admin() 调用失败，按非管理员处理：%r", exc)
             return False
+
+    def _evaluate_denied(self, event: AstrMessageEvent) -> str | None:
+        """``bsk_evaluate`` **专用**的权限门。返回文案=拒绝，返回 None=放行。
+
+        为什么不能复用 ``_denied()``：那个门表达的是"能不能操作浏览器"，
+        而执行任意 JavaScript 是**另一个量级**的授权 —— 它能静默读页面数据、
+        静默提交表单，绕开"用户看得见的动作"这层约束。所以它要过两道额外的关。
+
+        **判定顺序（顺序本身就是设计，不要调换）：**
+
+        1. **总开关**：``enabled=False`` → 拒绝（与其它工具一致）。
+        2. **独立开关**：``enable_evaluate=False`` → 拒绝。默认就走这条路径。
+           刻意**不**与 ``bsk_act`` 之类共用开关：升级插件不该凭空多出一个
+           高危能力，用户必须显式去配置里打开它。
+        3. **强制管理员**：``evaluate_require_admin=True`` 且调用者不是管理员
+           → **拒绝，即使 ``admin_only=False`` 也一样**。
+        4. 其余才交给 ``_denied()``，让白名单等既有规则继续生效。
+
+        ★ 第 3 条为什么要**盖过** ``admin_only=False``：
+        ``admin_only=False`` 的语义是"我愿意把**看得见的**浏览器操作开放给
+        其他人"（点按钮、填表单，用户都能在窗口里看着）。而执行脚本是静默的。
+        如果让这个粗粒度的宽松开关顺手把最高危能力一起放开，就会出现一种
+        极难察觉的权限放大：管理员只是想"让群里的人也能查网页"，结果同时
+        交出了"在已登录页面里跑任意脚本"的能力。
+        所以这里**先**判 ``evaluate_require_admin``，判完才轮到 ``_denied()``
+        —— 而不是把两者写成一个条件。要开放就必须**显式**再关掉这一项。
+        """
+        if not self.settings.enabled:
+            return "浏览器操作已在插件配置中停用。"
+
+        # --- 第 1 道：独立开关（默认关闭）---
+        if not self.settings.enable_evaluate:
+            return (
+                "执行 JavaScript 的能力**默认关闭**，当前未启用。"
+                "（这是本插件风险最高的功能：它能在你已登录的页面里运行任意脚本，"
+                "读取页面数据、带你的登录状态发请求，而且不会像点击那样显示在"
+                "浏览器窗口里。如果确实需要，请让管理员在 AstrBot WebUI → 插件 → "
+                "本插件 → 配置 里打开「允许执行 JavaScript（enable_evaluate）」。）"
+            )
+
+        # --- 第 2 道：强制管理员。★ 放在 _denied() **之前**，才能盖过 admin_only ---
+        if self.settings.evaluate_require_admin and not self._safe_is_admin(event):
+            sender = ""
+            try:
+                sender = str(event.get_sender_id() or "")
+            except Exception:  # noqa: BLE001
+                sender = ""
+            return (
+                "执行 JavaScript 仅限 AstrBot 管理员使用，"
+                "且这一限制**不受**「仅管理员可用」总开关与用户白名单影响。"
+                f"你的 ID 是 {sender or '未知'}。"
+                "（这是刻意设计的：执行脚本能静默读取页面数据、提交表单，"
+                "风险远高于点击和输入，所以它比其他浏览器操作多一道独立的"
+                "管理员要求。管理员确实想放开时，需要单独关闭配置里的"
+                "「执行 JavaScript 仅限管理员」（evaluate_require_admin）。）"
+            )
+
+        # --- 第 3 道：其余规则（admin_only / allowed_users）继续生效 ---
+        return self._denied(event)
 
     def _key(self, event: AstrMessageEvent) -> str:
         """计算浏览器会话的隔离键。
@@ -542,3 +643,43 @@ class BskBrowserPlugin(Star):
             lines.append(f"错误：{info['error']}")
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 工具 7：执行任意 JavaScript（高风险，默认关闭 + 强制管理员）
+    # ------------------------------------------------------------------
+
+    @filter.llm_tool("bsk_evaluate")
+    async def bsk_evaluate(self, event: AstrMessageEvent, expression: str):
+        """在当前页面里执行一段 JavaScript 表达式，并返回它的值。
+
+        这是**高风险**能力，默认关闭，且默认仅管理员可用（两项都在插件配置里，
+        需要管理员先去打开）。只在 bsk_read 读不到需要的东西时才用它，例如：
+        - 读取页面上没有直接显示的数据（元素属性、输入框里已有的内容）；
+        - 精确取出某个元素的文字，而不是靠 bsk_read 的摘要。
+
+        脚本在**用户已登录的页面**里运行，因此它能接触到页面上的全部内容。
+        返回文本过长时会被截断，需要完整内容时请在表达式里先做筛选。
+
+        Args:
+            expression(string): 要执行的 JavaScript 表达式，例如 document.title。求值成 undefined 时返回"没有值"
+        """
+        # ★ 三条权限分支都在 _evaluate_denied 里，顺序即设计（见它的 docstring）。
+        denied = self._evaluate_denied(event)
+        if denied:
+            return self._fail(denied)
+
+        script = (expression or "").strip()
+        if not script:
+            return self._fail(
+                "请提供要执行的 JavaScript 表达式，例如 document.title。"
+            )
+
+        key = self._key(event)
+        try:
+            result = await self.service.evaluate(key, script)
+            return self.service.render_evaluate(result, script)
+        except BskError as exc:
+            return self._fail(f"执行脚本失败：{exc.friendly}")
+        except Exception as exc:  # noqa: BLE001
+            astrbot_logger.exception("[bsk_browser] bsk_evaluate 未预期错误")
+            return self._fail(f"执行脚本时出现未预期的错误：{exc}")
