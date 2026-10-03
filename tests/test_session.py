@@ -24,6 +24,7 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 # 让测试能 import 到项目的 bsk 包（与 test_runner.py 保持一致）。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -532,36 +533,36 @@ class TestExecute(SessionTestCase):
     async def test_session_busy_retry_actually_waits(self) -> None:
         """★ 忙重试必须真的等一小会儿再发第二次，不能立刻连发。
 
-        这里断言"两次 observe 之间至少隔了一个 BUSY_RETRY_DELAY_SEC 的**睡眠**"，
-        用事件循环的时钟来量。**不能**直接量"execute 总耗时 >= 0.1"：Windows 上
-        asyncio 的 ``_run_once`` 用 ``end_time = now + _clock_resolution`` 判定到期，
-        定时器可能提前约 1ms 触发（实测偶发），那样断言的是事件循环的粒度而不是
-        我们的代码。这里留一点余量，只验证"确实 sleep 了，而不是忙等重发"。
+        **不量墙钟耗时**：Windows 的定时器粒度约 15.6ms，``asyncio.sleep(0.1)``
+        实测可能只睡 94ms（``_run_once`` 用 ``end_time = now + _clock_resolution``
+        判定到期），任何 "gap >= 0.1 - 小余量" 的断言都会偶发失败
+        （实测 15 次里错 12 次）。那是操作系统的定时器精度，不是我们的行为。
 
-        Note:
-            ``execute`` 内部还会**懒创建会话**（先跑一次 ``session start``），
-            所以这里必须按命令名过滤，只取 ``observe`` 的两次调用；
-            否则会把 start 也算进来，得到 3 个时间点。
+        改成把 ``asyncio.sleep`` 换成**只记录请求时长、不真的等**的替身，
+        确定性地验证"确实请求了一次 100ms 的等待"。
         """
         manager = self.make_manager()
-        started = asyncio.get_running_loop().time()
-        observe_marks: list[float] = []
-        original = manager._runner.run_or_raise
-
-        async def timed(args, **kwargs):  # type: ignore[no-untyped-def]
-            # 只记录 observe，跳过懒创建会话时的 session start。
-            if args and args[0] == "observe":
-                observe_marks.append(asyncio.get_running_loop().time() - started)
-            return await original(args, **kwargs)
-
-        manager._runner = types.SimpleNamespace(run_or_raise=timed)
         self.runner.queue("observe", fail("session_busy"))
-        await manager.execute("umo-1", observe_builder)
 
-        self.assertEqual(len(observe_marks), 2, "应当恰好 observe 两次（首次 + 忙重试一次）")
-        gap = observe_marks[1] - observe_marks[0]
-        # 容忍 Windows 定时器提前触发的粒度误差（约 1ms）。
-        self.assertGreaterEqual(gap, BUSY_RETRY_DELAY_SEC - 0.005)
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float, *args: Any, **kwargs: Any) -> None:
+            sleeps.append(delay)
+            await real_sleep(0)  # 仍然让出控制权，保持事件循环语义
+
+        with mock.patch("bsk.session.asyncio.sleep", fake_sleep):
+            result = await manager.execute("umo-1", observe_builder)
+
+        self.assertTrue(result.ok)
+        # 恰好等待一次，且时长就是约定的 BUSY_RETRY_DELAY_SEC（100ms）。
+        self.assertEqual(
+            sleeps, [BUSY_RETRY_DELAY_SEC], "忙重试应当恰好等待一次 100ms"
+        )
+        # 忙重试是同一条会话上的重试，不该重建会话。
+        observe_calls = self.runner.calls_for("observe")
+        self.assertEqual(len(observe_calls), 2)
+        self.assertEqual(self.runner.start_count, 1)
 
     async def test_session_busy_retries_only_once(self) -> None:
         manager = self.make_manager()
