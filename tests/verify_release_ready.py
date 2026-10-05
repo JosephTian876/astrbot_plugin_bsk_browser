@@ -371,10 +371,19 @@ def main() -> int:
             largest = (path.relative_to(PROJECT).as_posix(), size)
     mb = total / (1024 * 1024)
 
-    # ① 相对真实上限：留 8 倍余量（2MB），足够宽松又能在真出问题时报警
+    # ① 相对真实上限留足余量（这才是市场会拒的原因）
+    #
+    # 阈值定在 3MB，依据是仓库里有哪些**有意提交**的大文件：
+    #   - logo.png（AstrBot 要求必须叫这个名字，约 92KB）
+    #   - docs/architecture.html（架构图，约 634KB；它是自包含的可交互 HTML，
+    #     内联了完整渲染逻辑与 SVG，所以比源码大得多，这是这类产物的正常体积）
+    #   - LICENSE-AGPL（AGPL 全文，约 33KB）
+    # 2MB 是当初为前两者拍的数，加上架构图就不再够用。3MB 仍给 16MB 的市场上限
+    # 留了 5 倍余量 —— 真出现"误提交产物"（几百 MB 的视频/二进制）照样会报警，
+    # 这正是本检查的价值所在。
     check(
         f"总体积远低于市场 zip 上限（{MARKET_ZIP_LIMIT_MB:.0f}MB）",
-        mb < 2.0,
+        mb < 3.0,
         f"{file_count} 个文件，共 {mb:.2f} MB（上限 {MARKET_ZIP_LIMIT_MB:.0f}MB）",
     )
 

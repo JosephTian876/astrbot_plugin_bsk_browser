@@ -6,6 +6,11 @@
 >
 > 全部数字（工具数、action 数、用例数、字符数）均为实测值，未估算。
 > 唯一事实源是 `bsk/tools.py`（工具规格）与 `tests/`（测试），本文若与代码冲突以代码为准。
+>
+> **可交互架构图**：`docs/architecture.html`（用浏览器打开，支持明暗主题、缩放、
+> 语义检索、关系追踪、导览视图）。源文件是 `docs/architecture.json`，
+> 用 archify 重新渲染即可；图里声明了代码证据（`bsk/tools.py` 的 `TOOL_SCHEMAS`），
+> 渲染时会校验仓库 revision 是否与图一致。
 
 ---
 

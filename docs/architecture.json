@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "astrbot_plugin_bsk_browser 架构",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/JosephTian876/astrbot_plugin_bsk_browser",
+      "revision": "cddaedf790f33fe7247184ba0ee17894a522d47d"
+    },
+    "views": [
+      {
+        "id": "tool-call",
+        "label": "一次工具调用",
+        "focus": ["llm", "main", "tools", "service", "session", "runner", "bskcli", "browser"],
+        "note": "从模型发起调用到真实浏览器执行：参数先过 tools.py 校验，再由 service 拼成 bsk 命令行。"
+      },
+      {
+        "id": "two-groups",
+        "label": "两组工具",
+        "focus": ["llm", "main", "tools", "legacy"],
+        "note": "6 个多动作工具共用一套 schema 与校验；8 个旧工具保留原样，由 legacy_tools 开关控制。"
+      },
+      {
+        "id": "persistence",
+        "label": "落盘与解耦",
+        "focus": ["main", "service", "paths", "journal", "shots", "plugindata", "logger"],
+        "note": "bsk 包不依赖 AstrBot 也不碰日志模块，落盘位置全部收在 paths.py。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "大模型",
+      "sublabel": "决定调哪个工具",
+      "pos": [40, 320],
+      "size": [130, 64]
+    },
+    {
+      "id": "main",
+      "type": "frontend",
+      "label": "main.py",
+      "sublabel": "2080 行 · 唯一依赖 AstrBot",
+      "pos": [250, 320],
+      "size": [160, 64],
+      "tag": "14 个 handler"
+    },
+    {
+      "id": "legacy",
+      "type": "backend",
+      "label": "8 个旧工具",
+      "sublabel": "bsk_open / bsk_read / …",
+      "pos": [40, 140],
+      "size": [150, 64],
+      "tag": "legacy_tools 开关"
+    },
+    {
+      "id": "tools",
+      "type": "backend",
+      "label": "bsk/tools.py",
+      "sublabel": "2028 行 · 规格唯一事实源",
+      "pos": [250, 140],
+      "size": [160, 64],
+      "tag": "6 工具 / 33 action",
+      "sources": [{ "path": "bsk/tools.py", "line": 1, "label": "TOOL_SCHEMAS" }]
+    },
+    {
+      "id": "service",
+      "type": "backend",
+      "label": "bsk/service.py",
+      "sublabel": "3374 行 · 参数 → 命令行",
+      "pos": [490, 320],
+      "size": [160, 64],
+      "tag": "唯一实现"
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "bsk/session.py",
+      "sublabel": "1603 行 · 会话与并发",
+      "pos": [720, 320],
+      "size": [160, 64],
+      "tag": "acquire(start_args=)"
+    },
+    {
+      "id": "runner",
+      "type": "backend",
+      "label": "bsk/runner.py",
+      "sublabel": "460 行 · 起子进程",
+      "pos": [950, 320],
+      "size": [140, 64]
+    },
+    {
+      "id": "bskcli",
+      "type": "external",
+      "label": "bsk CLI",
+      "sublabel": "0.3.2 · 独立进程",
+      "pos": [1160, 320],
+      "size": [130, 64]
+    },
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "真实浏览器",
+      "sublabel": "你已登录的那个",
+      "pos": [1160, 140],
+      "size": [130, 64],
+      "tag": "插件不碰登录态"
+    },
+    {
+      "id": "logger",
+      "type": "backend",
+      "label": "bsk/logger.py",
+      "sublabel": "93 行 · 注入式日志",
+      "pos": [40, 640],
+      "size": [150, 60],
+      "tag": "零 logging 依赖"
+    },
+    {
+      "id": "paths",
+      "type": "backend",
+      "label": "bsk/paths.py",
+      "sublabel": "198 行 · 落盘位置",
+      "pos": [250, 520],
+      "size": [150, 60]
+    },
+    {
+      "id": "journal",
+      "type": "database",
+      "label": "bsk/journal.py",
+      "sublabel": "333 行 · 会话台账",
+      "pos": [490, 640],
+      "size": [150, 60]
+    },
+    {
+      "id": "shots",
+      "type": "database",
+      "label": "bsk/shots.py",
+      "sublabel": "468 行 · 截图与清理",
+      "pos": [490, 520],
+      "size": [150, 60]
+    },
+    {
+      "id": "plugindata",
+      "type": "database",
+      "label": "插件数据目录",
+      "sublabel": "plugin_data/…_bsk_browser",
+      "pos": [800, 580],
+      "size": [170, 60]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "bsk/ 包：不 import astrbot、不 import logging",
+      "wraps": ["tools", "service", "session", "runner", "paths", "journal", "shots", "logger"]
+    }
+  ],
+  "connections": [
+    { "id": "llm-main", "from": "llm", "to": "main", "label": "调用工具", "variant": "emphasis" },
+    { "id": "main-tools", "from": "main", "to": "tools", "label": "校验参数", "fromSide": "top", "toSide": "bottom" },
+    { "id": "main-service", "from": "main", "to": "service", "label": "分派到唯一实现", "variant": "emphasis" },
+    { "id": "service-session", "from": "service", "to": "session", "label": "取会话", "variant": "emphasis" },
+    { "id": "session-runner", "from": "session", "to": "runner", "label": "构造 argv" },
+    { "id": "runner-bskcli", "from": "runner", "to": "bskcli", "label": "子进程" },
+    { "id": "bskcli-browser", "from": "bskcli", "to": "browser", "label": "操控", "fromSide": "top", "toSide": "bottom" },
+    { "id": "main-logger", "from": "main", "to": "logger", "label": "注入", "variant": "dashed" },
+    { "id": "service-paths", "from": "service", "to": "paths", "label": "取落盘位置", "variant": "dashed", "fromSide": "bottom", "toSide": "top" },
+    { "id": "paths-journal", "from": "paths", "to": "journal", "label": "台账" },
+    { "id": "paths-shots", "from": "paths", "to": "shots", "label": "截图" },
+    { "id": "journal-plugindata", "from": "journal", "to": "plugindata", "label": "sessions.json" },
+    { "id": "shots-plugindata", "from": "shots", "to": "plugindata", "label": "shots/" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "分层",
+      "items": [
+        "main.py 是唯一 import astrbot 的文件，只做参数解包与结果渲染",
+        "bsk/ 包零框架依赖，可脱离 AstrBot 单独单测",
+        "工具规格集中在 bsk/tools.py，schema 与校验同源"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "调用链",
+      "items": [
+        "6 个多动作工具共 33 个 action，action 名与参数名对齐 BrowserSkill",
+        "参数先过 tools.py 校验，再进 service 拼命令行",
+        "会话并发由 session.py 的 acquire 串行化，同一 key 严格排队"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "与 AstrBot 的边界",
+      "items": [
+        "logger 由 main.py 注入，bsk/ 不碰标准库 logging",
+        "落盘位置全部收在 paths.py，data_dir 不可用时降级到临时目录",
+        "旧工具行为零变化，由 legacy_tools 开关控制是否注册"
+      ]
+    }
+  ]
+}

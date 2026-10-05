@@ -5,6 +5,12 @@
 > 本插件是腾讯 [BrowserSkill](https://github.com/Tencent/BrowserSkill)（命令名 `bsk`）的**第三方非官方集成**。
 > 详见文末[合规声明](#11-合规声明)。
 
+![架构图](docs/architecture.png)
+
+上图是一次工具调用的完整链路，以及插件与 AstrBot 的边界。
+想放大看细节 / 搜索节点 / 按关系追踪，用浏览器打开可交互版本：
+[`docs/architecture.html`](docs/architecture.html)（源文件 `docs/architecture.json`，可用 archify 重新渲染）。
+
 ---
 
 ## 1. 这是什么
