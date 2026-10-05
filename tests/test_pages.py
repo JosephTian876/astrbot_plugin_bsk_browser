@@ -1,13 +1,13 @@
 """``bsk/pages.py`` 的单元测试。
 
-全部是**纯函数测试**：不需要 AstrBot、不需要浏览器、不需要装 bsk，
+全部是纯函数测试：不需要 AstrBot、不需要浏览器、不需要装 bsk，
 甚至不需要联网。直接用实测抓到的真实 VOM 文本当输入。
 
 覆盖的重点（对应踩过的坑）：
 
 - 真实 example.com 的 VOM 能解析出标题 / 元素 / 视口；
 - 各种畸形输入（空串、只有头部、缺 ``@view``、tab 缩进、名字含引号、
-  没有 target、孤立代理项……）**一律不抛异常**；
+  没有 target、孤立代理项……）一律不抛异常；
 - 多语言（中/阿/俄/法/西）文本不丢失、不乱码；
 - ``summarize`` 的长度上限是硬保证，截断时必须带提示。
 
@@ -104,7 +104,7 @@ class TestRealExampleCom(unittest.TestCase):
 
         self.assertEqual(len(refs), 1, "这个页面只有 1 个可交互元素")
         ref = refs[0]
-        # ref 存进 PageRef 时必须**不带 @**
+        # ref 存进 PageRef 时必须不带 @
         self.assertEqual(ref.ref, "e1")
         self.assertEqual(ref.role, "link")
         self.assertEqual(ref.name, "Learn more")
@@ -287,7 +287,7 @@ class TestMalformedInputNeverRaises(unittest.TestCase):
     def test_root_webarea_word_inside_body_is_not_title(self) -> None:
         """正文里恰好出现 RootWebArea 字样时，不能抢在真标题前面被当成标题。
 
-        所以标题只认**行首**的 RootWebArea，不做全文子串搜索。
+        所以标题只认行首的 RootWebArea，不做全文子串搜索。
         """
         text = vom(
             "@vom 1",
@@ -541,7 +541,7 @@ class TestSummarize(unittest.TestCase):
         工具调用打挂（见 ARCHITECTURE.md 的 C9）。
 
         Note:
-            这里**不能**断言"能被 gbk 编码" —— 真实页面正文里就有阿拉伯文、
+            这里不能断言"能被 gbk 编码" —— 真实页面正文里就有阿拉伯文、
             俄文，它们本来就编不进 gbk。要保证的是"没有代理项"，
             也就是 ``encode("utf-8")`` 一定成功。
         """

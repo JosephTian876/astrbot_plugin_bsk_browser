@@ -1,13 +1,13 @@
-"""真实环境验证：recover_orphans 对**真实 bsk daemon** 的行为。
+"""真实环境验证：recover_orphans 对真实 bsk daemon 的行为。
 
-为什么必须单独做这一步：journal 的恢复逻辑此前只用**假 runner** 验证过。
+为什么必须单独做这一步：journal 的恢复逻辑此前只用假 runner 验证过。
 假 runner 的行为是我假设的，而真实 daemon 的返回结构、错误语义可能不同 ——
 一旦假设错了，"清理孤儿会话"可能会变成"不清理"甚至"误停别人的会话"。
 
-本脚本刻意制造一个**真实的孤儿会话**，然后验证恢复逻辑能正确识别并清理它。
+本脚本刻意制造一个真实的孤儿会话，然后验证恢复逻辑能正确识别并清理它。
 
 安全边界：
-- 只创建/停止**本脚本自己**的会话，绝不用 `session stop --all`；
+- 只创建/停止本脚本自己的会话，绝不用 `session stop --all`；
 - 不访问任何网站（只开会话、不导航）；
 - 结束前无论成败都清理干净。
 
@@ -96,7 +96,7 @@ async def main() -> int:
     sample = after_create.get(created[0], {})
     has_wid = "agent_window_id" in sample
     check(
-        "★ 真实 session list 带 agent_window_id（碰撞防护的前提）",
+        "真实 session list 带 agent_window_id（碰撞防护的前提）",
         has_wid,
         f"字段={sorted(sample)}" if sample else "没取到样本",
     )
@@ -128,7 +128,7 @@ async def main() -> int:
             f"当前={sorted(after_recover)}",
         )
         check(
-            "★ s2（不在 journal 里的，模拟别人的会话）没被动",
+            "s2（不在 journal 里的，模拟别人的会话）没被动",
             created[1] in after_recover,
             f"s2 是否还在={created[1] in after_recover}",
         )
@@ -137,7 +137,7 @@ async def main() -> int:
     # ------------------------------------------------------------------
     # 3. 碰撞防护的真实版：journal 里的窗口号故意写错
     # ------------------------------------------------------------------
-    print("\n--- 3. ★ 真实碰撞场景：窗口号不匹配时必须跳过 ---")
+    print("\n--- 3. 真实碰撞场景：窗口号不匹配时必须跳过 ---")
     still = await live_sessions(runner)
     target = created[1]
     if target in still:
@@ -150,7 +150,7 @@ async def main() -> int:
                     browser_instance_id=str(
                         still[target].get("browser_instance_id") or ""
                     ),
-                    # 故意写一个**不同**的窗口号，模拟"id 撞车但不是我们的"
+                    # 故意写一个不同的窗口号，模拟"id 撞车但不是我们的"
                     agent_window_id=real_wid + 999999,
                     created_at=1.0,
                     pid=0,
@@ -165,7 +165,7 @@ async def main() -> int:
                 f"cleaned={cleaned}",
             )
             check(
-                "★ 真实会话未被误停（没误杀别人的会话）",
+                "真实会话未被误停（没误杀别人的会话）",
                 target in after,
                 f"{target} 是否还在={target in after}",
             )

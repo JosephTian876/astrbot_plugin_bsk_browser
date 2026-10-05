@@ -1,13 +1,13 @@
 """真实环境验证：新增暴露的 wait_for_navigation 动作确实可用。
 
 ## 为什么单独验证
-`wait_for_navigation` 此前**已实现但三处清单都没列**（main.py 的 docstring、
+`wait_for_navigation` 此前已实现但三处清单都没列（main.py 的 docstring、
 service.py 的错误提示、README 的动作表），意味着模型根本不知道它存在 ——
 实质是不可达的死代码。本次把它补齐到三处。
 
 补齐之后必须验证两件事：
-1. **它能真的工作**（对真实浏览器发得出去、bsk 接受这个命令）；
-2. **它确实是只读的**（不会改变页面状态，因此可以在不确定态下安全使用）。
+1. 它能真的工作（对真实浏览器发得出去、bsk 接受这个命令）；
+2. 它确实是只读的（不会改变页面状态，因此可以在不确定态下安全使用）。
 
 安全边界：只访问 example.com、不借用用户标签页、不做任何写操作、
 不用 `session stop --all`、结束显式清理自己的会话。
@@ -73,8 +73,8 @@ async def main() -> int:
             f"session={session.session_id!r}, title={obs.title!r}",
         )
 
-        # --- ★ 调用 wait_for_navigation（本次新增暴露的动作）---
-        print("\n--- 2. ★ 执行 wait_for_navigation ---")
+        # --- 调用 wait_for_navigation（本次新增暴露的动作）---
+        print("\n--- 2. 执行 wait_for_navigation ---")
         try:
             result = await service.act(KEY, "wait_for_navigation")
             check(

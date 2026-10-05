@@ -1,12 +1,12 @@
 """端到端配置贯通验证：用户在 WebUI 里改的值，真的会生效吗？
 
 ## 为什么需要这个测试
-前面已有两个测试覆盖配置的**解析**（`test_config_source.py` 验证 dict 与
-AstrBotConfig 两种形态），但没有验证**从「用户写的配置文件」到「插件实际
-用于调用 bsk 的参数」这整条链路**。
+前面已有两个测试覆盖配置的解析（`test_config_source.py` 验证 dict 与
+AstrBotConfig 两种形态），但没有验证从「用户写的配置文件」到「插件实际
+用于调用 bsk 的参数」这整条链路。
 
 中间任何一环断掉，用户看到的现象都是同一句话：「我改了配置，但没用」。
-而这是插件里最难自查、也最让用户沮丧的一类问题 —— 因为**不会有任何报错**。
+而这是插件里最难自查、也最让用户沮丧的一类问题 —— 因为不会有任何报错。
 
 本脚本验证完整链路：
     用户写的 JSON 文件
@@ -39,7 +39,7 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
-# ★ 钉住 AstrBot root，避免在项目目录里生成 data/（含主配置与 API 密钥）。
+# 钉住 AstrBot root，避免在项目目录里生成 data/（含主配置与 API 密钥）。
 os.environ.setdefault(
     "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
 )
@@ -185,9 +185,9 @@ async def main() -> int:
     )
 
     # ------------------------------------------------------------------
-    # 4. ★ 贯通到实际发出的 bsk 命令行参数
+    # 4. 贯通到实际发出的 bsk 命令行参数
     # ------------------------------------------------------------------
-    print("\n--- 4. ★ → 实际传给 bsk 的命令行参数 ---")
+    print("\n--- 4. → 实际传给 bsk 的命令行参数 ---")
     try:
         await service.sessions.acquire("pipeline-test")
     except Exception as exc:  # noqa: BLE001
@@ -198,7 +198,7 @@ async def main() -> int:
     if start_calls:
         argv = start_calls[0]
         check(
-            "★ --browser 使用配置里的 instance_id",
+            "--browser 使用配置里的 instance_id",
             "--browser" in argv and "deadbeef" in argv,
             f"实际参数={argv}",
         )

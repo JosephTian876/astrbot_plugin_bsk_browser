@@ -1,17 +1,17 @@
 """会话所有权 journal —— 把"我创建了哪些浏览器会话"落到磁盘上。
 
-**要解决的问题**：``bsk`` 的会话由**独立于 AstrBot 的常驻 daemon** 持有。
+要解决的问题：``bsk`` 的会话由独立于 AstrBot 的常驻 daemon 持有。
 本插件只在内存里记着自己创建过哪些会话（``SessionManager._entries``），于是：
 
 - AstrBot 被强杀（任务管理器结束进程、崩溃、断电）时 ``terminate()`` 不会执行；
-- daemon 还活着，那些会话也还活着，**用户桌面上留下没人管的浏览器窗口**；
+- daemon 还活着，那些会话也还活着，用户桌面上留下没人管的浏览器窗口；
 - AstrBot 重启后插件内存是空的，不认识这些会话，于是永远清理不掉。
 
-对策是**持久化的所有权记录**：会话一建出来就落盘，正常 stop 后删掉，
+对策是持久化的所有权记录：会话一建出来就落盘，正常 stop 后删掉，
 下次启动时据此把"仍然活着的、自己的"会话停掉。
 
-**绝对不能用 ``bsk session stop --all`` 来"一把清干净"** —— 那会连带停掉
-**别的程序**（用户自己的 DSH、他们的另一个 AI 工具）创建的会话。所以：
+绝对不能用 ``bsk session stop --all`` 来"一把清干净" —— 那会连带停掉
+别的程序（用户自己的 DSH、他们的另一个 AI 工具）创建的会话。所以：
 
 1. journal 里除了 ``session_id``，还必须记 ``browser_instance_id`` 与
    ``agent_window_id``；
@@ -20,12 +20,12 @@
 
 设计约束（写代码时请勿破坏）：
 
-- **纯标准库**，不 import astrbot，也不 import 本包其他模块，可独立单测；
-- **本模块的任何方法都不抛异常**（``load`` / ``add`` / ``remove`` / ``clear``）：
+- 纯标准库，不 import astrbot，也不 import 本包其他模块，可独立单测；
+- 本模块的任何方法都不抛异常（``load`` / ``add`` / ``remove`` / ``clear``）：
   它在插件启动路径上跑，一个异常就是插件加载失败；
-- **原子写**：先写 ``<path>.tmp`` 再 ``os.replace()``，避免写一半被杀留下坏文件；
-- **显式 UTF-8**：Windows 中文环境下默认编码是 gbk，写中文诊断信息会炸；
-- **读不到就当没有**：文件不存在、是空文件、是半截 JSON、是二进制垃圾、
+- 原子写：先写 ``<path>.tmp`` 再 ``os.replace()``，避免写一半被杀留下坏文件；
+- 显式 UTF-8：Windows 中文环境下默认编码是 gbk，写中文诊断信息会炸；
+- 读不到就当没有：文件不存在、是空文件、是半截 JSON、是二进制垃圾、
   路径是个目录、没有读权限 —— 一律返回空列表。宁可漏清，绝不因为解析失败
   让插件起不来。
 """
@@ -71,7 +71,7 @@ def default_journal_path() -> Path:
     可以接受（journal 本来就是尽力而为的辅助机制）。
 
     Returns:
-        journal 文件的绝对路径（**不保证文件或目录存在**）。
+        journal 文件的绝对路径（不保证文件或目录存在）。
     """
     try:
         base = Path(tempfile.gettempdir())
@@ -121,13 +121,13 @@ class JournalEntry:
 
     三个身份字段缺一不可：
 
-    - ``session_id``：bsk 的会话 id，**只有 4 个小写字母**（26^4 ≈ 45.7 万空间）；
+    - ``session_id``：bsk 的会话 id，只有 4 个小写字母（26^4 ≈ 45.7 万空间）；
     - ``agent_window_id``：那扇 Agent Window 的 id，数值空间大得多，
-      是**区分 id 碰撞**的关键字段；
+      是区分 id 碰撞的关键字段；
     - ``browser_instance_id``：会话挂在哪个浏览器实例上，用于二次佐证。
 
     只有 ``session_id`` 一个字段的话，一旦出现碰撞（我们记录的 ``mnaa`` 已经过期，
-    之后另一个程序也建了一个 ``mnaa``），清理时就会**误停别人的会话**。
+    之后另一个程序也建了一个 ``mnaa``），清理时就会误停别人的会话。
     """
 
     session_id: str
@@ -136,7 +136,7 @@ class JournalEntry:
     created_at: float
     """``time.time()`` 的秒级时间戳。
 
-    这里**必须**用墙钟而不是 ``time.monotonic()``：要跨进程比较
+    这里必须用墙钟而不是 ``time.monotonic()``：要跨进程比较
     （上一次进程写、这一次进程读），而 monotonic 的原点在每个进程里都可能不同。
     """
 
@@ -155,7 +155,7 @@ class JournalEntry:
 
     @classmethod
     def from_json(cls, raw: Any) -> JournalEntry | None:
-        """从一条 JSON 记录构造；**结构非法时返回 None**（由调用方跳过这一条）。
+        """从一条 JSON 记录构造；结构非法时返回 None（由调用方跳过这一条）。
 
         刻意"坏一条丢一条"而不是"坏一条丢整份"：手工编辑或半截写入的 journal
         里混进一条垃圾，不该让其他完好的记录一起作废。
@@ -178,7 +178,7 @@ class JournalEntry:
 class SessionJournal:
     """把会话所有权记录存成一个 JSON 文件的 journal。
 
-    刻意做成**无内存状态**的：每次读写都直接面对文件，配合一把
+    刻意做成无内存状态的：每次读写都直接面对文件，配合一把
     ``threading.Lock`` 串行化 ``add`` / ``remove`` / ``clear``。
     这样做的好处是"文件里有什么"与"我们以为什么"永远一致 ——
     这正是一个崩溃恢复机制最需要的性质。
@@ -187,7 +187,7 @@ class SessionJournal:
         path: journal 文件的路径。父目录不存在时会在写入时自动创建。
 
     Note:
-        本类的公开方法**都不抛异常**。写失败只记 debug 日志：
+        本类的公开方法都不抛异常。写失败只记 debug 日志：
         journal 是尽力而为的辅助机制，它的失败绝不该影响会话的正常创建与停止。
     """
 
@@ -219,7 +219,7 @@ class SessionJournal:
     def load(self) -> list[JournalEntry]:
         """读出全部记录。
 
-        **任何异常都吞掉并返回空列表** —— 文件不存在、空文件、半截 JSON、
+        任何异常都吞掉并返回空列表 —— 文件不存在、空文件、半截 JSON、
         非法 JSON、二进制垃圾、路径是目录、没有读权限，结果都是"读不到"。
         本方法在插件启动路径上跑，抛异常等于插件加载失败，那是不可接受的。
 
@@ -234,7 +234,7 @@ class SessionJournal:
         return self.load()
 
     def add(self, entry: JournalEntry) -> None:
-        """写入一条记录（**原子写**：先写 ``.tmp`` 再 ``os.replace``）。
+        """写入一条记录（原子写：先写 ``.tmp`` 再 ``os.replace``）。
 
         ``session_id`` 相同的旧记录会被替换 —— 同一个 id 只可能对应一条记录，
         靠它去重可以避免崩溃重启后 journal 里堆出重复条目。
@@ -260,7 +260,7 @@ class SessionJournal:
             self._write_unlocked(remaining)
 
     def clear(self) -> None:
-        """清空 journal（**删文件**，不是写一个空列表）。
+        """清空 journal（删文件，不是写一个空列表）。
 
         先删主文件再删残留的 ``.tmp``；删不掉（被占用、权限不足）也不抛异常。
         删文件而不是写空内容，是为了让"没有遗留会话"这个状态在磁盘上一眼可见。
@@ -275,9 +275,9 @@ class SessionJournal:
     # ------------------------------------------------------------------
 
     def _read_unlocked(self) -> list[JournalEntry]:
-        """真正读文件的实现。**调用方必须持有锁**。"""
+        """真正读文件的实现。调用方必须持有锁。"""
         try:
-            # ★ 显式 utf-8：Windows 中文环境下默认是 gbk，写进中文诊断信息
+            # 显式 utf-8：Windows 中文环境下默认是 gbk，写进中文诊断信息
             #   或路径含中文时会抛 UnicodeDecodeError。
             text = self._path.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 - 读不到就是"没有记录"
@@ -314,11 +314,11 @@ class SessionJournal:
         return result
 
     def _write_unlocked(self, entries: list[JournalEntry]) -> None:
-        """真正写文件的实现（原子写）。**调用方必须持有锁，且本方法不抛异常**。
+        """真正写文件的实现（原子写）。调用方必须持有锁，且本方法不抛异常。
 
         步骤：建目录 → 写 ``.tmp`` → ``flush`` + ``fsync`` → ``os.replace``。
 
-        ``os.replace`` 在 Windows 与 POSIX 上都是**原子的覆盖**，所以任何时刻
+        ``os.replace`` 在 Windows 与 POSIX 上都是原子的覆盖，所以任何时刻
         读到的要么是旧的完整内容、要么是新的完整内容，不会读到写了一半的文件。
         """
         payload = {

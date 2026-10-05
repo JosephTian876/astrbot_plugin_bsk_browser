@@ -1,4 +1,4 @@
-"""L4 工具层端到端测试：直接 await 插件注册给 LLM 的 **6 个工具函数**。
+"""L4 工具层端到端测试：直接 await 插件注册给 LLM 的 6 个工具函数。
 
 ## 这一层补的是什么缺口
 
@@ -6,33 +6,33 @@
 参数校验、权限门、URL 协议白名单、异常包装、``bsk_screenshot`` 的 async generator
 行为、``bsk_act`` 的动作名归一化。既有的三层测试都不覆盖它：
 
-- **L1**（``tests/test_*.py``）只测 ``bsk/`` 纯逻辑，用假 runner；
-- **L2**（``tests/verify_astrbot_contract.py``）只证明 6 个工具**注册成功**、
-  docstring schema 正确、生命周期方法可调用，**没有调用过工具函数本身**；
-- **L3**（``tests/verify_integration.py``）测的是 ``BskService`` 服务层，
-  **不经过 main.py 的工具函数**。
+- L1（``tests/test_*.py``）只测 ``bsk/`` 纯逻辑，用假 runner；
+- L2（``tests/verify_astrbot_contract.py``）只证明 6 个工具注册成功、
+  docstring schema 正确、生命周期方法可调用，没有调用过工具函数本身；
+- L3（``tests/verify_integration.py``）测的是 ``BskService`` 服务层，
+  不经过 main.py 的工具函数。
 
-所以本脚本的定位是 L2 与 L3 之间缺掉的那一层：在**真实 AstrBot 环境**里加载插件、
-拿到插件实例，把工具函数当普通方法直接 await，用**真实浏览器**验证行为。
+所以本脚本的定位是 L2 与 L3 之间缺掉的那一层：在真实 AstrBot 环境里加载插件、
+拿到插件实例，把工具函数当普通方法直接 await，用真实浏览器验证行为。
 
 ## 加载方式与一致性检查
 
 工具函数被框架用 ``handler.__module__ == metadata.module_path`` 判定，所以必须走
 ``__import__("data.plugins.<目录>.main", fromlist=["main"])`` 这条真实加载路径。
-注意：**被测代码是安装目录那份**，而源码目录是我们编辑的那份。如果两者不一致，
+注意：被测代码是安装目录那份，而源码目录是我们编辑的那份。如果两者不一致，
 测试会在旧代码上通过而给出假信心 —— 所以脚本开头用 SHA256 严格比对
-``main.py`` 与 ``bsk/*.py``，不一致就**直接失败并提示同步**，绝不静默继续。
+``main.py`` 与 ``bsk/*.py``，不一致就直接失败并提示同步，绝不静默继续。
 
 ## 安全边界（与 L3 一致，不得放宽）
 
 - 只访问 ``https://example.com``，以及第 6 组用例里那个按 RFC 6761 保留、
   永不解析的 ``.invalid`` 域名；
-- 只用插件自己开的 Agent Window，**绝不借用（borrow）用户的标签页**；
+- 只用插件自己开的 Agent Window，绝不借用（borrow）用户的标签页；
 - 不做 click / fill / press / upload / download / evaluate（``bsk_act`` 只做只读的
   ``scroll_to``）；
-- **绝不使用 ``bsk session stop --all``**，只按精确 session id 停；
-- 结束时关闭**本测试创建的所有会话**；断言只比对"本测试创建的 session id 是否还在
-  daemon 里"，**不能**断言 daemon 会话数为 0（那会把用户自己的 DSH 会话也算进来而误报）。
+- 绝不使用 ``bsk session stop --all``，只按精确 session id 停；
+- 结束时关闭本测试创建的所有会话；断言只比对"本测试创建的 session id 是否还在
+  daemon 里"，不能断言 daemon 会话数为 0（那会把用户自己的 DSH 会话也算进来而误报）。
 
 用法：
     python tests/verify_tools_e2e.py
@@ -153,7 +153,7 @@ def _python_files(root: Path) -> dict[str, str]:
 def consistency_check() -> bool:
     """比对源码目录与安装目录的 ``main.py`` / ``bsk/*.py`` 内容。
 
-    为什么必须做：本脚本的 **import 走安装目录**，而人（和 CI）改的是**源码目录**。
+    为什么必须做：本脚本的 import 走安装目录，而人（和 CI）改的是源码目录。
     两者不一致时测试会在旧代码上"通过"，是最危险的一种假阳性。这里用文件哈希
     严格比对，不一致就报错并提示同步方式，而不是继续跑。
 
@@ -211,10 +211,10 @@ def _ensure_paths() -> None:
     - AstrBot 应用目录：``import astrbot``
     - ``~/.astrbot``：``import data.plugins.<插件>``（AstrBot 真实加载路径）
 
-    另外**必须**把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时
-    优先读它，否则普通模式下会用**当前工作目录**（core/utils/astrbot_path.py:29-35）。
+    另外必须把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时
+    优先读它，否则普通模式下会用当前工作目录（core/utils/astrbot_path.py:29-35）。
     不设置的话，在项目目录里运行本脚本会在项目内生成 ``data/cmd_config.json``
-    —— AstrBot 的**主配置**，含 provider API 密钥与管理员 QQ 号，
+    —— AstrBot 的主配置，含 provider API 密钥与管理员 QQ 号，
     而这个仓库是要公开发布的。
     """
     for path in (str(HERE), str(PROJECT)):
@@ -225,7 +225,7 @@ def _ensure_paths() -> None:
     if os.path.isdir(astrbot_app) and astrbot_app not in sys.path:
         sys.path.insert(0, astrbot_app)
 
-    # ★ 先"设置"再"读取"：只在没设过时才写入，避免覆盖用户显式配置。
+    # 先"设置"再"读取"：只在没设过时才写入，避免覆盖用户显式配置。
     astrbot_root = os.environ.get(
         "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
     )
@@ -246,7 +246,7 @@ def _resolve_bsk_path() -> str:
 
 
 def _installed_submodule(name: str):
-    """取**安装目录**那份代码里的子模块（保证用被测代码本身做辅助操作）。"""
+    """取安装目录那份代码里的子模块（保证用被测代码本身做辅助操作）。"""
     return sys.modules[f"{PLUGIN_PKG}.bsk.{name}"]
 
 
@@ -258,7 +258,7 @@ def _installed_submodule(name: str):
 async def call(fn, *args, **kwargs):
     """await 一个工具函数，返回 ``(结果, 异常)``。
 
-    刻意**不**让异常冒出来：本层要验证的核心之一就是"工具函数绝不把异常抛给框架"，
+    刻意不让异常冒出来：本层要验证的核心之一就是"工具函数绝不把异常抛给框架"，
     所以异常必须被捕捉成数据交给用例去判定，而不是中断整个脚本。
     """
     try:
@@ -350,7 +350,7 @@ async def daemon_session_ids() -> set[str]:
     """直接问 daemon 现在有哪些会话 id。
 
     用 ``bsk session list --json`` 而不是 ``browsers`` 的 ``session_count`` ——
-    后者会把**所有**会话算进来（包括用户自己的 DSH），无法区分哪些是本测试创建的。
+    后者会把所有会话算进来（包括用户自己的 DSH），无法区分哪些是本测试创建的。
     """
     result = await RUNNER.run(["session", "list", "--json"], timeout=15)
     data = result.data or []
@@ -402,7 +402,7 @@ async def group_permission() -> None:
     )
     check_str_result("1.1 非管理员调用 bsk_open 被拒绝", denied, exc, ("仅限管理员",))
 
-    # --- 1.2 拒绝时**没有真的打开浏览器**（daemon 会话清单前后对比）---
+    # --- 1.2 拒绝时没有真的打开浏览器（daemon 会话清单前后对比）---
     after = await daemon_session_ids()
     record(
         "1.2 拒绝时没有新建 bsk 会话（daemon 前后对比）",
@@ -411,7 +411,7 @@ async def group_permission() -> None:
     )
 
     # --- 1.3 管理员放行 ---
-    # 这里故意用一个"必然在权限门之后才失败"的输入（空网址）来证明**已经过了权限门**：
+    # 这里故意用一个"必然在权限门之后才失败"的输入（空网址）来证明已经过了权限门：
     # 空网址的提示文案与权限拒绝文案完全不同，能明确区分"被拒"与"放行"。
     text, exc = await call(
         inst.bsk_open, FakeEvent(is_admin=True, sender_id="10001", umo=UMO_BROWSER), url=""
@@ -467,7 +467,7 @@ async def group_permission() -> None:
     )
 
     # --- 1.8 只有 1.4 那一次放行产生了会话，其余拒绝路径一个都不许有 ---
-    # 注意：1.4 是**故意**真实打开一次浏览器的（证明 admin_only=False 确实放行），
+    # 注意：1.4 是故意真实打开一次浏览器的（证明 admin_only=False 确实放行），
     # 所以这里允许且仅允许它那一个会话出现，其余 key 必须始终为空。
     final = await daemon_session_ids()
     allowed_sid = session_id_for(inst_open, UMO_NONADMIN)
@@ -544,7 +544,7 @@ async def group_validation() -> None:
     text, exc = await call(inst.bsk_act, admin, action="select", target="@e1")
     check_str_result("2.7 bsk_act(select) 缺 value 返回可读错误", text, exc, ("操作失败", "选项"))
 
-    # 2.8 参数校验失败**不能**顺手开一个浏览器会话
+    # 2.8 参数校验失败不能顺手开一个浏览器会话
     started_after = started_count(inst)
     record(
         "2.8 参数校验失败未创建任何浏览器会话",
@@ -886,15 +886,15 @@ async def run() -> int:
 async def cleanup() -> None:
     """关闭本测试创建的所有会话，并精确验证没有残留。
 
-    ★ 断言只比对"**本测试创建的** session id 是否还在 daemon 里"，
+    断言只比对"本测试创建的 session id 是否还在 daemon 里"，
       不断言 daemon 会话数为 0 —— 那会把用户自己的 DSH 会话算进来而误报。
 
     这里分两步记录，刻意不把两者混为一谈：
 
-    1. **7.1**：插件的 ``terminate()`` 有没有留下残留 —— 这是对**被测代码**的断言，
+    1. 7.1：插件的 ``terminate()`` 有没有留下残留 —— 这是对被测代码的断言，
        失败了就是真实的健壮性问题，如实报出来。
-    2. **7.2**：测试自己兜底清理（按精确 id 重试 stop）的结果 —— 这是**测试的卫生要求**，
-       保证跑完不给用户留浏览器窗口。它通过**不代表** 7.1 的缺陷不存在。
+    2. 7.2：测试自己兜底清理（按精确 id 重试 stop）的结果 —— 这是测试的卫生要求，
+       保证跑完不给用户留浏览器窗口。它通过不代表 7.1 的缺陷不存在。
     """
     banner("清理：关闭本测试创建的所有会话")
 
@@ -907,22 +907,22 @@ async def cleanup() -> None:
 
     # --- 7.1 插件自身 terminate() 的清理结果 ---
     #
-    # ⚠️ 这一条是**已知会间歇性失败**的断言，而且失败是**真问题**，不是测试抖动：
+    # ⚠️ 这一条是已知会间歇性失败的断言，而且失败是真问题，不是测试抖动：
     #
-    #   ``bsk/session.py`` 的 ``_stop_session_id`` 对 ``session stop`` **只尝试一次**
+    #   ``bsk/session.py`` 的 ``_stop_session_id`` 对 ``session stop`` 只尝试一次
     #   （失败分支见该函数里的 ``self._counters["stop_failed"] += 1``），
     #   任何异常都直接记 ``stop_failed`` 并返回 False —— 行号会随重构漂移，
-    #   所以这里按**函数名 + 计数器名**定位，不写死行号。实测 bsk 0.3.2 在
-    #   "**navigate 曾经失败过**的会话"上会随机返回：
+    #   所以这里按函数名 + 计数器名定位，不写死行号。实测 bsk 0.3.2 在
+    #   "navigate 曾经失败过的会话"上会随机返回：
     #       extension rejected tool.session_stop: RpcError {
     #           code: ProtocolError, message: "Background execution cleanup timed out" }
-    #   此时会话其实**还活着**（Agent Window 还开着），而插件已经放弃，
+    #   此时会话其实还活着（Agent Window 还开着），而插件已经放弃，
     #   于是会话泄漏到 daemon 里，直到 bsk 自己 5 分钟后回收（且回收不保证归还标签页）。
     #
     #   量化（本机实测）：navigate 失败的会话 3/14 轮泄漏；同样流程但 navigate 成功 0/14。
-    #   紧接一次重试 stop 就能成功 —— 说明这是**瞬时**状态，重试是有效修复。
+    #   紧接一次重试 stop 就能成功 —— 说明这是瞬时状态，重试是有效修复。
     #
-    #   这里**刻意保持严格断言**（不去放水），让它继续报红，直到 bsk/session.py 修好。
+    #   这里刻意保持严格断言（不去放水），让它继续报红，直到 bsk/session.py 修好。
     #   7.2 才是测试自己的兜底清理。
     try:
         remaining = await daemon_session_ids()

@@ -1,12 +1,12 @@
 """真实发现路径验证：AstrBot 自己能不能"找到并加载"这个插件。
 
-已有的 L2 契约测试是**我手动拼 import 路径**去加载插件；这里不同 ——
-它调用 AstrBot **自己的插件发现函数**（``PluginManager._get_modules``），
+已有的 L2 契约测试是我手动拼 import 路径去加载插件；这里不同 ——
+它调用 AstrBot 自己的插件发现函数（``PluginManager._get_modules``），
 然后走它自己的元数据解析与版本校验流程。
 
 为什么值得单独测：发现逻辑有一堆隐式规则（目录下必须有 main.py、
 跳过 ``.plugin-install-*`` 之类前缀、``_conf_schema.json`` 决定是否给配置…），
-任何一条不满足，插件在用户机器上就是**装了但不出现**。
+任何一条不满足，插件在用户机器上就是装了但不出现。
 这类问题在我手动 import 的测试里完全看不出来。
 
 用法：
@@ -26,10 +26,10 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
-# ★ 关键：把 AstrBot 的 root 钉到用户真实目录，并让 CWD 离开项目目录。
+# 关键：把 AstrBot 的 root 钉到用户真实目录，并让 CWD 离开项目目录。
 #
 # 原因：AstrBot 解析数据路径时优先读 ``ASTRBOT_ROOT``，否则桌面版用
-# ``~/.astrbot``、普通模式用 **当前工作目录**（astrbot_path.py:29-35）。
+# ``~/.astrbot``、普通模式用 当前工作目录（astrbot_path.py:29-35）。
 # 如果本脚本在项目根目录下运行且不设置该变量，AstrBot 会把项目目录当成
 # root，就地生成 ``data/cmd_config.json``（含 AstrBot 主配置）——
 # 这正是之前误提交 data/ 目录的成因。
@@ -109,10 +109,10 @@ def main() -> int:
                 bool(str(meta.astrbot_version).strip()),
                 f"astrbot_version={meta.astrbot_version!r}",
             )
-            # 注意：这里**不**断言 star_cls_type 非空。
+            # 注意：这里不断言 star_cls_type 非空。
             # 它由插件 import 时的 Star.__init_subclass__ 填充（star/base.py:64），
             # 而 _load_plugin_metadata 只读 YAML、不做 import，所以此处为 None
-            # 是**正常**的。插件类是否真的被注册，由第 6 步用真实 import 验证。
+            # 是正常的。插件类是否真的被注册，由第 6 步用真实 import 验证。
             print(
                 "       （star_cls_type 在此为 None 属正常：该函数只读 YAML 不 import，"
                 "插件类由第 6 步验证）"
@@ -217,7 +217,7 @@ def main() -> int:
         for p in our_dir.iterdir()
         if p.is_dir() and not p.name.startswith((".", "__")) and p.name not in {"bsk", "tests"}
     ]
-    # ``data/`` 是**运行期产物**，不是插件源码：AstrBot 解析数据路径时用
+    # ``data/`` 是运行期产物，不是插件源码：AstrBot 解析数据路径时用
     # 「当前工作目录」当 root（astrbot_path.py:35），任何在插件目录下
     # import astrbot 的脚本都会就地生成一个 data/（内含 AstrBot 主配置）。
     # 它不该出现在安装目录里，发现即清理。

@@ -1,7 +1,7 @@
-"""真实调用链验证：走 **AstrBot 自己的工具执行器**，而不是直接调函数。
+"""真实调用链验证：走 AstrBot 自己的工具执行器，而不是直接调函数。
 
 ## 与已有测试的区别
-`verify_tools_e2e.py` 是**直接 await 工具函数**（`plugin.bsk_read(event)`）。
+`verify_tools_e2e.py` 是直接 await 工具函数（`plugin.bsk_read(event)`）。
 但那不是生产路径 —— 真实调用要经过 AstrBot 的工具执行层，它会：
 
 1. 用 ``functools.partial`` 把插件实例绑上去（``star_manager.py:1300``）；
@@ -10,12 +10,12 @@
 4. 消费 async generator，并把 yield 出来的图片走
    ``tool_direct_result`` 通道发给用户（``astr_agent_tool_exec.py:708-716``）。
 
-任何一环与我们的假设不符，**真实使用就会失败**，而直接调函数的测试
+任何一环与我们的假设不符，真实使用就会失败，而直接调函数的测试
 完全看不出来。例如：如果工具签名不被 ``decorator_handler`` 接受，
 或者 yield 的对象不是 AstrBot 认识的类型，图片就发不出去。
 
 ## 覆盖范围
-不启动浏览器：只验证**执行链本身**能用，以及**拒绝路径**（权限/参数）
+不启动浏览器：只验证执行链本身能用，以及拒绝路径（权限/参数）
 经真实执行器返回的结果形态正确。真实浏览器交互已由其他脚本覆盖。
 
 用法：
@@ -108,9 +108,9 @@ async def main() -> int:
     )
 
     # ------------------------------------------------------------------
-    # 2. ★ 经真实执行器调用：拒绝路径（非管理员）
+    # 2. 经真实执行器调用：拒绝路径（非管理员）
     # ------------------------------------------------------------------
-    print("\n--- 2. ★ 经 call_local_llm_tool 执行（非管理员应被拒）---")
+    print("\n--- 2. 经 call_local_llm_tool 执行（非管理员应被拒）---")
     try:
         from astrbot.core.astr_agent_tool_exec import call_local_llm_tool
     except Exception as exc:  # noqa: BLE001
@@ -147,7 +147,7 @@ async def main() -> int:
 
     text_out = " ".join(str(c) for c in collected if c is not None)
     check(
-        "★ 非管理员经真实执行器被拒绝",
+        "非管理员经真实执行器被拒绝",
         "管理员" in text_out or "权限" in text_out,
         f"输出={text_out[:160]!r}",
     )

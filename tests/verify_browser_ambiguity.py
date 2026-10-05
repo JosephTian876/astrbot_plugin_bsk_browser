@@ -1,18 +1,18 @@
 """聚焦验证：多浏览器歧义检测的行为是否符合设计。
 
 重点验证三件事（这些是真实用户会遇到的分支）：
-1. **恰好 1 个浏览器 → 仍然免配置自动选中**（这是最常见的场景，
+1. 恰好 1 个浏览器 → 仍然免配置自动选中（这是最常见的场景，
    绝不能因为新增歧义检查而被破坏）
-2. **≥2 个且未配置 → 报出可操作的错误**（列出每个 instance_id）
-3. **≥2 个但已配置 → 尊重配置，不报歧义**
+2. ≥2 个且未配置 → 报出可操作的错误（列出每个 instance_id）
+3. ≥2 个但已配置 → 尊重配置，不报歧义
 
 ## 测试方式说明
-``probe_browser()`` 内部用的是**同步** ``subprocess.run`` 调真实 bsk，
+``probe_browser()`` 内部用的是同步 ``subprocess.run`` 调真实 bsk，
 所以不能靠注入假 runner 来喂数据。好在判定逻辑被拆成了纯函数
-``_pick_browser_from_probe(data)``，本脚本**直接测它** —— 覆盖面相同，
+``_pick_browser_from_probe(data)``，本脚本直接测它 —— 覆盖面相同，
 且不依赖 subprocess。
 
-``probe_browser`` 与 ``SessionManager`` 的**异常穿透**行为另行验证
+``probe_browser`` 与 ``SessionManager`` 的异常穿透行为另行验证
 （用注入的 ``browser_probe``），见第 4 节。
 
 用法：
@@ -139,7 +139,7 @@ async def main() -> int:
     )
     resolved = await mgr3._resolve_browser_instance()
     check(
-        "★ 已配置时完全不调用 probe",
+        "已配置时完全不调用 probe",
         called["n"] == 0,
         f"probe 被调用 {called['n']} 次（应为 0）",
     )
@@ -148,7 +148,7 @@ async def main() -> int:
     # ------------------------------------------------------------------
     # 4. 歧义异常必须能穿过 SessionManager（不能被吞成静默降级）
     # ------------------------------------------------------------------
-    print("\n--- 4. ★ 歧义异常能穿过 SessionManager（不被吞掉）---")
+    print("\n--- 4. 歧义异常能穿过 SessionManager（不被吞掉）---")
     settings4 = types.SimpleNamespace(
         max_sessions=2,
         idle_release_sec=0,
@@ -165,12 +165,12 @@ async def main() -> int:
     try:
         await mgr4._resolve_browser_instance()
         check(
-            "★ 歧义异常未被吞掉",
+            "歧义异常未被吞掉",
             False,
             "被吞掉了 → 会退化成静默随机选浏览器（正是要修的行为）",
         )
     except BskBrowserAmbiguous:
-        check("★ 歧义异常未被吞掉", True, "正确抛出")
+        check("歧义异常未被吞掉", True, "正确抛出")
 
     # 对照：普通异常仍应被吞掉并降级（原有容错语义不能丢）
     def broken_probe() -> str:

@@ -1,13 +1,13 @@
-"""L3 真实集成测试：用**本插件自己的代码**驱动真实浏览器。
+"""L3 真实集成测试：用本插件自己的代码驱动真实浏览器。
 
 和之前调研阶段的验证不同 —— 那时是直接敲 bsk 命令；这里走的是
 ``BskService`` → ``SessionManager`` → ``BskRunner`` 这条本插件的真实调用链，
-验证的是**我们写的代码**能不能跑通，而不只是 bsk 能不能跑通。
+验证的是我们写的代码能不能跑通，而不只是 bsk 能不能跑通。
 
 安全边界（用户只授权访问无害页面）：
 - 只访问 ``https://example.com`` 与本插件自己开出来的空白页；
 - 不借用任何用户标签页；
-- 只做 click/fill 之类的动作在 example.com 的链接上？**不** —— 本项目
+- 只做 click/fill 之类的动作在 example.com 的链接上？不 —— 本项目
   集成测试只做「读」相关的动作（navigate / observe / screenshot），
   不做任何会改变页面状态的操作，也不做 evaluate；
 - 不使用 ``session stop --all``；
@@ -47,7 +47,7 @@ async def _daemon_session_ids(service: BskService) -> set[str]:
     """直接问 daemon 现在有哪些会话 id。
 
     用 ``bsk session list --json`` 而不是 ``browsers`` 的 ``session_count`` ——
-    后者会把**所有**会话算进来（包括用户的 DSH、别的聊天会话），
+    后者会把所有会话算进来（包括用户的 DSH、别的聊天会话），
     无法区分哪些是本测试创建的。
     """
     result = await service.runner.run(["session", "list", "--json"], timeout=10)
@@ -206,17 +206,17 @@ async def run() -> int:
         except Exception as exc:  # noqa: BLE001
             record("诊断信息可用", False, repr(exc))
 
-        # --- 10. ★ 会话过期 → 自动重建 → 重试成功（真实 daemon）---
+        # --- 10. 会话过期 → 自动重建 → 重试成功（真实 daemon）---
         #
-        # 这是**最有价值的真实用例**：模拟"会话空闲 5 分钟被 bsk 回收"后，
+        # 这是最有价值的真实用例：模拟"会话空闲 5 分钟被 bsk 回收"后，
         # 插件能否自动重建并让调用方无感。
         #
-        # 做法：先正常建一个会话，然后**绕过管理器**用 runner 直接把它停掉
+        # 做法：先正常建一个会话，然后绕过管理器用 runner 直接把它停掉
         # （于是管理器仍以为它活着），接着发一条命令 —— 必然收到 not_found，
         # 触发重建 + 重试。
         #
-        # ⚠️ 早先这里写的是"用假 session id 让命令失败"，那是**错的**：
-        #    execute 会先按 key 懒创建一个**真实**会话，而我们用假 id 去 observe
+        # ⚠️ 早先这里写的是"用假 session id 让命令失败"，那是错的：
+        #    execute 会先按 key 懒创建一个真实会话，而我们用假 id 去 observe
         #    得到的 not_found 并不是"我们的会话死了"，于是重建时不会去停旧会话
         #    （按设计 not_found 路径不 stop 旧会话，因为 bsk 说它不存在了），
         #    结果那个真实会话被遗弃 → 泄漏。
@@ -252,26 +252,26 @@ async def run() -> int:
             created_session_ids.add(new_session.session_id)
 
             record(
-                "★ 会话过期后自动重建并重试成功",
+                "会话过期后自动重建并重试成功",
                 after_rebuild > before_rebuild
                 and bool(observation.text or observation.title),
                 f"重建次数 {before_rebuild}→{after_rebuild}，"
                 f"新会话={new_session.session_id!r}，标题={observation.title!r}",
             )
             record(
-                "重建后拿到**不同**的会话 id",
+                "重建后拿到不同的会话 id",
                 new_session.session_id != stale_id,
                 f"{stale_id!r} → {new_session.session_id!r}",
             )
         except BskSessionGone as exc:
             record(
-                "★ 会话过期后自动重建并重试成功",
+                "会话过期后自动重建并重试成功",
                 False,
                 f"重建后仍然 not_found（重试已用尽）：{exc.friendly}",
             )
         except Exception as exc:  # noqa: BLE001
             record(
-                "★ 会话过期后自动重建并重试成功",
+                "会话过期后自动重建并重试成功",
                 False,
                 f"意外异常：{type(exc).__name__}: {exc}",
             )
@@ -284,15 +284,15 @@ async def run() -> int:
             closed = await service.shutdown()
             print(f"清理：关闭了 {closed} 个会话")
 
-            # ★ 断言必须精确到"**本测试创建的那些**会话没了"。
+            # 断言必须精确到"本测试创建的那些会话没了"。
             #   不能断言"浏览器上 session_count == 0"：那会把别人（用户的
             #   DSH、别的聊天会话、甚至上一次失败运行遗留的会话）也算进来，
             #   从而误报。这里用 daemon 的实际会话清单做差集比对。
             remaining_ids = await _daemon_session_ids(service)
             leaked = remaining_ids & created_session_ids
 
-            # ★ 兜底强清：万一管理器漏掉了某个我们创建的会话（例如上面那个
-            #   "绕过管理器停掉"的用例留下的尾巴），这里按**精确 id** 补刀。
+            # 兜底强清：万一管理器漏掉了某个我们创建的会话（例如上面那个
+            #   "绕过管理器停掉"的用例留下的尾巴），这里按精确 id 补刀。
             #   绝不能因为"管理器说它已清空"就相信真的清空了 —— daemon 才是
             #   事实来源。补刀同样只用精确 id，绝不使用 --all。
             if leaked:

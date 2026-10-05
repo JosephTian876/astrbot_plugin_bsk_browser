@@ -1,22 +1,22 @@
 """真实环境验证：模拟"AstrBot 被强杀后重启"，验证遗留会话被自动清理。
 
 ## 为什么这是最有价值的端到端验证
-`recover_orphans` 的**唯一**设计目的就是应对这个场景，但此前只用假 runner
-或"手工构造 journal"验证过。本脚本走**完整真实路径**：
+`recover_orphans` 的唯一设计目的就是应对这个场景，但此前只用假 runner
+或"手工构造 journal"验证过。本脚本走完整真实路径：
 
-    进程 A：真实建会话 → 写入真实 journal → **不 stop 直接退出**（模拟被强杀）
+    进程 A：真实建会话 → 写入真实 journal → 不 stop 直接退出（模拟被强杀）
     进程 B：读同一份 journal → recover_orphans() → 只清掉自己的遗留会话
 
-这验证了 journal 的**跨进程可用性**（时间戳、原子写、文件位置、格式），
+这验证了 journal 的跨进程可用性（时间戳、原子写、文件位置、格式），
 而这些是单元测试覆盖不到的。
 
-同时验证**反向安全性**：进程 B 启动时 daemon 里若还有**别人的**会话
+同时验证反向安全性：进程 B 启动时 daemon 里若还有别人的会话
 （模拟用户的 DSH），绝不能被误停。
 
 安全边界：
-- 进程 A 只建**自己**的会话，只开空白页不导航；
+- 进程 A 只建自己的会话，只开空白页不导航；
 - 绝不用 `session stop --all`；
-- 进程 B 只清理 journal 里记录且**窗口号匹配**的会话；
+- 进程 B 只清理 journal 里记录且窗口号匹配的会话；
 - 结束后清理本脚本创建的一切。
 
 用法：
@@ -64,7 +64,7 @@ async def _live_ids(runner: BskRunner) -> set[str]:
 
 
 # ----------------------------------------------------------------------
-# 阶段 A：建会话 + 写 journal，然后**故意不 stop**就退出
+# 阶段 A：建会话 + 写 journal，然后故意不 stop就退出
 # ----------------------------------------------------------------------
 async def phase_a(journal_path: Path, out_path: Path) -> int:
     settings = parse_settings({"bsk_path": "bsk", "max_sessions": 5})
@@ -85,7 +85,7 @@ async def phase_a(journal_path: Path, out_path: Path) -> int:
     }
     out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    # ★ 关键：**不调用 release / terminate**，直接结束进程，
+    # 关键：不调用 release / terminate，直接结束进程，
     #   模拟 AstrBot 被强杀。会话仍然活在 daemon 里，journal 里留着记录。
     print(f"  阶段 A：已建会话 {payload['orphans']}，故意不 stop 就退出")
     print(f"          journal 已落盘：{journal_path}")
@@ -185,7 +185,7 @@ async def main() -> int:
     j = SessionJournal(journal_path)
     loaded = j.load()
     check(
-        "★ 新进程能读出 journal 记录",
+        "新进程能读出 journal 记录",
         len(loaded) == len(orphans),
         f"记录数={len(loaded)}，期望={len(orphans)}",
     )
@@ -218,7 +218,7 @@ async def main() -> int:
     # --- 断言 ---
     print("\n--- 断言 ---")
     check(
-        "★ 自己的遗留会话被清理干净",
+        "自己的遗留会话被清理干净",
         not (set(orphans) & set(res["after"])),
         f"孤儿={orphans}，恢复后仍在={sorted(set(orphans) & set(res['after']))}",
     )
@@ -230,7 +230,7 @@ async def main() -> int:
     # 反向安全：别人的会话不能被误停
     if res["pre_existing"]:
         check(
-            "★ 别人的既有会话未被误停",
+            "别人的既有会话未被误停",
             set(res["pre_existing"]).issubset(set(res["after"])),
             f"既有={res['pre_existing']}，恢复后={res['after']}",
         )

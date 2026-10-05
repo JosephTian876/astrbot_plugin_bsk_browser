@@ -1,38 +1,38 @@
-"""``bsk_evaluate`` 权限门的专项验证 —— 三条分支，**不需要真实浏览器**。
+"""``bsk_evaluate`` 权限门的专项验证 —— 三条分支，不需要真实浏览器。
 
 ## 为什么单独一个脚本
 
-``bsk evaluate`` 能在用户**已登录**的页面里执行任意 JavaScript，是本插件风险
-最高的能力。它的权限门有三条分支，其中**第 2 条**是最容易写错、也最要命的一条：
+``bsk evaluate`` 能在用户已登录的页面里执行任意 JavaScript，是本插件风险
+最高的能力。它的权限门有三条分支，其中第 2 条是最容易写错、也最要命的一条：
 
     即使把 ``admin_only`` 关掉（或把调用者加进 ``allowed_users`` 白名单），
-    只要 ``evaluate_require_admin`` 为 True，非管理员**依然不能**执行脚本。
+    只要 ``evaluate_require_admin`` 为 True，非管理员依然不能执行脚本。
 
-这条规则的存在理由：``admin_only=False`` 的语义是"我愿意把**看得见的**浏览器
-操作开放给其他人"，而执行脚本是**静默**的（能读页面数据、能带 cookie 发请求）。
+这条规则的存在理由：``admin_only=False`` 的语义是"我愿意把看得见的浏览器
+操作开放给其他人"，而执行脚本是静默的（能读页面数据、能带 cookie 发请求）。
 让一个粗粒度的宽松开关顺手把最高危能力一起放开，是最难察觉的权限放大路径。
 
 把这个验证并进 ``tests/verify_tools_e2e.py`` 不合适：那个脚本需要真实浏览器、
 并且用 SHA256 严格比对安装目录（本脚本只测源码目录，改完立刻能跑）。
-所以这里新建一个，且**完全不碰浏览器**：用假 event + 假 service。
+所以这里新建一个，且完全不碰浏览器：用假 event + 假 service。
 
 ## 三条分支（外加几条边界）
 
 | # | enabled | enable_evaluate | evaluate_require_admin | admin_only | 调用者 | 期望 |
 |---|---|---|---|---|---|---|
-| 1 | true | **false** | — | true | 管理员 | **拒绝**（默认路径）|
-| 2 | true | true | **true** | **false** | **非管理员** | **仍拒绝** ★ |
-| 2b| true | true | true | false | 白名单里的非管理员 | **仍拒绝** ★ |
+| 1 | true | false | — | true | 管理员 | 拒绝（默认路径）|
+| 2 | true | true | true | false | 非管理员 | 仍拒绝 |
+| 2b| true | true | true | false | 白名单里的非管理员 | 仍拒绝 |
 | 3 | true | true | true | true | 管理员 | 放行 |
 | 3b| true | true | false | false | 非管理员 | 放行（需显式关两项）|
-| 4 | **false** | true | — | — | 管理员 | 拒绝（总开关优先）|
+| 4 | false | true | — | — | 管理员 | 拒绝（总开关优先）|
 
 用法：
     python tests/verify_evaluate_gate.py
 
 退出码：全部通过 0，有任何失败 1。
 
-安全边界：本脚本**从不执行任何 JavaScript**，也不创建任何 bsk 会话 ——
+安全边界：本脚本从不执行任何 JavaScript，也不创建任何 bsk 会话 ——
 它注入的假 service 只记录"被调用了"，不会走到子进程。
 """
 
@@ -63,12 +63,12 @@ def _ensure_paths() -> None:
 
     - 本目录：``import astrbot_test_doubles``
     - 仓库根：``import bsk``
-    - **仓库根的上一级**：``import astrbot_plugin_bsk_browser.main``
+    - 仓库根的上一级：``import astrbot_plugin_bsk_browser.main``
       （目录名本身就是包名，Python 的命名空间包会处理缺失的 ``__init__.py``）
     - AstrBot 应用目录：``import astrbot``
 
-    ★ 必须先把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时优先
-    读它，否则普通模式下会用**当前工作目录**（``astrbot_path.py:29-35``），
+    必须先把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时优先
+    读它，否则普通模式下会用当前工作目录（``astrbot_path.py:29-35``），
     在项目里运行时会在仓库内生成 ``data/cmd_config.json``（AstrBot 主配置，
     含 API 密钥与管理员 QQ 号）—— 而本仓库是要公开发布的。
     """
@@ -94,7 +94,7 @@ def _ensure_paths() -> None:
 
 
 class FakeService:
-    """假的 ``BskService``：只记录调用，**绝不碰子进程/浏览器**。
+    """假的 ``BskService``：只记录调用，绝不碰子进程/浏览器。
 
     把它注入插件实例，就能回答"这次调用到底有没有被放行" —— 因为放行的唯一
     表现就是 ``service.evaluate`` 被调用了。
@@ -115,7 +115,7 @@ class FakeService:
         return EvaluateResult(ok=True, value=self.value, has_value=True)
 
     def render_evaluate(self, result, expression: str) -> str:
-        """用**真实**渲染逻辑才需要；这里给一个可识别的标记即可。"""
+        """用真实渲染逻辑才需要；这里给一个可识别的标记即可。"""
         return f"RENDERED[{expression}]={result.value!r}"
 
 
@@ -187,7 +187,7 @@ async def run() -> int:
         record("分支 1", False, traceback.format_exc())
 
     # ---------------------------------------------------------------
-    print("\n--- 分支 2：开关开启 + 强制管理员，admin_only=false → ★ 仍拒绝 ---")
+    print("\n--- 分支 2：开关开启 + 强制管理员，admin_only=false → 仍拒绝 ---")
     # ---------------------------------------------------------------
     try:
         plugin, fake = make_plugin(
@@ -195,13 +195,13 @@ async def run() -> int:
                 "enabled": True,
                 "enable_evaluate": True,
                 "evaluate_require_admin": True,
-                "admin_only": False,  # ★ 总开关被关掉
+                "admin_only": False,  # 总开关被关掉
             }
         )
         text = await call_tool(plugin, nonadmin, "document.title")
 
         record(
-            "2.1 ★ admin_only=false 也不能让非管理员执行脚本",
+            "2.1 admin_only=false 也不能让非管理员执行脚本",
             fake.calls == [],
             f"service 被调用 {len(fake.calls)} 次（应为 0）",
         )
@@ -227,7 +227,7 @@ async def run() -> int:
         record("分支 2", False, traceback.format_exc())
 
     # ---------------------------------------------------------------
-    print("\n--- 分支 2b：白名单里的非管理员 → ★ 也不能绕过 ---")
+    print("\n--- 分支 2b：白名单里的非管理员 → 也不能绕过 ---")
     # ---------------------------------------------------------------
     try:
         plugin, fake = make_plugin(
@@ -236,13 +236,13 @@ async def run() -> int:
                 "enable_evaluate": True,
                 "evaluate_require_admin": True,
                 "admin_only": True,
-                # ★ 白名单优先于 admin_only，这是**别的工具**的既有语义；
+                # 白名单优先于 admin_only，这是别的工具的既有语义；
                 #   对 evaluate 它必须失效。
                 "allowed_users": ["10001"],
             }
         )
 
-        # 先验证前提：白名单确实让这个非管理员通过了**普通**权限门
+        # 先验证前提：白名单确实让这个非管理员通过了普通权限门
         # （否则这条用例就没在测"盖过白名单"）。用 bsk_read 的门来对照。
         ordinary_denied = plugin._denied(nonadmin)
         record(
@@ -253,7 +253,7 @@ async def run() -> int:
 
         text = await call_tool(plugin, nonadmin, "document.title")
         record(
-            "2b.1 ★ 白名单不能绕过 evaluate 的管理员要求",
+            "2b.1 白名单不能绕过 evaluate 的管理员要求",
             fake.calls == [],
             f"service 被调用 {len(fake.calls)} 次（应为 0）",
         )
@@ -383,7 +383,7 @@ async def run() -> int:
 
         fake.raise_error = RuntimeError("未预期")
         # 工具函数会 astrbot_logger.exception(...) 打一条带堆栈的日志 ——
-        # 那是**刻意的**（真出问题时得能排查），但会让本脚本输出很难读，
+        # 那是刻意的（真出问题时得能排查），但会让本脚本输出很难读，
         # 所以临时把该 logger 的级别提上去，只为让结果清爽。
         import logging
 
@@ -404,7 +404,7 @@ async def run() -> int:
         record("边界", False, traceback.format_exc())
 
     # ---------------------------------------------------------------
-    print("\n--- 静态检查：evaluate 必须是**独立工具**，且没混进 bsk_act ---")
+    print("\n--- 静态检查：evaluate 必须是独立工具，且没混进 bsk_act ---")
     # ---------------------------------------------------------------
     try:
         from astrbot_plugin_bsk_browser.bsk.service import BskService

@@ -1,19 +1,19 @@
 """``bsk/shots.py`` 的单元测试。
 
-策略：**用真实的临时文件测，不 mock 文件系统**。这个模块的正事就是跟文件打交道
+策略：用真实的临时文件测，不 mock 文件系统。这个模块的正事就是跟文件打交道
 （读文件头、比大小、删除），mock 掉 OS 之后测的就不是它了。
 
-测试数据全部**用代码现场构造**，不下载网络图片：
+测试数据全部用代码现场构造，不下载网络图片：
 
-- :func:`build_png` —— 用 ``zlib`` + ``struct`` 手工拼一个**真实合法**的最小 PNG
+- :func:`build_png` —— 用 ``zlib`` + ``struct`` 手工拼一个真实合法的最小 PNG
   （IHDR + IDAT + IEND，CRC 自己算）。实测可以被 Pillow 正常打开，所以
   ``encode_for_llm`` 的用例也用它。
 - :func:`build_jpeg` —— 手工拼一个结构合法的 JPEG 头（SOI + APP0 + SOF0 + EOI）。
-  它的熵编码数据是空的，Pillow 打不开，但**魔数嗅探与 SOF 尺寸解析要的就是这些头**。
+  它的熵编码数据是空的，Pillow 打不开，但魔数嗅探与 SOF 尺寸解析要的就是这些头。
 
 覆盖的重点是那些实测踩过的坑：
 - bsk 的 ``format`` 字段会撒谎（请求 png 实际给 jpeg）→ 必须靠魔数
-- 魔数嗅探**只读文件头**，不能把几十 MB 的全页截图读进内存
+- 魔数嗅探只读文件头，不能把几十 MB 的全页截图读进内存
 - ``session_id`` 来自外部 → 目录穿越
 - 清理时文件被占用（Windows 上是 ``PermissionError``）→ 跳过而不是抛异常
 - 没装 Pillow → ``encode_for_llm`` 返回 ``None``，不抛异常
@@ -61,7 +61,7 @@ HAS_PIL = importlib.util.find_spec("PIL") is not None
 
 
 def build_png(width: int = 40, height: int = 20, rgb: tuple[int, int, int] = (10, 20, 30)) -> bytes:
-    """手工构造一个**真实合法**的 PNG（纯色）。
+    """手工构造一个真实合法的 PNG（纯色）。
 
     PNG 结构：8 字节签名 + 若干 ``长度(4) 类型(4) 数据 CRC(4)`` 的块。
     这里只写必需的三个块：IHDR（尺寸）、IDAT（zlib 压缩的像素）、IEND。
@@ -79,10 +79,10 @@ def build_png(width: int = 40, height: int = 20, rgb: tuple[int, int, int] = (10
 
 
 def build_jpeg(width: int = 40, height: int = 20) -> bytes:
-    """手工构造一个**结构合法**的 JPEG 头（不含真实图像数据）。
+    """手工构造一个结构合法的 JPEG 头（不含真实图像数据）。
 
     SOI + APP0(JFIF) + SOF0(尺寸) + EOI。段格式是 ``FF <marker> <长度(2)> <载荷>``，
-    长度字段**包含它自己那 2 字节**（这是 JPEG 最容易写错的地方）。
+    长度字段包含它自己那 2 字节（这是 JPEG 最容易写错的地方）。
     """
     app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x01\x01" + b"\x00" + b"\x00\x01\x00\x01" + b"\x00\x00"
     # SOF0 载荷: 精度(1) 高(2) 宽(2) 分量数(1) + 每分量 3 字节
@@ -169,7 +169,7 @@ class TestSniffFormat(TempDirTestCase):
         self.assertEqual(sniff_format(path), "unknown")
 
     def test_后缀名撒谎时以内容为准(self) -> None:
-        """★ 实测坑：文件名是 .png，内容其实是 JPEG。"""
+        """实测坑：文件名是 .png，内容其实是 JPEG。"""
         path = self.write("lying.png", build_jpeg())
         self.assertEqual(sniff_format(path), "jpeg")
 
@@ -201,7 +201,7 @@ class TestSniffFormat(TempDirTestCase):
         self.assertEqual(sniff_format(path), "png")
 
     def test_大文件只读文件头(self) -> None:
-        """★ 只读头部：20MB 的截图不能整个读进内存。
+        """只读头部：20MB 的截图不能整个读进内存。
 
         用稀疏文件构造（seek 到 20MB 再写 1 字节），创建瞬间完成，不占磁盘。
         """
@@ -268,7 +268,7 @@ class TestVerifyShot(TempDirTestCase):
         self.assertTrue(ok, why)
 
     def test_魔数不符_声明png实际jpeg(self) -> None:
-        """★ 核心用例：bsk 的 format 字段在撒谎。"""
+        """核心用例：bsk 的 format 字段在撒谎。"""
         path = self.write("lying.png", build_jpeg(40, 20))
         shot = Screenshot(
             path=str(path), width=40, height=20, format="png", byte_size=path.stat().st_size
@@ -376,7 +376,7 @@ class TestMakeShotPath(TempDirTestCase):
         self.assertTrue(path.exists(), "占位文件应已创建，避免并发撞名")
 
     def test_连续100次唯一(self) -> None:
-        """★ 同一毫秒内连续调用也不能撞名。"""
+        """同一毫秒内连续调用也不能撞名。"""
         paths = [make_shot_path(self.tmp, "mnaa") for _ in range(100)]
         self.assertEqual(len(set(paths)), 100)
         self.assertEqual(len(list(paths[0].parent.iterdir())), 100)
@@ -397,7 +397,7 @@ class TestMakeShotPath(TempDirTestCase):
         self.assertNotIn(first, others)
 
     def test_恶意session_id不会穿越目录(self) -> None:
-        """★ 安全用例：session_id 来自外部。"""
+        """安全用例：session_id 来自外部。"""
         shots_root = (self.tmp / "shots").resolve()
         for evil in ("../../etc", "a/b", "a\\b", "..", "..\\..", "\x00", "a\x00/../b", "C:\\Windows"):
             path = make_shot_path(self.tmp, evil)
@@ -486,7 +486,7 @@ class TestCleanupShots(TempDirTestCase):
         self.assertEqual(len([p for p in fresh if p.exists()]), 2)
 
     def test_跨会话子目录都清理(self) -> None:
-        """keep 是**全局**的：跨 session 目录一起按新旧排序，保留最新的 N 张。"""
+        """keep 是全局的：跨 session 目录一起按新旧排序，保留最新的 N 张。"""
         self._make("mnaa", 3)
         self._make("xyzw", 3)
         deleted = cleanup_shots(self.tmp, keep=1, max_age_sec=0)
@@ -513,7 +513,7 @@ class TestCleanupShots(TempDirTestCase):
         self.assertEqual(cleanup_shots("\x00非法路径"), 0)
 
     def test_文件被占用时跳过而不是抛异常(self) -> None:
-        """★ Windows 实测：只读/被占用的文件 os.remove 会抛 PermissionError。"""
+        """Windows 实测：只读/被占用的文件 os.remove 会抛 PermissionError。"""
         made = self._make("mnaa", 3)
         locked = made[0]
         # 把三张都改成"很久以前"，让 max_age 规则把它们全列为待删对象，
@@ -560,7 +560,7 @@ class TestEncodeForLlm(TempDirTestCase):
     """给模型的 data URL：必须降采样，且没有 Pillow 时优雅降级。"""
 
     def test_没有PIL时返回None不抛异常(self) -> None:
-        """★ 关键降级路径：PIL 可能没装。"""
+        """关键降级路径：PIL 可能没装。"""
         path = self.write("shot.png", build_png())
         with pil_missing():
             self.assertIsNone(encode_for_llm(path))
@@ -589,7 +589,7 @@ class TestEncodeForLlm(TempDirTestCase):
 
     @unittest.skipUnless(HAS_PIL, "本机没有 Pillow，跳过需要 PIL 的用例")
     def test_大图降采样到max_width(self) -> None:
-        """★ 1850x1208 的原图很贵，必须能降到 max_width。"""
+        """1850x1208 的原图很贵，必须能降到 max_width。"""
         path = self.write("shot.png", build_png(2000, 1000))
         url = encode_for_llm(path, max_width=1280)
         assert url is not None

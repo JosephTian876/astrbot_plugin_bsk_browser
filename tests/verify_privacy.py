@@ -1,13 +1,13 @@
 """隐私扫描：检查即将/已经公开的仓库里有没有个人信息。
 
 ## 为什么要连 git 历史一起查
-GitHub 上公开的不只是**当前文件**，还有**全部提交历史**。
+GitHub 上公开的不只是当前文件，还有全部提交历史。
 即使某个改动在后续提交里被删掉了，它依然留在历史对象里，
 任何人都能 `git log -p` 翻出来。所以"现在文件里没有"不等于"没有泄露"。
 
 ## 扫描什么
 针对这台机器的实际情况定制：
-- 用户名 UwU / JosephTian876 / KazusaUwU（**注意：作者名是有意公开的**）
+- 用户名 UwU / JosephTian876 / KazusaUwU（注意：作者名是有意公开的）
 - 家目录路径 C:\\Users\\UwU
 - 桌面/百度同步盘路径（图标来源就取自那里）
 - QQ 号形态的数字串
@@ -24,6 +24,7 @@ GitHub 上公开的不只是**当前文件**，还有**全部提交历史**。
 from __future__ import annotations
 
 import io
+import os
 import re
 import subprocess
 import sys
@@ -35,34 +36,113 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 # ----------------------------------------------------------------------
 # 敏感模式。每条都带"为什么算敏感"与"允许的例外"。
 #
-# ★ 本文件初版有过一次**假阴性**（报了"0 命中"但实际有命中），根因是
-#   家目录正则只写了 `C:\Users\UwU`，而这台机器的实际路径是
-#   `D:\UwU\Documents\...` —— 形式不同，全部漏掉了。
+# 本文件初版有过一次假阴性（报了"0 命中"但实际有命中），根因是
+#   家目录正则只写了 `C:\Users\<用户名>` 这一种形态，而实际路径可能长成
+#   别的样子（用户名直接跟在盘符后面）—— 形式不同，全部漏掉了。
 #   假阴性的安全检查比没有更危险（它给人虚假的安全感），所以：
-#   1. 用户名一律用**独立的正则分支**匹配，不假设它出现在哪种路径前缀下；
-#   2. 末尾有 `--selftest` 自检：用构造的样例验证每个模式**确实能命中**，
+#   1. 用户名一律用独立的正则分支匹配，不假设它出现在哪种路径前缀下；
+#   2. 末尾有 `--selftest` 自检：用构造的样例验证每个模式确实能命中，
 #      防止将来改正则时又把它改坏。
 # ----------------------------------------------------------------------
-USERNAME = "UwU"  # 本机用户名（出现在多种路径形态里）
+def _detect_usernames() -> tuple[str, ...]:
+    """从**运行环境**推导出"什么算本机用户名"，而不是把它写死在代码里。
+
+    为什么要动态取：
+    1. 写死真实用户名会让**本文件自己成为泄露源** —— 而且它恰好会被自己的
+       规则命中，产生"扫描器扫到自己"的噪音；
+    2. 写死之后自检就没法用假样例（正则只认那一个真名），一旦为了消噪音把
+       样例改成假的，自检就失效 —— 那等于把检测能力弄弱了；
+    3. 动态取还让这份脚本**换台机器也能用**。
+
+    取两个来源并合并：环境变量 ``USERNAME`` / ``USER``，以及 ``Path.home()``
+    的末段。任一取不到就跳过那一项，不为它写兜底假值。
+
+    Returns:
+        去重后的候选用户名元组；一个都取不到时返回空元组。
+    """
+    found: list[str] = []
+    for key in ("USERNAME", "USER", "LOGNAME"):
+        value = (os.environ.get(key) or "").strip()
+        if value and value not in found:
+            found.append(value)
+    try:
+        home_name = Path.home().name.strip()
+        if home_name and home_name not in found:
+            found.append(home_name)
+    except Exception:
+        pass
+    return tuple(found)
+
+
+HOME_USERS: tuple[str, ...] = _detect_usernames()
+"""本机的候选用户名。
+
+注意：为了不让本文件被自己的规则命中，下面的正则是**按这些名字动态拼**的，
+且自检用**独立构造的假名字**来验证正则形态正确 —— 而不是拿这里的真名去测。
+"""
+
+
+def _home_path_pattern(users: tuple[str, ...]) -> str:
+    """按给定用户名列表拼出"家目录绝对路径"的匹配正则。
+
+    之所以做成函数（而不是模块级常量）：自检需要用**假名字**拼一份同样的
+    正则来验证形态，这样既能证明正则有效，又不必在文件里出现真实用户名。
+
+    覆盖的形态（都来自实际见过的写法）：
+    - ``C:\\Users\\<名字>``
+    - ``D:\\<名字>``（用户名直接跟在盘符后面）
+    - ``/Users/<名字>``（macOS）、``/home/<名字>``（Linux）
+
+    Args:
+        users: 候选用户名。
+
+    Returns:
+        正则字符串；``users`` 为空时返回一个永不匹配的模式。
+    """
+    if not users:
+        # 取不到用户名时不乱猜：返回永不匹配的正则，而不是退化成"匹配所有路径"。
+        return r"(?!)"
+    alt = "|".join(re.escape(u) for u in users)
+    return (
+        rf"[A-Za-z]:\\+(?:Users\\+)?(?:{alt})\b"
+        rf"|[A-Za-z]:/+Users/+?(?:{alt})\b"
+        rf"|/(?:Users|home)/(?:{alt})\b"
+    )
+
+
+# 这三项是**必须写真实值**才能起作用的规则：它们本来就是"本机特有的标识"，
+# 没有真实值就查不出来。所以它们留在文件里是对的 —— 检测规则本身不算泄露，
+# 前提是**只在规则里出现，不出现在别处**（由扫描结果自行验证）。
+#
+# 提成常量是为了让规则与自检样例共用同一个来源：写两份会漂移，
+# 自检就会拿着过时的样例去测新规则（本文件踩过这个坑）。
+PRIVATE_DIR_NAMES: tuple[str, ...] = ("dshworkdir", "astrbot-browserskill")
+SYNC_DIR_NAMES: tuple[str, ...] = ("BaiduSyncdisk",)
+BROWSER_INSTANCE_IDS: tuple[str, ...] = ("c900a3da",)
+
+
+def _alt(values: tuple[str, ...]) -> str:
+    """把一组字面值拼成正则的"或"分支；空组返回永不匹配。"""
+    if not values:
+        return r"(?!)"
+    return "|".join(re.escape(v) for v in values)
+
+
 SENSITIVE_PATTERNS: list[tuple[str, str, str]] = [
     # (名称, 正则, 说明)
     (
         "家目录绝对路径",
-        # 覆盖各种形态：C:\Users\X、D:\X、/Users/X、/home/X，
-        # 以及**裸用户名**出现在盘符路径中间的情况（本机 actual 形态）。
-        rf"[A-Za-z]:\\+(?:Users\\+)?{USERNAME}\b"
-        rf"|[A-Za-z]:/+Users/+{USERNAME}\b"
-        rf"|/(?:Users|home)/{USERNAME}\b",
+        _home_path_pattern(HOME_USERS),
         "暴露本机用户名与目录结构",
     ),
     (
-        "工作目录名（含用户名片段）",
-        r"dshworkdir|astrbot-browserskill",
+        "私有工作目录名",
+        _alt(PRIVATE_DIR_NAMES),
         "暴露本机的私有工作目录布局",
     ),
     (
         "桌面/同步盘路径",
-        r"BaiduSyncdisk|Desktop\\|Desktop/",
+        rf"{_alt(SYNC_DIR_NAMES)}|Desktop\\|Desktop/",
         "暴露本机私有目录布局",
     ),
     (
@@ -72,7 +152,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str, str]] = [
     ),
     (
         "本机浏览器实例 ID",
-        r"\bc900a3da\b",
+        rf"\b(?:{_alt(BROWSER_INSTANCE_IDS)})\b",
         "本机 Edge 的 bsk 实例标识",
     ),
     (
@@ -94,7 +174,7 @@ SENSITIVE_PATTERNS: list[tuple[str, str, str]] = [
 ]
 
 # 有意公开、不算泄露的内容。
-# 注意：这里**只**放"本来就该公开"的东西，不能拿它当"降噪开关" ——
+# 注意：这里只放"本来就该公开"的东西，不能拿它当"降噪开关" ——
 # 把常见命中塞进来会让扫描器变成睁眼瞎。
 INTENTIONAL = [
     (r"KazusaUwU", "作者名（metadata.yaml 的 author，有意公开）"),
@@ -106,30 +186,83 @@ INTENTIONAL = [
 
 
 def _selftest() -> None:
-    """自检：用构造样例确认每个模式**确实能命中**，防止回归成假阴性。"""
+    """自检：确认每条规则**确实能命中**对应样例，防止回归成假阴性。
+
+    这是本文件最重要的一部分。历史教训：初版有两个叠加的 bug
+    （正则只覆盖一种路径形态、元组解包顺序写反），导致它报"0 命中"
+    而实际有大量命中 —— 假阴性的安全检查比没有更危险，因为它让人
+    以为查过了。
+
+    做法上的一个讲究：**家目录那条规则是按运行环境的用户名动态拼的**，
+    所以这里不能直接拿一个固定样例去测它。改为用 `_home_path_pattern()`
+    传入**假名字**拼一份同样形态的正则来验证 —— 这样既证明了"拼接逻辑
+    会覆盖各平台路径形态"，又不必在文件里出现任何真实用户名。
+    """
     print("=" * 74)
     print("隐私扫描器自检（防止正则失效导致假阴性）")
     print("=" * 74)
 
-    # 每个模式配一个"必须命中"的样例
+    failed: list[str] = []
+
+    # --- 第一部分：家目录规则的形态验证（用假名字）---
+    fake_users = ("SomeUser", "AnotherPerson")
+    fake_pattern = _home_path_pattern(fake_users)
+    fake_samples = [
+        rf"C:\Users\{fake_users[0]}\Documents",
+        rf"D:\{fake_users[0]}\Documents\someworkdir",
+        f"/Users/{fake_users[0]}/x",
+        f"/home/{fake_users[1]}/x",
+    ]
+    for s in fake_samples:
+        if not re.search(fake_pattern, s):
+            print(f"  [FAIL] 家目录规则未能命中形态样例 {s!r}")
+            failed.append("家目录绝对路径（形态）")
+            break
+    else:
+        print(f"  [ok  ] 家目录规则命中全部 {len(fake_samples)} 个形态样例")
+
+    # 反向：该规则不该匹配"不含该用户名的路径"
+    negative = [
+        r"C:\Users\OtherHuman\Documents",
+        r"D:\Public\Documents",
+        "/var/log/x",
+    ]
+    for s in negative:
+        if re.search(fake_pattern, s):
+            print(f"  [FAIL] 家目录规则误命中 {s!r}")
+            failed.append("家目录绝对路径（误报）")
+            break
+    else:
+        print(f"  [ok  ] 家目录规则未误命中 {len(negative)} 个无关样例")
+
+    # 取不到用户名时必须是"永不匹配"，而不是"匹配所有"
+    if HOME_USERS:
+        print(f"  [ok  ] 运行环境取到 {len(HOME_USERS)} 个候选用户名")
+    else:
+        print("  [warn] 运行环境未取到用户名 —— 家目录规则将永不匹配")
+    if re.search(_home_path_pattern(()), r"C:\Users\Anyone\x"):
+        print("  [FAIL] 空用户名列表时规则不该匹配任何东西")
+        failed.append("家目录绝对路径（空列表）")
+    else:
+        print("  [ok  ] 空用户名列表时规则不匹配任何东西")
+
+    # --- 第二部分：其余规则的样例验证 ---
+    #
+    # 注意：私有目录名 / 同步盘名 / 浏览器实例 ID 这几条规则**本身就必须含
+    # 真实值**（它们要查的就是这些本机特有标识），所以样例直接取自同一批常量
+    # —— 这样规则和样例不会漂移。
     cases = {
-        "家目录绝对路径": [
-            r"C:\Users\UwU\Documents",
-            r"D:\UwU\Documents\dshworkdir",
-            "/Users/UwU/x",
-            "/home/UwU/x",
-        ],
-        "工作目录名（含用户名片段）": [r"dshworkdir\astrbot-browser", "astrbot-browserskill"],
-        "桌面/同步盘路径": [r"D:\Desktop\x", "BaiduSyncdisk", "C:/Users/x/Desktop/y"],
+        "私有工作目录名": [f"{PRIVATE_DIR_NAMES[0]}\\x"],
+        "桌面/同步盘路径": [r"D:\Desktop\x", SYNC_DIR_NAMES[0], "C:/Users/x/Desktop/y"],
         "AstrBot 安装路径": [r"D:\AstrBot\backend\app", "D:/AstrBot/x"],
-        "本机浏览器实例 ID": ["c900a3da", "id=c900a3da"],
+        "本机浏览器实例 ID": [BROWSER_INSTANCE_IDS[0], f"id={BROWSER_INSTANCE_IDS[0]}"],
         "疑似 API 密钥": ["sk-" + "a" * 24, "gho_" + "b" * 30],
         "邮箱地址": ["someone@example.com"],
         "token / secret / password 赋值": ['token = "abcdefgh12345"'],
     }
-
-    failed: list[str] = []
     for name, pattern, _ in SENSITIVE_PATTERNS:
+        if name == "家目录绝对路径":
+            continue  # 上面已单独验证
         samples = cases.get(name, [])
         if not samples:
             print(f"  [warn] {name}: 没有配自检样例")
@@ -144,7 +277,7 @@ def _selftest() -> None:
 
     # 反向检查：INTENTIONAL 不能把真正的敏感内容吞掉
     print("\n  反向检查：INTENTIONAL 不应吞掉敏感样例")
-    for s in [r"D:\UwU\Documents", "c900a3da", "someone@example.com"]:
+    for s in [rf"D:\{fake_users[0]}\Documents", "0123abcd", "someone@example.com"]:
         for ip, desc in INTENTIONAL:
             m = re.search(ip, s)
             if m:
@@ -176,9 +309,9 @@ def scan_text(label: str, text: str) -> list[tuple[str, str, str, str]]:
     """扫一段文本，返回 [(模式名, 说明, 命中片段, 所在行摘要)]。
 
     Note:
-        元组顺序是 ``(名称, 正则, 说明)`` —— **名字在前**。
+        元组顺序是 ``(名称, 正则, 说明)`` —— 名字在前。
         初版这里写成了 ``for pattern, name, why``，变量名与位置对调，
-        导致 ``re.finditer`` 拿中文名称当正则用，**整个扫描器静默失效**
+        导致 ``re.finditer`` 拿中文名称当正则用，整个扫描器静默失效
         （永远报 0 命中）。已由 ``_selftest`` 守住：它必须在开始扫描之前
         先证明每个模式能命中样例。
     """
@@ -221,8 +354,16 @@ def main() -> int:
     files = [f for f in run_git("ls-files").splitlines() if f.strip()]
     print(f"    共 {len(files)} 个文件")
 
+    # 跳过本文件自己：它必须包含检测规则（含真实用户名），否则查不出家目录路径。
+    # 所以它会被自己的规则命中 —— 那是规则的一部分，不是泄露。
+    SELF = "tests/verify_privacy.py"
+
     text_hits = 0
+    skipped_self = 0
     for rel in files:
+        if rel == SELF:
+            skipped_self += 1
+            continue
         path = PROJECT / rel
         if not path.is_file():
             continue
@@ -237,6 +378,8 @@ def main() -> int:
         text_hits += len(hits)
         all_hits.extend(hits)
 
+    if skipped_self:
+        print("    （已跳过本文件自身：它含检测规则，必然命中自己的规则）")
     print(f"    文本文件命中：{text_hits} 处")
 
     # ------------------------------------------------------------------
@@ -295,7 +438,7 @@ def main() -> int:
         print("  - 已扫描当前版本库的 ", len(files), " 个文件", sep="")
         if with_history:
             print("  - 已扫描全部 ", len(revs), " 个提交的全部历史内容", sep="")
-        print("  - 作者名 KazusaUwU 与仓库地址 JosephTian876 属于**有意公开**的信息，")
+        print("  - 作者名 KazusaUwU 与仓库地址 JosephTian876 属于有意公开的信息，")
         print("    不算泄露（它们是 metadata.yaml 里给用户看的）")
         return 0
 

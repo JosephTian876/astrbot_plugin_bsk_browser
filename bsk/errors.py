@@ -1,6 +1,6 @@
 """bsk 的退出码与错误分类。
 
-bsk 的退出码有 6 档（实测确认），错误 JSON 走 **stdout** 而不是 stderr，
+bsk 的退出码有 6 档（实测确认），错误 JSON 走 stdout 而不是 stderr，
 结构是扁平的 ``{code, message, hint, exit_code, data?}``：
 
     {
@@ -10,13 +10,13 @@ bsk 的退出码有 6 档（实测确认），错误 JSON 走 **stdout** 而不�
       "exit_code": 1
     }
 
-但有三种情况**拿不到 JSON**，调用方必须能容错：
+但有三种情况拿不到 JSON，调用方必须能容错：
 
 1. clap 参数错误（例如写了不存在的 flag）→ stderr 纯文本，退出码 1；
 2. 进程被我们杀掉（超时）→ 可能没有任何输出；
 3. 极少数命令不带 ``--json`` 时输出人类可读文本。
 
-因此判成败**只看退出码**，JSON 解析只是锦上添花。
+因此判成败只看退出码，JSON 解析只是锦上添花。
 """
 
 from __future__ import annotations
@@ -56,19 +56,19 @@ EXIT_CODE_NAMES: dict[int, str] = {
 # --- bsk 返回的 error code 字符串 ---
 
 CODE_NOT_FOUND = "not_found"
-"""session/tab/browser 不存在或已停止。**可以重建会话后重试。**"""
+"""session/tab/browser 不存在或已停止。可以重建会话后重试。"""
 
 CODE_SESSION_BUSY = "session_busy"
-"""同一 session 上有 in-flight 命令。**可以短暂等待后重试一次。**"""
+"""同一 session 上有 in-flight 命令。可以短暂等待后重试一次。"""
 
 CODE_PERMISSION_DENIED = "permission_denied"
-"""权限不足（例如 evaluate 试图跑在非 Agent Window 标签里）。**重试无用。**"""
+"""权限不足（例如 evaluate 试图跑在非 Agent Window 标签里）。重试无用。"""
 
 CODE_BROWSER_AMBIGUOUS = "browser_ambiguous"
-"""同时连着多个浏览器，而用户没有指定用哪一个。**必须改配置才能继续，重试无用。**"""
+"""同时连着多个浏览器，而用户没有指定用哪一个。必须改配置才能继续，重试无用。"""
 
 # 这些 reason 出现在错误 JSON 的 data.reason 里，表示"动作可能已经生效"，
-# 此时**绝对禁止重试**，否则可能重复点击/重复提交表单。
+# 此时绝对禁止重试，否则可能重复点击/重复提交表单。
 OUTCOME_UNKNOWN_REASONS: frozenset[str] = frozenset(
     {
         "extension_reconnected",
@@ -108,7 +108,7 @@ class BskError(Exception):
 
     @property
     def retryable(self) -> bool:
-        """这个错误是否**安全**重试。"""
+        """这个错误是否安全重试。"""
         return False
 
     def __str__(self) -> str:  # pragma: no cover - 便于日志排查
@@ -129,7 +129,7 @@ class BskNotInstalled(BskError):
 
 
 class BskTimeout(BskError):
-    """命令超时。重试**可能**有意义（页面慢），但需谨慎。"""
+    """命令超时。重试可能有意义（页面慢），但需谨慎。"""
 
     @property
     def retryable(self) -> bool:
@@ -139,7 +139,7 @@ class BskTimeout(BskError):
 class BskSessionGone(BskError):
     """会话不存在或已停止（``not_found``）。
 
-    这是**最常见的可恢复错误**：bsk 会话空闲 5 分钟会被回收。
+    这是最常见的可恢复错误：bsk 会话空闲 5 分钟会被回收。
     正确处理是重建会话后重试一次，而不是报错给用户。
     """
 
@@ -163,7 +163,7 @@ class BskSessionBusy(BskError):
 class BskOutcomeUnknown(BskError):
     """动作结果未知（扩展断开/重连等）。
 
-    **绝对不能重试**：动作可能已经执行了。重试会造成重复点击、重复提交。
+    绝对不能重试：动作可能已经执行了。重试会造成重复点击、重复提交。
     调用方应把会话标记为"不确定态"，并要求用户人工确认页面状态。
     """
 
@@ -199,14 +199,14 @@ class BskVersionError(BskError):
 class BskBrowserAmbiguous(BskError):
     """同时连着多个浏览器，而用户没有指定要用哪一个。
 
-    为什么需要**单独一个类型**（而不是让 ``probe_browser`` 返回空串了事）：
+    为什么需要单独一个类型（而不是让 ``probe_browser`` 返回空串了事）：
     返回空串的后果是调用方不传 ``--browser``，于是 bsk 自己随便挑一个 ——
     用户明明连着 Edge 和 Chrome，插件却会静默操作其中一个，而且"有时候对
-    有时候不对"，完全无从排查。这里唯一的正确做法是**明确报错**，把每个
+    有时候不对"，完全无从排查。这里唯一的正确做法是明确报错，把每个
     已连接实例的 ``instance_id`` 都列出来，让用户填进配置。
 
     Note:
-        这是**用户配置问题**，不是瞬时故障：重试多少次结果都一样，只有
+        这是用户配置问题，不是瞬时故障：重试多少次结果都一样，只有
         改配置（或关掉多余的浏览器）才能继续。
         ``friendly`` 里必须带上完整的实例清单与操作步骤 —— 它最终会经
         ``main.py`` 的 ``except BskError`` 变成给模型看的字符串，

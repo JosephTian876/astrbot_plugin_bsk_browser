@@ -2,10 +2,10 @@
 
 ## 为什么需要这个函数
 
-本插件给全页截图准备的最终超时是 180 秒，而 **AstrBot 自己的单次工具调用上限**
+本插件给全页截图准备的最终超时是 180 秒，而 AstrBot 自己的单次工具调用上限
 （``tool_call_timeout``，默认 120 秒，见 ``core/agent/run_context.py:19``）比它小。
 后果是插件允许自己等 180 秒，框架却在 120 秒时把它掐断 —— 用户看到的是框架抛的英文
-``tool <name> execution timeout after 120 seconds.``，而**不是插件精心写的中文提示**。
+``tool <name> execution timeout after 120 seconds.``，而不是插件精心写的中文提示。
 
 要解决它就得知道框架的上限是多少。``Context.get_config()`` 能拿到 AstrBot 主配置
 （``core/star/context.py:597``），路径已用真实配置文件确认：
@@ -14,13 +14,13 @@
 
 ## 这个文件在测什么
 
-**只有一件事：任何输入都不能让插件加载失败。**
+只有一件事：任何输入都不能让插件加载失败。
 
 它跑在插件加载路径上（``main.py.__init__`` → ``BskService``），一抛异常整个插件就
-起不来。而它读的是**外部配置**：用户手改过、版本不同、结构被挪动、值被写成字符串……
+起不来。而它读的是外部配置：用户手改过、版本不同、结构被挪动、值被写成字符串……
 全部可能。所以约定与 ``parse_settings`` 完全一致：
 
-    读不到就返回 None（= "未知"），**绝不抛异常**；未知时调用方保持原有行为，
+    读不到就返回 None（= "未知"），绝不抛异常；未知时调用方保持原有行为，
     不因为"读不到"就缩短用户愿意等待的时间。
 
 覆盖的降级情形（用户明确要求的四类 + 补强）：
@@ -31,7 +31,7 @@
 - 值是 ``0`` / 负数 / ``nan`` / ``inf`` / 布尔；
 - 畸形类型（``.get()`` 自己抛异常的映射、属性访问抛异常的对象）。
 
-另外还钉住一条**分层约束**：``bsk/`` 包不得 import astrbot。这里用一个"会爆炸的
+另外还钉住一条分层约束：``bsk/`` 包不得 import astrbot。这里用一个"会爆炸的
 astrbot 哨兵模块"来证明——如果被测代码偷偷 import 它，测试就会失败。
 
 pytest 在本机不可用（实测 ``ModuleNotFoundError``），所以用标准库 ``unittest``。
@@ -114,11 +114,11 @@ class TestReaderHappyPath(unittest.TestCase):
     """能读到时必须给出正确的浮点秒数。"""
 
     def test_real_shaped_dict(self) -> None:
-        """★ 与真实配置文件同构的 dict —— 这条是"路径没写错"的基准。"""
+        """与真实配置文件同构的 dict —— 这条是"路径没写错"的基准。"""
         self.assertEqual(read_framework_tool_timeout(real_shaped_config()), 120.0)
 
     def test_attr_style_object(self) -> None:
-        """★ ``AstrBotConfig`` 那种"dict + 属性访问"的对象也要能读。"""
+        """``AstrBotConfig`` 那种"dict + 属性访问"的对象也要能读。"""
         self.assertEqual(
             read_framework_tool_timeout(AttrConfig(real_shaped_config())), 120.0
         )
@@ -155,7 +155,7 @@ class TestReaderHappyPath(unittest.TestCase):
 
 
 class TestReaderDegradesToNone(unittest.TestCase):
-    """★ 用户要求的核心契约：覆盖各类畸形输入，全部返回 None。"""
+    """用户要求的核心契约：覆盖各类畸形输入，全部返回 None。"""
 
     def test_none(self) -> None:
         self.assertIsNone(read_framework_tool_timeout(None))
@@ -212,7 +212,7 @@ class TestReaderDegradesToNone(unittest.TestCase):
                 )
 
     def test_leaf_is_zero_or_negative(self) -> None:
-        """★ ``0`` 与负数当"未知"：超时 0 会让每条命令一启动就被掐死。"""
+        """``0`` 与负数当"未知"：超时 0 会让每条命令一启动就被掐死。"""
         for raw in (0, 0.0, -1, -120.0, "-5"):
             with self.subTest(raw=repr(raw)):
                 self.assertIsNone(
@@ -251,7 +251,7 @@ class TestReaderDegradesToNone(unittest.TestCase):
                 self.assertIsNone(read_framework_tool_timeout(cfg))
 
     def test_hostile_mapping_does_not_raise(self) -> None:
-        """★ 畸形映射：``.get()`` 与属性访问都抛异常，也必须降级。"""
+        """畸形映射：``.get()`` 与属性访问都抛异常，也必须降级。"""
         self.assertIsNone(read_framework_tool_timeout(HostileMapping()))
         self.assertIsNone(
             read_framework_tool_timeout({"agent_runner": HostileMapping()})
@@ -333,7 +333,7 @@ class TestAsTimeoutSeconds(unittest.TestCase):
 
 
 class TestNoAstrbotImport(unittest.TestCase):
-    """★ ``bsk/`` 包绝不能 import astrbot（本函数只接受鸭子类型对象的根本原因）。"""
+    """``bsk/`` 包绝不能 import astrbot（本函数只接受鸭子类型对象的根本原因）。"""
 
     def test_astrbot_is_not_imported_by_bsk_config(self) -> None:
         """把 ``astrbot`` 换成会爆炸的哨兵模块，再重新 import 被测模块。

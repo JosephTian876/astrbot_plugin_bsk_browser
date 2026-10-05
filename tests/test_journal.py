@@ -1,17 +1,17 @@
 """``bsk/journal.py`` 的单元测试。
 
-策略：**用真实的临时文件测，不 mock 文件系统**。这个模块的正事就是跟文件打交道
+策略：用真实的临时文件测，不 mock 文件系统。这个模块的正事就是跟文件打交道
 （原子写、容错读、并发），mock 掉 OS 之后测的就不是它了。
 
 模块的硬性契约（每一条都有对应用例）：
 
-1. **绝不抛异常** —— 空文件、半截 JSON、非法 JSON、二进制垃圾、目录不存在、
+1. 绝不抛异常 —— 空文件、半截 JSON、非法 JSON、二进制垃圾、目录不存在、
    路径是目录、没有权限，一律降级成"读不到"并返回空列表。它在插件启动路径上跑，
    抛异常就等于插件加载失败。
-2. **原子写** —— 先写 ``<path>.tmp`` 再 ``os.replace``。写一半崩溃绝不能污染
+2. 原子写 —— 先写 ``<path>.tmp`` 再 ``os.replace``。写一半崩溃绝不能污染
    已经存在的好文件（AstrBot 是常驻服务，随时可能被杀）。
-3. **并发安全** —— 多线程同时 add 不能丢记录、不能写坏文件。
-4. **显式 UTF-8** —— Windows 中文环境下默认编码是 gbk，含中文的路径与内容会炸。
+3. 并发安全 —— 多线程同时 add 不能丢记录、不能写坏文件。
+4. 显式 UTF-8 —— Windows 中文环境下默认编码是 gbk，含中文的路径与内容会炸。
 
 pytest 在本机不可用，因此用标准库 ``unittest``。
 """
@@ -179,7 +179,7 @@ class TestAtomicWrite(JournalTestCase):
     """写一半崩溃不能污染已存在的好文件。"""
 
     def test_partial_tmp_does_not_corrupt_existing_file(self) -> None:
-        """★ 模拟"写盘中途被杀"：.tmp 是半截 JSON，但主文件仍是完整旧内容。"""
+        """模拟"写盘中途被杀"：.tmp 是半截 JSON，但主文件仍是完整旧内容。"""
         self.journal.add(make_entry("mnaa", 111))
         before = self.path.read_text(encoding="utf-8")
 
@@ -200,7 +200,7 @@ class TestAtomicWrite(JournalTestCase):
         self.assertEqual([e.session_id for e in self.journal.load()], ["mnab"])
 
     def test_write_uses_replace_not_truncate(self) -> None:
-        """★ 断言实现细节：整个写入过程结束后主文件始终是完整 JSON。
+        """断言实现细节：整个写入过程结束后主文件始终是完整 JSON。
 
         做法：反复 add，每次 add 后立刻读 —— 若实现是"直接覆盖写"，
         Windows 上很容易读到空文件或半截内容（读与写在同线程里虽然串行，
@@ -222,7 +222,7 @@ class TestAtomicWrite(JournalTestCase):
         self.assertEqual(len(journal.load()), 1)
 
     def test_add_survives_when_parent_is_a_file(self) -> None:
-        """父路径是个文件（而不是目录）→ 写不进去，但**绝不能抛异常**。"""
+        """父路径是个文件（而不是目录）→ 写不进去，但绝不能抛异常。"""
         blocker = self.dir / "blocker"
         blocker.write_text("我不是目录", encoding="utf-8")
         journal = SessionJournal(blocker / "sessions.json")
@@ -237,7 +237,7 @@ class TestAtomicWrite(JournalTestCase):
 
 
 class TestCorruptionTolerance(JournalTestCase):
-    """★ 这一组是模块最重要的契约：插件启动路径上不许崩。"""
+    """这一组是模块最重要的契约：插件启动路径上不许崩。"""
 
     def test_empty_file(self) -> None:
         self.path.write_text("", encoding="utf-8")
@@ -384,7 +384,7 @@ class TestConcurrency(JournalTestCase):
     """add/remove 可能从不同线程（不同协程）被调到，必须串行化。"""
 
     def test_concurrent_add_100_entries(self) -> None:
-        """★ 8 个线程各 add，最后必须能完整读到所有记录（不丢、不坏）。"""
+        """8 个线程各 add，最后必须能完整读到所有记录（不丢、不坏）。"""
         total = 100
         threads_count = 8
         entries = [make_entry(f"s{i:03d}", i) for i in range(total)]
@@ -479,7 +479,7 @@ class TestConcurrency(JournalTestCase):
 
 
 class TestEncoding(JournalTestCase):
-    """★ Windows 中文环境下默认编码是 gbk，不显式 UTF-8 就会炸。"""
+    """Windows 中文环境下默认编码是 gbk，不显式 UTF-8 就会炸。"""
 
     def test_chinese_path_and_content(self) -> None:
         chinese_dir = self.dir / "中文目录" / "会话记录"

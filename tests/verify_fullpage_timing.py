@@ -2,12 +2,12 @@
 
 ## 为什么测
 一直有人说"全页截图需要同时调大插件的 command_timeout_sec 和 AstrBot 的
-tool_call_timeout"，但从没人量过**它实际要多久**。如果只要几秒，那所谓
+tool_call_timeout"，但从没人量过它实际要多久。如果只要几秒，那所谓
 "框架限制"根本不存在，文档里那段话就是在吓唬用户。
 
-并且这决定了一件更重要的事：**能不能在插件侧解决**。
+并且这决定了一件更重要的事：能不能在插件侧解决。
 AstrBot 的超时是包在 `asyncio.wait_for(anext(wrapper), ...)` 上的
-（`astr_agent_tool_exec.py:691`）—— 是**每一步**的超时，不是整个工具的超时。
+（`astr_agent_tool_exec.py:691`）—— 是每一步的超时，不是整个工具的超时。
 如果工具是 async generator 且能中途 yield，理论上可以重置这个计时器。
 
 安全边界：
@@ -123,10 +123,10 @@ async def main() -> int:
         print(f"  全页截图：最长 {max(fullpage):.2f}s，中位数 {statistics.median(fullpage):.2f}s")
         worst = max(fullpage)
         if worst > FRAMEWORK_LIMIT_SEC:
-            print(f"  ★ 确实会撞上 AstrBot 的 {FRAMEWORK_LIMIT_SEC:.0f}s 限制 —— 是真问题")
+            print(f"  确实会撞上 AstrBot 的 {FRAMEWORK_LIMIT_SEC:.0f}s 限制 —— 是真问题")
         else:
             margin = FRAMEWORK_LIMIT_SEC / worst
-            print(f"  ★ 最长只用了框架限制的 1/{margin:.1f} —— **不撞限制**，"
+            print(f"  最长只用了框架限制的 1/{margin:.1f} —— 不撞限制，"
                   "文档里那段警告是多余的")
             print(f"    （除非页面远端更慢。留了 {FRAMEWORK_LIMIT_SEC - worst:.0f}s 余量）")
 

@@ -1,25 +1,25 @@
 """配置解析与校验。
 
-AstrBot 把用户在 WebUI 里填的配置以**原始 dict** 交给插件（``Star.__init__`` 的
+AstrBot 把用户在 WebUI 里填的配置以原始 dict 交给插件（``Star.__init__`` 的
 ``config`` 参数），用户填什么就传什么：数字可能写成字符串 ``"60"``、开关可能写成
 字符串 ``"true"``、字段可能整条缺失、也可能被手工编辑成 ``null`` 或别的类型。
 所以这一层的唯一目标是：
 
-    **把任意输入收敛成强类型、取值合法、可直接使用的 :class:`Settings`，永不抛异常。**
+    把任意输入收敛成强类型、取值合法、可直接使用的 :class:`Settings`，永不抛异常。
 
 两个函数的职责严格分开：
 
-- :func:`parse_settings` —— **兜底**：非法值静默回退默认值，数值越界夹到边界。
-- :func:`validate_settings` —— **报告**：把"值合法、但用起来会出问题"的情况
+- :func:`parse_settings` —— 兜底：非法值静默回退默认值，数值越界夹到边界。
+- :func:`validate_settings` —— 报告：把"值合法、但用起来会出问题"的情况
   （例如超时设得比 AstrBot 自己的调用上限还大）变成给用户看的中文提示，
   供插件启动时打印。
 
 由于 ``parse_settings`` 已经把越界值夹住了，``validate_settings`` 里那些
-"≥ 上限"的判断主要面向**直接构造出来的 Settings**（单元测试、脚本、以及按旧
+"≥ 上限"的判断主要面向直接构造出来的 Settings（单元测试、脚本、以及按旧
 schema 手写的配置文件）。这也是它必须对任意字段取值都不抛异常的原因：
 它在插件启动路径上跑，崩了就等于插件加载失败。
 
-本模块**零 astrbot 依赖、零第三方依赖**，可以脱离框架直接单测。
+本模块零 astrbot 依赖、零第三方依赖，可以脱离框架直接单测。
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ DEFAULT_BROWSER_INSTANCE_ID = ""
 DEFAULT_COMMAND_TIMEOUT_SEC = 60.0
 """所有 bsk 命令的超时（秒）。必须 < 120，见 ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``。
 
-它是**全局**超时：每个命令还有一个内置的下限建议值（见 ``service.py`` 的
+它是全局超时：每个命令还有一个内置的下限建议值（见 ``service.py`` 的
 ``TIMEOUT_*``），最终超时 = ``max(内置下限, 本项)`` —— 再对框架上限做一次钳制
 （见 ``service.BskService._timeout``）。所以调大它一定能生效，
 调小它则不会把慢命令压到下限以下。
@@ -130,12 +130,12 @@ DEFAULT_MAX_PAGE_CHARS = 3000
 """回给模型的页面文本上限（字符数），防止把整棵 VOM 树塞进上下文。"""
 
 DEFAULT_ENABLE_EVALUATE = False
-"""是否允许在页面里执行任意 JavaScript（``bsk evaluate``）。**默认关闭。**
+"""是否允许在页面里执行任意 JavaScript（``bsk evaluate``）。默认关闭。
 
-这是本插件风险最高的能力，所以**不复用** ``enabled`` 总开关，而是单独一项：
+这是本插件风险最高的能力，所以不复用 ``enabled`` 总开关，而是单独一项：
 
-- 它能在用户**已登录**的页面里跑任意脚本：读邮箱内容、读后台数据、读 token；
-- 它能静默提交表单、带 cookie 发请求，**绕开"用户看得见的动作"这层约束**
+- 它能在用户已登录的页面里跑任意脚本：读邮箱内容、读后台数据、读 token；
+- 它能静默提交表单、带 cookie 发请求，绕开"用户看得见的动作"这层约束
   —— click/fill 至少会在浏览器窗口里显示出来，执行 JS 不会；
 - 它能自动确认 ``confirm`` 弹窗（实测确认），于是"页面自己会拦一下"的
   最后一道人工确认也失效了。
@@ -144,9 +144,9 @@ DEFAULT_ENABLE_EVALUATE = False
 """
 
 DEFAULT_EVALUATE_REQUIRE_ADMIN = True
-"""执行 JavaScript 是否**强制**仅 AstrBot 管理员可用。**默认开启且建议保持。**
+"""执行 JavaScript 是否强制仅 AstrBot 管理员可用。默认开启且建议保持。
 
-★ 这一项与 ``admin_only`` 是**独立**的，而且优先级更高：即使把 ``admin_only``
+这一项与 ``admin_only`` 是独立的，而且优先级更高：即使把 ``admin_only``
 关掉（或把调用者写进了 ``allowed_users`` 白名单），只要本项为 True，非管理员
 依然无法执行 JS。
 
@@ -159,8 +159,8 @@ DEFAULT_EVALUATE_REQUIRE_ADMIN = True
 DEFAULT_FULLPAGE_TIMEOUT_SEC = 120.0
 """全页截图「最多等多久」（秒）—— 用户可调，默认 120。
 
-★ 这个默认值是**按实测数据**定的，不是拍脑袋：本机实测长页面（Wikipedia 长条目）
-全页截图 **11.72 / 11.11 / 10.91 秒**（1820x11741，4.5MB），短页面（example.com）
+这个默认值是按实测数据定的，不是拍脑袋：本机实测长页面（Wikipedia 长条目）
+全页截图 11.72 / 11.11 / 10.91 秒（1820x11741，4.5MB），短页面（example.com）
 全页截图 2.91 秒、视口截图 0.12 秒。120 秒对实测的 11.72 秒有约 10 倍余量，
 把"模型/页面慢"这类正常波动都装得下。
 
@@ -169,8 +169,8 @@ DEFAULT_FULLPAGE_TIMEOUT_SEC = 120.0
 替他定死；上限给到 600 秒，让放宽了框架 ``tool_call_timeout`` 的用户能真的用上
 更大的值。
 
-⚠️ **它管的是"调用浏览器的这一段最多等多久"，与模型生成回复的快慢无关。**
-AstrBot 的 ``tool_call_timeout`` 限制的也是工具执行耗时，**不包含**模型出 token
+⚠️ 它管的是"调用浏览器的这一段最多等多久"，与模型生成回复的快慢无关。
+AstrBot 的 ``tool_call_timeout`` 限制的也是工具执行耗时，不包含模型出 token
 的时间。所以"模型很慢"不是调大它的理由 —— 页面特别慢、网络特别差才是。
 """
 
@@ -179,7 +179,7 @@ AstrBot 的 ``tool_call_timeout`` 限制的也是工具执行耗时，**不包�
 # --------------------------------------------------------------------------
 
 ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC = 120.0
-"""AstrBot 单次工具调用的时间上限（秒）—— **默认值**，不是实测值。
+"""AstrBot 单次工具调用的时间上限（秒）—— 默认值，不是实测值。
 
 来源：``core/agent/run_context.py:19``（``tool_call_timeout: int = 120``）、
 ``core/config/agent_runner.py:33``（默认配置同值）；用户可改，改的是
@@ -189,16 +189,16 @@ ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC = 120.0
 （``astr_agent_tool_exec.py:691-726``：``asyncio.wait_for(anext(wrapper), timeout=...)``），
 用户看到的就是这句英文 —— 而不是我们写的中文提示。
 
-⚠️ 这个**默认值**曾把我引到一个错误的结论上：既然框架默认只等 120 秒，而全页截图
-当时的内置下限是 180 秒，就推断"全页截图必须两处一起调大才能用"。**实测推翻了它**：
-真实长页面（Wikipedia 长条目）的全页截图只要 **11.72 / 11.11 / 10.91 秒**
+⚠️ 这个默认值曾把我引到一个错误的结论上：既然框架默认只等 120 秒，而全页截图
+当时的内置下限是 180 秒，就推断"全页截图必须两处一起调大才能用"。实测推翻了它：
+真实长页面（Wikipedia 长条目）的全页截图只要 11.72 / 11.11 / 10.91 秒
 （1820x11741、4.5MB），是 120 秒限制的约 1/10，留了 108 秒余量；短页面
 （example.com）视口截图 0.12 秒、全页截图 2.91 秒。所以"必须调大"是个多余的警告。
 （该说法已从 README/ARCHITECTURE 删除；全页截图的下限后来也按用户要求从 180 改成
 可配置的 120，见 :data:`DEFAULT_FULLPAGE_TIMEOUT_SEC`。）
 
-真正的风险是另一个（也是这个常量仍然有用的原因）：**它一旦小于我们的最终超时，
-用户看到的就会是框架抛的英文超时，而不是插件精心写的中文提示**，会话还可能
+真正的风险是另一个（也是这个常量仍然有用的原因）：它一旦小于我们的最终超时，
+用户看到的就会是框架抛的英文超时，而不是插件精心写的中文提示，会话还可能
 留下未完成状态。所以运行时要把这个值读出来并给自己的超时留出安全余量 ——
 见 :func:`read_framework_tool_timeout` 与 ``service.BskService._timeout``。
 """
@@ -211,7 +211,7 @@ ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC = 120.0
 # 这次调用掐了 —— 用户看到的是一句英文的 execution timeout，我们精心写的中文
 # 提示根本没机会出现，而且"会话可能留下未完成状态"这件事被完全掩盖。
 #
-# 解法：把框架的上限读出来，让自己的超时始终**低于**它。读不到就一切照旧
+# 解法：把框架的上限读出来，让自己的超时始终低于它。读不到就一切照旧
 #（宁可用原语义，也不要凭猜测缩短用户的等待）。
 # --------------------------------------------------------------------------
 
@@ -224,21 +224,21 @@ FRAMEWORK_TOOL_TIMEOUT_PATH: tuple[str, ...] = (
 """框架 ``tool_call_timeout`` 在 AstrBot 主配置里的路径。
 
 已用真实配置文件（``~/.astrbot/data/cmd_config.json``）确认过这条路径与结构，
-本机取到的值 = 120。它同时也是一个**拼错的提示**该照抄的路径：
+本机取到的值 = 120。它同时也是一个拼错的提示该照抄的路径：
 用户要改的就是这一项。
 """
 
 FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC = 5.0
 """最终超时必须留在框架上限之下的安全余量（秒）。
 
-为什么需要它（而不是取"正好等于上限"）：框架的计时是从**它开始等**算起的
+为什么需要它（而不是取"正好等于上限"）：框架的计时是从它开始等算起的
 （``asyncio.wait_for`` 包住整条工具调用），而一次工具调用不只是 bsk 子进程本身 ——
 bsk 返回之后我们还要校验截图、渲染给模型的中文、序列化结果、把图片交给框架发送。
 这些收尾都在同一个 120 秒窗口里。若插件超时正好等于上限，就会出现"bsk 刚好返回、
 框架同时掐断"的临界情况：用户拿不到任何中文解释。
 
 5 秒的依据：收尾动作实测都在毫秒级，5 秒是宽裕的余量，同时小到不会实质缩短
-用户愿意等待的时间。它**只是**一个余量，不承担"压低命令超时"的职责。
+用户愿意等待的时间。它只是一个余量，不承担"压低命令超时"的职责。
 """
 
 FRAMEWORK_TIMEOUT_FLOOR_SEC = 10.0
@@ -246,7 +246,7 @@ FRAMEWORK_TIMEOUT_FLOOR_SEC = 10.0
 
 没有它的话，用户把 ``tool_call_timeout`` 调到 120 以上是小概率事件，但把它调到
 15 秒却完全可能 —— 那时按公式会算出 15 - 5 = 10 秒甚至更小。超时太小比超时更糟：
-每条命令都会**在起点就被掐死**（连 `observe` 都来不及完成），现象是"插件完全不能用"，
+每条命令都会在起点就被掐死（连 `observe` 都来不及完成），现象是"插件完全不能用"，
 比"慢一点但能成"难排查得多。所以宁可让它最多少等 10 秒。
 """
 
@@ -285,7 +285,7 @@ def as_timeout_seconds(value: Any) -> float | None:
 def read_framework_tool_timeout(config_obj: Any) -> float | None:
     """从 AstrBot 的主配置对象里读出框架的工具调用超时（秒）。
 
-    **本函数只接受"鸭子类型"对象，绝不 import astrbot。** 分层约束要求 ``bsk/``
+    本函数只接受"鸭子类型"对象，绝不 import astrbot。 分层约束要求 ``bsk/``
     包零框架依赖（有测试与 ``verify_release_ready.py`` 守护），所以这里靠
     ``getattr`` / ``.get()`` 逐层小心下探，调用方（``main.py``）负责把
     ``self.context.get_config()`` 的返回值传进来。
@@ -293,7 +293,7 @@ def read_framework_tool_timeout(config_obj: Any) -> float | None:
     取值路径：``agent_runner`` → ``config`` → ``misc`` → ``tool_call_timeout``
     （见 :data:`FRAMEWORK_TOOL_TIMEOUT_PATH`）。
 
-    ★ **任何异常都降级成"未知"（返回 ``None``），绝不抛异常。** 这个函数跑在插件
+    任何异常都降级成"未知"（返回 ``None``），绝不抛异常。 这个函数跑在插件
     加载路径上：它一抛，整个插件就加载失败 —— 而"框架上限读不到"最多只是让我们
     少一层保护，绝不该让插件起不来。这与 :func:`parse_settings` 的"非法值一律回退"
     是同一个约定。
@@ -312,7 +312,7 @@ def read_framework_tool_timeout(config_obj: Any) -> float | None:
 
     Returns:
         读到且合法时返回正的浮点秒数；读不到或值不可用时返回 ``None``
-        （调用方据此**保持原有行为**，不要因为读不到就缩短超时）。
+        （调用方据此保持原有行为，不要因为读不到就缩短超时）。
     """
     try:
         node: Any = config_obj
@@ -329,7 +329,7 @@ def _dig_one_level(node: Any, key: str) -> Any:
     """从配置树里取一层子节点，取不到时返回 ``None``。
 
     ``AstrBotConfig`` 既是 dict 又支持 ``.键名`` 属性访问，所以两种方式都试。
-    刻意**不**用 ``isinstance(node, dict)`` 去卡类型：真实的 ``AstrBotConfig``
+    刻意不用 ``isinstance(node, dict)`` 去卡类型：真实的 ``AstrBotConfig``
     恰好是 dict 子类，但将来若换成别的映射类型，用鸭子类型（有没有 ``get``）
     判断更稳。任何异常都吞掉并返回 ``None``。
     """
@@ -362,7 +362,7 @@ COMMAND_TIMEOUT_MAX_SEC = 110.0
 避免出现"bsk 刚好返回、框架已经掐断"的临界情况。
 
 在新语义（最终超时 = ``max(内置下限, 本项)``）下这个上界仍然合理：
-它必须**严格小于** ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``（120），这样即便用户把它
+它必须严格小于 ``ASTRBOT_TOOL_TIMEOUT_LIMIT_SEC``（120），这样即便用户把它
 拉满，插件内部也总有时间把超时翻译成中文提示，而不是被框架从外面打断。
 """
 
@@ -377,7 +377,7 @@ FULLPAGE_TIMEOUT_MAX_SEC = 600.0
 下界 30 的依据：实测最慢一次全页截图是 11.72 秒，30 秒约为它的 2.5 倍，
 再低就等于"必然超时"，填了也没有意义。
 
-上界 600 的依据：它**必须允许超过框架默认的 120 秒**，否则用户放宽了框架的
+上界 600 的依据：它必须允许超过框架默认的 120 秒，否则用户放宽了框架的
 ``tool_call_timeout``（例如调到 300）之后，插件这边仍然卡在 120 用不上更大的值。
 600 秒足够覆盖任何真实网页，同时仍是个有界的值（不至于等价于"永不超时"）。
 """
@@ -399,14 +399,14 @@ SESSION_SCOPES: tuple[str, ...] = ("umo", "user")
 # --------------------------------------------------------------------------
 # 单个取值的容错转换
 #
-# 全部遵循同一个约定：**拿不准就返回 default**，绝不抛异常。
+# 全部遵循同一个约定：拿不准就返回 default，绝不抛异常。
 # --------------------------------------------------------------------------
 
 # 字符串形式的布尔值。用户把开关填成字符串是很常见的（配置文件手改、
 # 从别处复制粘贴），所以必须认这些写法。
 _TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on", "y", "t", "是", "开", "启用"})
 _FALSY_STRINGS = frozenset({"0", "false", "no", "off", "n", "f", "否", "关", "禁用"})
-# 注意空字符串**不在**上面两个集合里：``enabled: ""`` 说明用户没填（或填错了），
+# 注意空字符串不在上面两个集合里：``enabled: ""`` 说明用户没填（或填错了），
 # 这时回退默认值比擅自理解成 False 更符合预期。
 
 
@@ -556,7 +556,7 @@ def _parse_session_scope(value: Any) -> str:
 
 @dataclass(slots=True, frozen=True)
 class Settings:
-    """插件运行所需的全部配置，**保证每一项都已合法**。
+    """插件运行所需的全部配置，保证每一项都已合法。
 
     这个对象是不可变的：配置在插件启动时解析一次，运行期只读。
     要改配置就改 WebUI 然后重载插件 —— 避免"运行到一半规则变了"这种难查的行为。
@@ -618,16 +618,16 @@ class Settings:
     """回给模型的页面文本上限（字符数）。"""
 
     enable_evaluate: bool
-    """是否允许执行任意 JavaScript（``bsk evaluate``）。**默认 False。**
+    """是否允许执行任意 JavaScript（``bsk evaluate``）。默认 False。
 
     与 ``enabled`` 无关：``enabled`` 是"插件是否工作"，本项是"是否额外开放
     最高危的那个能力"。详见 :data:`DEFAULT_ENABLE_EVALUATE`。
     """
 
     evaluate_require_admin: bool
-    """执行 JavaScript 是否强制仅管理员。**默认 True**，且**优先于** ``admin_only``。
+    """执行 JavaScript 是否强制仅管理员。默认 True，且优先于 ``admin_only``。
 
-    为 True 时，``admin_only=False`` 与 ``allowed_users`` 都**不能**让非管理员
+    为 True 时，``admin_only=False`` 与 ``allowed_users`` 都不能让非管理员
     执行 JS —— 详见 :data:`DEFAULT_EVALUATE_REQUIRE_ADMIN`。
     """
 
@@ -635,7 +635,7 @@ class Settings:
 def parse_settings(raw: dict | None) -> Settings:
     """从 AstrBot 的原始配置 dict 构造 :class:`Settings`。
 
-    **任何非法值都回退到默认值，任何越界值都夹到边界，本函数永不抛异常。**
+    任何非法值都回退到默认值，任何越界值都夹到边界，本函数永不抛异常。
     用户把配置填成一团乱麻的后果是"插件按默认值工作"，而不是"插件起不来"。
 
     Args:
@@ -677,7 +677,7 @@ def parse_settings(raw: dict | None) -> Settings:
             IDLE_RELEASE_MIN_SEC,
             IDLE_RELEASE_MAX_SEC,
         ),
-        # 整页截图专用超时。上界（600）刻意**大于**框架默认的 120 秒：
+        # 整页截图专用超时。上界（600）刻意大于框架默认的 120 秒：
         # 用户放宽了框架 tool_call_timeout 之后，这一项要能真的用上更大的值；
         # 是否被框架上限钳住由 service._timeout 在运行时决定（那里才读得到框架值）。
         fullpage_timeout_sec=_clamp(
@@ -711,7 +711,7 @@ def parse_settings(raw: dict | None) -> Settings:
 def validate_settings(s: Settings) -> list[str]:
     """检查配置里"合法但会出问题"的地方，返回给用户看的中文提示。
 
-    只报告**实质问题**，不报告非法值 —— 非法值已经在 :func:`parse_settings`
+    只报告实质问题，不报告非法值 —— 非法值已经在 :func:`parse_settings`
     里被兜底了，那些不需要用户操心。
 
     Args:
@@ -750,19 +750,19 @@ def validate_settings(s: Settings) -> list[str]:
 
     if not s.admin_only:
         problems.append(
-            "【安全提醒】`admin_only` 已经关闭：**任何能给机器人发消息的人**都能操控"
+            "【安全提醒】`admin_only` 已经关闭：任何能给机器人发消息的人都能操控"
             "你这台机器上已登录的浏览器 —— 读你的网页、点按钮、填表单、截图。"
             "如果只是想给某个人用，请把 `admin_only` 改回开启，并把对方的用户 ID"
             "填进 `allowed_users`。"
         )
 
-    # ★ evaluate 是本插件风险最高的能力，它的提醒**必须**单独一条，且说清
+    # evaluate 是本插件风险最高的能力，它的提醒必须单独一条，且说清
     #   "它能做什么"而不是"它被打开了" —— 用户要判断的是风险，不是开关状态。
     if _as_bool(getattr(s, "enable_evaluate", False), False):
         problems.append(
-            "【安全提醒】`enable_evaluate` 已开启：模型现在可以在你**已登录**的页面里"
+            "【安全提醒】`enable_evaluate` 已开启：模型现在可以在你已登录的页面里"
             "执行任意 JavaScript。这与点击、输入有本质区别 —— 后者是你在浏览器窗口里"
-            "**看得见**的动作，而执行脚本不是："
+            "看得见的动作，而执行脚本不是："
             "它能静默读取页面上的任何数据（邮箱正文、后台列表、登录 token），"
             "能带着你的登录状态发请求或提交表单，还能自动点掉页面的确认弹窗"
             "（实测 `confirm` 会被自动确认为「确定」）。"
@@ -775,7 +775,7 @@ def validate_settings(s: Settings) -> list[str]:
         getattr(s, "evaluate_require_admin", True), True
     ):
         problems.append(
-            "【安全提醒】`enable_evaluate` 与「执行脚本仅限管理员」是**同时关闭**的："
+            "【安全提醒】`enable_evaluate` 与「执行脚本仅限管理员」是同时关闭的："
             "现在任何能跟机器人对话的人（包括 `allowed_users` 白名单里的人，以及"
             "`admin_only=false` 时所有能发消息的人）都可以让你的浏览器执行任意 "
             "JavaScript，读取或提交你已登录账号里的任何内容。"
@@ -796,9 +796,9 @@ def validate_settings(s: Settings) -> list[str]:
         shown = "、".join(users[:5]) + ("…" if len(users) > 5 else "")
         problems.append(
             f"`allowed_users` 里填了 {len(users)} 个用户（{shown}），同时 `admin_only` "
-            "也是开启的。实际规则是**白名单优先**：名单里的用户会被放行，"
+            "也是开启的。实际规则是白名单优先：名单里的用户会被放行，"
             "名单外的用户即使是管理员之外的普通人也会被挡住；而 AstrBot 管理员"
-            "始终可用。也就是说，这份白名单会让名单里的**非管理员**也能操作浏览器。"
+            "始终可用。也就是说，这份白名单会让名单里的非管理员也能操作浏览器。"
             "如果不希望这样，请清空 `allowed_users`。"
         )
 

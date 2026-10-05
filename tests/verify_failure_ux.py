@@ -1,11 +1,11 @@
 """首次使用体验验证：环境没准备好时，用户看到的是什么？
 
-这是**每个新用户都会先撞上的路径**，也是插件最容易给出糟糕体验的地方：
-如果 bsk 没装、或浏览器扩展没连上，工具应当返回**能照着做**的中文提示，
+这是每个新用户都会先撞上的路径，也是插件最容易给出糟糕体验的地方：
+如果 bsk 没装、或浏览器扩展没连上，工具应当返回能照着做的中文提示，
 而不是 Python 堆栈、空字符串、或一句"操作失败"。
 
 本脚本用真实的插件实例 + 故意配错的环境，验证这些路径。
-**不需要浏览器**（正因为环境是坏的，它压根到不了浏览器那一步）。
+不需要浏览器（正因为环境是坏的，它压根到不了浏览器那一步）。
 
 用法：
     python tests/verify_failure_ux.py
@@ -28,11 +28,11 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
-# ★ 必须钉住 AstrBot 的 root，且要在**任何** astrbot import 之前生效。
+# 必须钉住 AstrBot 的 root，且要在任何 astrbot import 之前生效。
 #
 # 本脚本通过 load_plugin() 间接 import 插件，插件又 import astrbot；
 # 一旦 astrbot 被加载，AstrBot 就会按 get_astrbot_root() 解析数据路径：
-# 优先 ASTRBOT_ROOT，否则普通模式用**当前工作目录**（astrbot_path.py:29-35）。
+# 优先 ASTRBOT_ROOT，否则普通模式用当前工作目录（astrbot_path.py:29-35）。
 # 不设置的话，在项目目录下运行本脚本会在项目里生成 data/cmd_config.json
 # （AstrBot 主配置，含 API 密钥与管理员 QQ 号）—— 曾因此误提交过整个 data/。
 os.environ.setdefault(
@@ -136,7 +136,7 @@ async def main() -> int:
     check("非管理员被拒绝", "管理员" in out or "权限" in out, f"{out[:120]}")
     check("拒绝提示说明怎么获得权限", "管理员" in out, "应告诉用户找管理员")
 
-    # 被拒绝时**不应该**产生任何浏览器会话。
+    # 被拒绝时不应该产生任何浏览器会话。
     # 注意要比较"调用前后"的差集，而不是断言总数为 0 —— daemon 是共享的，
     # 可能本来就有别的程序（用户的 DSH、其他会话）创建的会话。
     def _ids(data: object) -> set[str]:

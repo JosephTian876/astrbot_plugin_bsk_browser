@@ -41,7 +41,7 @@ local_config.json
 *.local.json
 .commitmsg
 
-# ★ AstrBot 运行期数据目录 —— 绝不属于插件源码，绝不能提交
+# AstrBot 运行期数据目录 —— 绝不属于插件源码，绝不能提交
 #
 # 为什么会有这个：验证脚本在项目根目录下 import astrbot 时，AstrBot 会以
 # 「当前工作目录」为 root 去解析数据路径（core/utils/astrbot_path.py 的

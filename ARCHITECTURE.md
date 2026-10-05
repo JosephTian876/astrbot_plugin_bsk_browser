@@ -8,11 +8,11 @@
 
 ## 1. 项目目标
 
-把本机 `bsk` CLI（腾讯 BrowserSkill）包装成 AstrBot 的 LLM 可调用工具，让机器人能操作用户**已登录的真实浏览器**。
+把本机 `bsk` CLI（腾讯 BrowserSkill）包装成 AstrBot 的 LLM 可调用工具，让机器人能操作用户已登录的真实浏览器。
 
 **核心价值**：AstrBot 现有浏览器插件都是"开一个干净的无头浏览器"，用不了用户已登录的账号。本插件复用用户的真实登录态。
 
-**非目标**（明确不做，避免范围蔓延）：
+非目标（明确不做，避免范围蔓延）：
 - 不实现 `evaluate`（执行任意 JS）—— 安全风险，v1 不开放
 - 不捆绑 `bsk` 二进制 —— 合规红线，必须用户自装
 - 不支持远程（非 loopback）模式 —— bsk 远程模式本身不支持文件传输
@@ -24,14 +24,14 @@
 | # | 约束 | 源码证据 | 违反后果 |
 |---|---|---|---|
 | **C1** | 插件入口必须是 `main.py`（或与目录同名的 `.py`） | `star_manager._get_modules` L301-304 | 插件根本不被发现 |
-| **C2** | `@filter.llm_tool` 装饰的函数**必须定义在 `main.py`** | `star_manager.py` L1281-1288：仅当 `ft.handler.__module__ == metadata.module_path` 才用 `functools.partial(raw_handler, metadata.star_cls)` 绑定 `self` | 工具定义在子模块 → **拿不到 self，调用时静默失败/TypeError** |
-| **C3** | **绝不定义 `__del__`** | `star_manager.py` L1944-1963 是 `if "__del__" in ...: ... elif "terminate" in ...` | 定义了 `__del__` → `terminate()` **永不执行** → 子进程/会话泄漏 |
-| **C4** | `terminate` / `initialize` 必须定义在**插件类自己的 `__dict__`** 里 | 同上，用 `cls.__dict__` 判断 | 继承来的不算，钩子不触发 |
+| **C2** | `@filter.llm_tool` 装饰的函数必须定义在 `main.py` | `star_manager.py` L1281-1288：仅当 `ft.handler.__module__ == metadata.module_path` 才用 `functools.partial(raw_handler, metadata.star_cls)` 绑定 `self` | 工具定义在子模块 → **拿不到 self，调用时静默失败/TypeError** |
+| **C3** | 绝不定义 `__del__` | `star_manager.py` L1944-1963 是 `if "__del__" in ...: ... elif "terminate" in ...` | 定义了 `__del__` → `terminate()` **永不执行** → 子进程/会话泄漏 |
+| **C4** | `terminate` / `initialize` 必须定义在插件类自己的 `__dict__` 里 | 同上，用 `cls.__dict__` 判断 | 继承来的不算，钩子不触发 |
 | **C5** | 配置 schema 的 `type` 必须在 `DEFAULT_VALUE_MAP` 白名单内 | `int/float/bool/string/text/list/file/object/template_list/dict` | 非法 type → `TypeError` 插件**加载失败** |
-| **C6** | `@filter.llm_tool` 的 docstring `Args:` 段是**参数 schema 的唯一来源**（不读函数类型注解） | `star_handler.py` L633-665 | 漏写 `Args:` → schema 为空且**静默失效**；类型名非法 → `ValueError` 加载失败 |
+| **C6** | `@filter.llm_tool` 的 docstring `Args:` 段是参数 schema 的唯一来源（不读函数类型注解） | `star_handler.py` L633-665 | 漏写 `Args:` → schema 为空且**静默失效**；类型名非法 → `ValueError` 加载失败 |
 | **C7** | `Star.__init__(self, context, config=None)`，config 必须有默认值 | 框架用关键字参数调用 | 无默认值 → 无配置时实例化失败 |
-| **C8** | 插件是**单例**，消息处理是**并发 task** | `metadata.star_cls` 实例化一次；`event_bus.py` `asyncio.create_task` | 多用户并发进入同一实例 → 必须按 umo 隔离状态 + 加锁 |
-| **C9** | AstrBot 自带 Python **3.12**；Windows 下 `sys.stdout.encoding = gbk` | 实机实测 | 不显式指定 UTF-8 → `UnicodeDecodeError`（在 reader 线程抛，主线程只看到 `None`） |
+| **C8** | 插件是单例，消息处理是并发 task | `metadata.star_cls` 实例化一次；`event_bus.py` `asyncio.create_task` | 多用户并发进入同一实例 → 必须按 umo 隔离状态 + 加锁 |
+| **C9** | AstrBot 自带 Python 3.12；Windows 下 `sys.stdout.encoding = gbk` | 实机实测 | 不显式指定 UTF-8 → `UnicodeDecodeError`（在 reader 线程抛，主线程只看到 `None`） |
 
 ---
 
@@ -62,8 +62,8 @@
 
 **为什么这样分**：
 - `C2` 强制工具函数必须在 `main.py`。若把业务逻辑也写进去，`main.py` 会变成 1000+ 行巨石（当前骨架就是 44KB 单文件）。
-- 因此让 `main.py` 只做**薄适配**：每个工具函数 5-15 行，负责"取参数、调 service、包结果"。
-- 真正的逻辑在 `bsk/service.py` 及其依赖，**不 import astrbot**，所以可以直接 `pytest` 跑，不需要启动 AstrBot。
+- 因此让 `main.py` 只做薄适配：每个工具函数 5-15 行，负责"取参数、调 service、包结果"。
+- 真正的逻辑在 `bsk/service.py` 及其依赖，不 import astrbot，所以可以直接 `pytest` 跑，不需要启动 AstrBot。
 
 ---
 
@@ -86,7 +86,7 @@ class BskOutcomeUnknown(BskError): ... # 动作结果未知 → 禁止重试
 class BskProtocolError(BskError): ...  # 输出不是 JSON（如 clap 参数错误）
 ```
 
-**退出码映射**（实测 6 档）：`0` 成功 / `1` 用户错误 / `2` 协议传输 / `3` 浏览器CDP / `4` 超时 / `5` 版本不匹配。
+退出码映射（实测 6 档）：`0` 成功 / `1` 用户错误 / `2` 协议传输 / `3` 浏览器CDP / `4` 超时 / `5` 版本不匹配。
 
 ### 4.2 `bsk/runner.py`
 
@@ -98,13 +98,13 @@ class BskRunner:
     async def run(self, args: list[str], timeout: float | None = None) -> BskResult: ...
 ```
 
-**必须处理的坑**（全部实测确认）：
-1. `asyncio.create_subprocess_exec(*args)` —— 列表参数，**不过 shell**（无注入面）
-2. **超时必须包住 `communicate()`** —— Windows 下 daemon 继承管道句柄可能导致永不返回
+必须处理的坑（全部实测确认）：
+1. `asyncio.create_subprocess_exec(*args)` —— 列表参数，不过 shell（无注入面）
+2. 超时必须包住 `communicate()` —— Windows 下 daemon 继承管道句柄可能导致永不返回
 3. 超时后：先关 stdin 给 15 秒宽限（Windows 取消语义），再 `kill()`
-4. stdout/stderr **显式 `.decode("utf-8", errors="replace")`** —— 见 C9
-5. **错误 JSON 走 stdout 不是 stderr**；clap 参数错误是 stderr 纯文本 → 解析必须容错
-6. 退出码非 0 即失败，**不能靠解析 JSON 判成败**
+4. stdout/stderr 显式 `.decode("utf-8", errors="replace")` —— 见 C9
+5. 错误 JSON 走 stdout 不是 stderr；clap 参数错误是 stderr 纯文本 → 解析必须容错
+6. 退出码非 0 即失败，不能靠解析 JSON 判成败
 
 ### 4.3 `bsk/session.py`
 
@@ -116,16 +116,16 @@ class SessionManager:
 ```
 
 **必须遵守**：
-- `session stop <ID>` 的 id 是**位置参数**（唯一例外，其余命令用 `--session`）
-- 每个 key 一把 `asyncio.Lock`，**禁止同 session 并发**（bsk 同时只允许 1 个 in-flight，否则 `session_busy`）
-- **绝不使用 `session stop --all`** —— 会停掉别的程序（如 DSH）创建的会话
-- 会话失效靠"用失败触发重建"（`not_found` → 重建 → 重试 1 次），**不要**每次操作前先探测
+- `session stop <ID>` 的 id 是位置参数（唯一例外，其余命令用 `--session`）
+- 每个 key 一把 `asyncio.Lock`，禁止同 session 并发（bsk 同时只允许 1 个 in-flight，否则 `session_busy`）
+- 绝不使用 `session stop --all` —— 会停掉别的程序（如 DSH）创建的会话
+- 会话失效靠"用失败触发重建"（`not_found` → 重建 → 重试 1 次），不要每次操作前先探测
 - `terminate` 里必须 `try/finally` 全部 stop，否则留下 Agent Window 打扰用户
-- `session_busy` 等 100ms 重试一次；`outcome_unknown` **禁止重试**并标记会话为不确定态
+- `session_busy` 等 100ms 重试一次；`outcome_unknown` 禁止重试并标记会话为不确定态
 
 ### 4.4 `bsk/pages.py`
 
-`observe` 返回的是**带标记的缩进文本树**，不是 JSON 结构：
+`observe` 返回的是带标记的缩进文本树，不是 JSON 结构：
 
 ```
 @vom 1
@@ -139,20 +139,20 @@ L1 page
 
 必须解析出：页面标题（`RootWebArea "..."`）、可交互元素（`@eN role "name"`）、ref 总数、是否截断。
 
-**注意**：`observe` **没有**独立 `title`/`url` 字段，只能正则提取。
-**注意**：`snapshot` 与 `observe` 实测输出逐字节相同且都不带截图 → **只调 `observe`**。
+**注意**：`observe` 没有独立 `title`/`url` 字段，只能正则提取。
+**注意**：`snapshot` 与 `observe` 实测输出逐字节相同且都不带截图 → 只调 `observe`。
 
 ### 4.5 `bsk/shots.py`
 
-- 必须**自己指定绝对路径**并保证唯一（含 session_id + 时间戳），否则并发互相覆盖
-- `--out` 会**覆盖**已有文件
-- 拿到路径后**三重校验**：文件存在、大小 == `byte_size`、**前 8 字节魔数**（某些 Chromium 构建请求 png 却返回 JPEG）
+- 必须自己指定绝对路径并保证唯一（含 session_id + 时间戳），否则并发互相覆盖
+- `--out` 会覆盖已有文件
+- 拿到路径后三重校验：文件存在、大小 == `byte_size`、前 8 字节魔数（某些 Chromium 构建请求 png 却返回 JPEG）
 - 定期清理，避免磁盘无限增长
 - 给 LLM 前考虑降采样（1850×1208 的原图很贵）
 
 ### 4.6 `bsk/config.py`
 
-把 AstrBot 传来的原始 dict 转成强类型 `Settings`，**对每一项做类型校验和兜底**（配置可能被用户填成任何东西）。
+把 AstrBot 传来的原始 dict 转成强类型 `Settings`，对每一项做类型校验和兜底（配置可能被用户填成任何东西）。
 
 ---
 
@@ -160,21 +160,21 @@ L1 page
 
 ### D1：注册路径选 `@filter.llm_tool`（而非 `context.add_llm_tools`）
 
-- 前者由框架解析 docstring 生成 schema，**单一事实来源**，不易写错；
+- 前者由框架解析 docstring 生成 schema，单一事实来源，不易写错；
 - 后者需手写 JSON schema，且要自己管 `handler_module_path`。
 - 代价：工具函数必须在 `main.py`（C2），已由分层设计消化。
 
 ### D2：权限默认仅管理员，且可调（用户要求 #5）
 
-- 插件自己实现 `admin_only`（默认 `true`），读插件配置，**可在 AstrBot 插件设置页直接改**；
+- 插件自己实现 `admin_only`（默认 `true`），读插件配置，可在 AstrBot 插件设置页直接改；
 - 每个工具函数入口统一调用一个 `_guard(event) -> str | None`；
 - 额外支持 `allowed_users`（用户 ID 白名单），便于"只给某个人用"；
-- 同时**兼容** AstrBot 原生的 `tool_permissions`（WebUI → 扩展组件）机制，两者取严。
+- 同时兼容 AstrBot 原生的 `tool_permissions`（WebUI → 扩展组件）机制，两者取严。
 
-### D3：`evaluate` 单独成工具、**默认关闭**、强制管理员（原为"不做 evaluate"，v0.1.0 追加）
+### D3：`evaluate` 单独成工具、默认关闭、强制管理员（原为"不做 evaluate"，v0.1.0 追加）
 
-`evaluate` 能让模型在用户已登录页面执行任意 JS。**能力保留但默认关闭**，
-且独立成一个工具而不是并进 `bsk_act`，具体决策见 §5 **D7**。
+`evaluate` 能让模型在用户已登录页面执行任意 JS。能力保留但默认关闭，
+且独立成一个工具而不是并进 `bsk_act`，具体决策见 §5 D7。
 
 仍然不做的事：不把它作为 `bsk_act` 的一个 action（那样会绕过独立开关与
 AstrBot 原生的 `tool_permissions`），也不给它任何"自动降级"路径。
@@ -185,24 +185,24 @@ AstrBot 原生的 `tool_permissions`），也不给它任何"自动降级"路径
 
 ### D5：错误一律转成"模型能看懂的中文"
 
-工具返回给 LLM 的字符串必须包含**下一步该怎么做**（例如"会话已过期，已自动重建，请重试"），而不是抛裸异常。
+工具返回给 LLM 的字符串必须包含下一步该怎么做（例如"会话已过期，已自动重建，请重试"），而不是抛裸异常。
 
 ### D6：超时采用「取较大值 + 框架上限钳制」的规则
 
-**规则一句话**：`command_timeout_sec` 是所有 bsk 命令的超时；每个命令的内置值是**下限**，
-整页截图另有**专门的可配置项**；最后统一被框架上限钳一次。
+**规则一句话**：`command_timeout_sec` 是所有 bsk 命令的超时；每个命令的内置值是下限，
+整页截图另有专门的可配置项；最后统一被框架上限钳一次。
 
 ```
 最终超时 = min( max(内置下限, command_timeout_sec), 框架上限 - 5s )
 整页截图：内置下限换成 settings.fullpage_timeout_sec（默认 120，范围 30–600）
 ```
 
-- 内置下限 = "这个命令至少需要多久"。例如 `navigate` 必须 **大于** bsk 自身的 `--timeout`
+- 内置下限 = "这个命令至少需要多久"。例如 `navigate` 必须 大于 bsk 自身的 `--timeout`
   30s，否则我们会先把它掐掉、而它正要成功返回。
 - 用户配置 = "我愿意等多久"。
 - 取较大值，两者都不被违背。
-- 最后与"框架上限 − 5s"取较小值：**保证插件在框架动手之前自己超时**（见下方"框架上限"）。
-  框架上限**读不到时不钳制** —— 拿不到事实就不该凭猜测缩短用户的等待。
+- 最后与"框架上限 − 5s"取较小值：保证插件在框架动手之前自己超时（见下方"框架上限"）。
+  框架上限读不到时不钳制 —— 拿不到事实就不该凭猜测缩短用户的等待。
 
 | 命令 | 内置下限 |
 |---|---|
@@ -210,21 +210,21 @@ AstrBot 原生的 `tool_permissions`），也不给它任何"自动降级"路径
 | observe | 15s |
 | session start | 30s |
 | navigate | 45s（必须 > bsk 自身默认 30s） |
-| screenshot 视口 | 30s（**固定，不读 fullpage 配置**） |
+| screenshot 视口 | 30s（固定，不读 fullpage 配置） |
 | screenshot --full-page | `fullpage_timeout_sec`（默认 120s，用户可调 30–600） |
 
 **为什么整页截图单独一项**：它的耗时与其余命令完全不在一个量级（实测 2.9–11.7s，
 其余命令多在 1s 内），塞进 `command_timeout_sec`（上界 110s）既不够用、又会让用户
-为了截图把"所有命令的超时"一起拉长。独立一项可以只调它。**视口截图刻意不读这一项**：
+为了截图把"所有命令的超时"一起拉长。独立一项可以只调它。视口截图刻意不读这一项：
 实测只要 0.12s，跟着变成 120s 属于误伤。
 
-**为什么不做更复杂的规则**（例如"快命令取 min、慢命令取 max"）：本插件的使用者是
+为什么不做更复杂的规则（例如"快命令取 min、慢命令取 max"）：本插件的使用者是
 编程新手，配置项的行为必须能用一句话说清。复杂规则会带来解释成本和"为什么调了没用"
 的困惑 —— 而这正是改进前的老问题。
 
 #### 框架上限（`tool_call_timeout`）与钳制
 
-AstrBot 的 `tool_call_timeout` 默认 **120 秒**（源码 `core/agent/run_context.py:19` 与
+AstrBot 的 `tool_call_timeout` 默认 120 秒（源码 `core/agent/run_context.py:19` 与
 `core/config/agent_runner.py:33`；本机配置文件实测值也是 120），可调项为
 `agent_runner.config.misc.tool_call_timeout`。到点后框架抛
 `tool <name> execution timeout after N seconds.`（`astr_agent_tool_exec.py:691-726`）。
@@ -232,85 +232,85 @@ AstrBot 的 `tool_call_timeout` 默认 **120 秒**（源码 `core/agent/run_cont
 `bsk.config.read_framework_tool_timeout`（鸭子类型下探，任何异常都降级成 None）。
 
 **钳制的理由**：插件的全页截图预算与框架默认上限都是 120 秒。若不钳制，用户看到的
-会是框架抛的英文 `execution timeout`，而**不是插件精心写的中文提示**，并且"会话可能
+会是框架抛的英文 `execution timeout`，而不是插件精心写的中文提示，并且"会话可能
 留下未完成状态"这件事被完全掩盖。钳制后（默认组合 → 115 秒）超时由插件先报出来。
-**安全余量 5 秒**的理由：框架从**它开始等**的那一刻计时，而 bsk 返回后我们还要校验截图、
+安全余量 5 秒的理由：框架从它开始等的那一刻计时，而 bsk 返回后我们还要校验截图、
 渲染中文、序列化结果、交给框架发图片 —— 这些都在同一个窗口里，留余量才不会正好撞边界。
 
-⚠️ **不要把这个钳制说成"必须两处一起调大才能用全页截图"**。实测数据（见 §6.2）：
+⚠️ 不要把这个钳制说成"必须两处一起调大才能用全页截图"。实测数据（见 §6.2）：
 长页面全页截图 11.72 / 11.11 / 10.91 秒，短页面 2.91 秒，距 120 秒上限约 1/10。
-**默认配置下整页截图就能用，什么都不用改**。只有极慢的页面/网络才需要同时放宽两处，
-且顺序是"先调大框架、重启，再调大插件"——否则**只调插件不会更久**（会被钳住）。
+默认配置下整页截图就能用，什么都不用改。只有极慢的页面/网络才需要同时放宽两处，
+且顺序是"先调大框架、重启，再调大插件"——否则只调插件不会更久（会被钳住）。
 这一点必须写进 README 的已知限制里，否则用户要么白改配置，要么以为插件有 bug。
 
 ### D7：`evaluate` —— 独立工具、默认关闭、强制管理员盖过 `admin_only`
 
-`bsk evaluate` 在用户**已登录**的页面里执行任意 JavaScript。这是 bsk 最强的
-能力（读 DOM、改页面、带 cookie 调 `fetch`），但它的风险**不是** click/fill
+`bsk evaluate` 在用户已登录的页面里执行任意 JavaScript。这是 bsk 最强的
+能力（读 DOM、改页面、带 cookie 调 `fetch`），但它的风险不是 click/fill
 的"更强版本"，而是另一种性质的东西：
 
 | | click / fill / press | evaluate |
 |---|---|---|
-| 用户能否看见 | **能**，动作显示在浏览器窗口里 | **不能**，脚本静默运行 |
-| 能读到什么 | 页面上显示的内容 | 页面上**一切**（含 token、隐藏字段、localStorage） |
+| 用户能否看见 | 能，动作显示在浏览器窗口里 | 不能，脚本静默运行 |
+| 能读到什么 | 页面上显示的内容 | 页面上一切（含 token、隐藏字段、localStorage） |
 | 能发请求吗 | 只能通过点按钮触发 | 可以直接 `fetch`，带登录态 |
-| 人工兜底 | 页面的 confirm 弹窗会拦住 | **弹窗被自动确认**（实测 `handled: "accepted"`） |
+| 人工兜底 | 页面的 confirm 弹窗会拦住 | 弹窗被自动确认（实测 `handled: "accepted"`） |
 
 因此有三个决策，每个都对应上表的一行：
 
 **为什么单独成工具（而不是 `bsk_act` 的一个 action）**
 
-1. **才能被单独禁用**。动作混在一个工具里，用户就没法"保留点击、禁掉执行脚本"
+1. 才能被单独禁用。动作混在一个工具里，用户就没法"保留点击、禁掉执行脚本"
    —— 只能整块开或整块关，等于逼用户在做不到精细控制时干脆全开。
-2. **才能被 AstrBot 原生的 `tool_permissions` 单独控制**（WebUI → 扩展 → 组件）。
-   框架那一层是按**工具名**授权的；`evaluate` 藏在 `bsk_act` 里就自动继承了
+2. 才能被 AstrBot 原生的 `tool_permissions` 单独控制（WebUI → 扩展 → 组件）。
+   框架那一层是按工具名授权的；`evaluate` 藏在 `bsk_act` 里就自动继承了
    `bsk_act` 的授权，管理员在框架侧无法把它单独摘出去。
-3. **权限判定顺序才能不同**。`bsk_act` 走 `_denied()`；`evaluate` 要在它**之前**
+3. 权限判定顺序才能不同。`bsk_act` 走 `_denied()`；`evaluate` 要在它之前
    多插两道判（见下）。
 
 **为什么默认关闭（`enable_evaluate=false`）**
 
-- **升级不该凭空多出高危能力**。用户装 0.1.0 时心里那笔账是"机器人能点页面"；
+- 升级不该凭空多出高危能力。用户装 0.1.0 时心里那笔账是"机器人能点页面"；
   如果新版本默认把"在你邮箱里跑任意脚本"一起打开，那是在用户不知情的情况下
-  扩大了授权。新增高危能力必须**显式开启**，这个默认值本身就是一道同意。
-- 它也**不复用** `enabled` 总开关，理由同上：总开关的语义是"插件是否工作"，
+  扩大了授权。新增高危能力必须显式开启，这个默认值本身就是一道同意。
+- 它也不复用 `enabled` 总开关，理由同上：总开关的语义是"插件是否工作"，
   不是"是否开放最高危能力"，两者混在一起会让用户为了关掉一个能力而停掉整个插件。
 
 **为什么"强制管理员"要盖过 `admin_only=false`（本决策的重点）**
 
-`admin_only=false` 的语义是"我愿意把**看得见的**浏览器操作开放给其他人"
+`admin_only=false` 的语义是"我愿意把看得见的浏览器操作开放给其他人"
 （群里的人点按钮、填表单，用户全程能在窗口里看着）。而执行脚本是静默的。
-如果让这个**粗粒度**的宽松开关顺手把最高危能力一起放开，就产生了一条极难察觉的
+如果让这个粗粒度的宽松开关顺手把最高危能力一起放开，就产生了一条极难察觉的
 权限放大路径：管理员只想"让群里的人也能查网页"，结果同时交出了
 "在已登录页面里跑任意脚本"。
 
-所以实现上 `_evaluate_denied()` 的判定是**有序的三道**（顺序即设计）：
+所以实现上 `_evaluate_denied()` 的判定是有序的三道（顺序即设计）：
 
 ```
 1. enabled            — 总开关
 2. enable_evaluate    — 独立开关（默认关闭）
-3. evaluate_require_admin + is_admin  ← ★ 必须在 _denied() 之前
+3. evaluate_require_admin + is_admin  ← 这一步必须在 _denied() 之前
 4. _denied()          — admin_only / allowed_users 等既有规则
 ```
 
-第 3 步放在第 4 步**之前**、而不是把两者写进同一个条件表达式，是为了让
-"`admin_only=false` 不能绕过它"成为**结构性**保证而不是巧合：
+第 3 步放在第 4 步之前、而不是把两者写进同一个条件表达式，是为了让
+"`admin_only=false` 不能绕过它"成为结构性保证而不是巧合：
 `_denied()` 里那条 `if self.settings.admin_only and not is_admin` 根本没机会执行。
 `allowed_users` 白名单同理 —— 它对别的工具是"准入"，对 evaluate 不是。
 
-放开需要**两次独立决定**：既要 `enable_evaluate=true`，又要
+放开需要两次独立决定：既要 `enable_evaluate=true`，又要
 `evaluate_require_admin=false`。这个"摩擦力是特性"的设计已在
 `tests/verify_evaluate_gate.py` 里按分支钉死（分支 2、2b 是核心用例）。
 
 **超时**：`TIMEOUT_EVALUATE = 45s`，遵守 D6 的单一规则。必须大于 bsk 自身的
-`--timeout`（**默认 30s**，实测帮助文本），否则我们会先把它掐掉 —— 与
-`navigate` 同一条理由。我们**不**给 bsk 传 `--timeout`，好让"bsk 内部超时"
+`--timeout`（默认 30s，实测帮助文本），否则我们会先把它掐掉 —— 与
+`navigate` 同一条理由。我们不给 bsk 传 `--timeout`，好让"bsk 内部超时"
 与"外层兜底超时"保持明确的先后关系。
 
-**★ 实现上最容易错的一点（已用测试钉死）**
+**实现上最容易错的一点（已用测试钉死）**
 
-JS 抛异常时 **bsk 的退出码仍然是 0**，失败只体现在返回 JSON 的 `ok: false` 里。
-`SessionManager.execute` 是**按退出码**判成败的（对 bsk 其它命令都正确），
+JS 抛异常时 bsk 的退出码仍然是 0，失败只体现在返回 JSON 的 `ok: false` 里。
+`SessionManager.execute` 是按退出码判成败的（对 bsk 其它命令都正确），
 所以这一步必须在 `service.evaluate()` 里自己做：
 
 ```python
@@ -323,52 +323,52 @@ if not evaluation.ok:           # ← 不能省
 而模型不会知道自己错了。实测三种形态（全部 `exit=0`）：
 `throw new Error('boom')`、`ReferenceError`、`SyntaxError`。
 
-**其它实测约束**（写进代码注释与 `bsk/models.py`）：
+其它实测约束（写进代码注释与 `bsk/models.py`）：
 
-- `EXPRESSION` 是**位置参数**；
-- 求值成 `undefined` / `null` 时 `value` 字段**整个消失**（要用 `has_value`
+- `EXPRESSION` 是位置参数；
+- 求值成 `undefined` / `null` 时 `value` 字段整个消失（要用 `has_value`
   区分"没有值"和"值是 null"）；
-- 没有弹窗时 `dialogs` 字段**整个消失**；
-- 返回值可以是任意大的 JSON（实测 2000 元素数组 = **32947 字符**），
+- 没有弹窗时 `dialogs` 字段整个消失；
+- 返回值可以是任意大的 JSON（实测 2000 元素数组 = 32947 字符），
   必须截断 —— 复用 `max_page_chars`，不新增配置项。
 
 ---
 
 ## 6. 测试策略
 
-**分四层 + 专项验证**。前两层不需要任何外部依赖，后两层需要真实环境。
+分四层 + 专项验证。前两层不需要任何外部依赖，后两层需要真实环境。
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
 | L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制 | ❌ | ❌ | `tests/test_*.py`（580 个用例） |
 | L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
-| L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与**会话过期自动重建** | ✅ | ✅ | `verify_integration.py` |
-| L4 工具层端到端 | **直接 await `main.py` 里的 6 个工具函数**，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
+| L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与会话过期自动重建 | ✅ | ✅ | `verify_integration.py` |
+| L4 工具层端到端 | 直接 await `main.py` 里的 6 个工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
 
 **为什么必须有 L4**：L2 只证明工具"注册成功"，L3 只走到服务层。工具函数内部那层
 （URL 校验、权限判定、`bsk_screenshot` 的 async generator、异常是否被吞掉）
 只有 L4 能覆盖 —— 而那正是最容易出 bug、且出错时用户直接看到堆栈的地方。
 
-**专项验证**（各自针对一类"单元测试覆盖不到"的风险）：
+专项验证（各自针对一类"单元测试覆盖不到"的风险）：
 
 | 脚本 | 针对的风险 | 需要浏览器 |
 |---|---|---|
-| `verify_tool_execution_chain.py` | 走 **AstrBot 真实工具执行器**（`call_local_llm_tool` + partial 绑定 + async generator 消费），而非直接调函数 | ✅ |
-| `verify_restart_real.py` | **跨进程**验证"强杀后重启自愈"，含他人会话干扰项 | ✅ |
-| `verify_recover_real.py` | journal 恢复逻辑对**真实 daemon** 的行为（含碰撞防护） | ✅ |
-| `verify_journal_safety.py` | 碰撞防护：id 相同但窗口号不同时**一条 stop 都不发** | ❌ |
+| `verify_tool_execution_chain.py` | 走 AstrBot 真实工具执行器（`call_local_llm_tool` + partial 绑定 + async generator 消费），而非直接调函数 | ✅ |
+| `verify_restart_real.py` | 跨进程验证"强杀后重启自愈"，含他人会话干扰项 | ✅ |
+| `verify_recover_real.py` | journal 恢复逻辑对真实 daemon 的行为（含碰撞防护） | ✅ |
+| `verify_journal_safety.py` | 碰撞防护：id 相同但窗口号不同时一条 stop 都不发 | ❌ |
 | `verify_browser_ambiguity.py` | 多浏览器歧义：1 个免配置 / ≥2 报错 / 已配置尊重配置 | ❌ |
-| `verify_config_pipeline.py` | 配置从文件 → `AstrBotConfig` → `Settings` → **实际 bsk 命令行参数**的完整贯通 | ❌ |
+| `verify_config_pipeline.py` | 配置从文件 → `AstrBotConfig` → `Settings` → 实际 bsk 命令行参数的完整贯通 | ❌ |
 | `verify_config_type.py` / `verify_config_consistency.py` | 配置来源形态（dict vs `AstrBotConfig` 对象）、schema 与代码默认值一致 | ❌ |
-| `verify_evaluate_gate.py` | `bsk_evaluate` 的**权限门三分支**（独立开关 / 强制管理员盖过 `admin_only` 与白名单 / 放行），用假 event + 假 service，不执行任何 JS | ❌ |
-| `verify_install.py` | 从**已提交文件**导出干净副本并加载，验证"别人拿到仓库能用" | ❌ |
-| `verify_discovery.py` | AstrBot **自己的插件发现函数**能否找到本插件 | ❌ |
+| `verify_evaluate_gate.py` | `bsk_evaluate` 的权限门三分支（独立开关 / 强制管理员盖过 `admin_only` 与白名单 / 放行），用假 event + 假 service，不执行任何 JS | ❌ |
+| `verify_install.py` | 从已提交文件导出干净副本并加载，验证"别人拿到仓库能用" | ❌ |
+| `verify_discovery.py` | AstrBot 自己的插件发现函数能否找到本插件 | ❌ |
 | `verify_failure_ux.py` | 环境未就绪时的提示质量（不能是 Python 堆栈） | ❌ |
 | `verify_stop_timing_real.py` | `session stop` 真实耗时（为超时预算提供数据依据） | ✅ |
 | `verify_wait_navigation_real.py` | 新增暴露的 `wait_for_navigation` 动作真实可用且只读 | ✅ |
 | `verify_release_ready.py` | 发布前自检（34 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
 
-**运行方式**（用 AstrBot 自带解释器，因为插件就跑在它上面）：
+运行方式（用 AstrBot 自带解释器，因为插件就跑在它上面）：
 
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
@@ -382,22 +382,22 @@ cd <插件目录>                                 # 即本仓库根目录
 
 **注意**：本机 `pytest` 不可用（`ModuleNotFoundError`），全部测试用 `unittest`。
 
-**L3/L4 的强制安全边界**（这些脚本会真的操作浏览器）：
-只访问 `example.com`；**绝不**借用用户标签页；不做 click/fill/press/upload/download/evaluate；
-**绝不**使用 `session stop --all`（会误停用户的 DSH 会话）；结束时按精确 id 清理自己的会话。
-断言"自己的会话没了"时，**只比对自己创建的 session id**，不能断言"浏览器会话数为 0"
-（那会把别人的会话算进来而误报）。并且**以 daemon 为事实来源**：清理后再查一次
+L3/L4 的强制安全边界（这些脚本会真的操作浏览器）：
+只访问 `example.com`；绝不借用用户标签页；不做 click/fill/press/upload/download/evaluate；
+绝不使用 `session stop --all`（会误停用户的 DSH 会话）；结束时按精确 id 清理自己的会话。
+断言"自己的会话没了"时，只比对自己创建的 session id，不能断言"浏览器会话数为 0"
+（那会把别人的会话算进来而误报）。并且以 daemon 为事实来源：清理后再查一次
 `session list`，必要时按精确 id 补刀，不要只信管理器自述"已清空"。
 
 **L2/L4 的路径前提**：AstrBot 用 `__import__("data.plugins.<目录>.main")` 加载插件，
 所以脚本需要把 `~/.astrbot` 放进 `sys.path`，且插件要真的安装在
 `~/.astrbot/data/plugins/astrbot_plugin_bsk_browser/` 下。脚本已自行处理路径。
 
-**★ 所有 import astrbot 的测试脚本必须先 `os.environ.setdefault("ASTRBOT_ROOT", ...)`**：
-AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当前工作目录**
+**所有 import astrbot 的测试脚本必须先 `os.environ.setdefault("ASTRBOT_ROOT", ...)`**：
+AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前工作目录
 （`astrbot_path.py:29-35`），会在项目里生成 `data/cmd_config.json`
 （AstrBot 主配置，含 provider API 密钥与管理员 QQ 号）—— 而本仓库是要公开发布的。
-这个坑**栽过 3 次**，现已由 `verify_release_ready.py` 静态扫描（AST 解析真实 import
+这个坑栽过 3 次，现已由 `verify_release_ready.py` 静态扫描（AST 解析真实 import
 语句）自动拦截。
 
 ---
@@ -408,15 +408,15 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当�
 
 | # | 缺陷 | 根因 | 表现 | 守护测试 |
 |---|---|---|---|---|
-| 1 | **stdin 自杀式取消** | `communicate()` 会在读取前关掉 stdin，而环境变量设了 `BSK_CANCEL_ON_STDIN_CLOSE=1`，bsk 把"stdin 被关"当成用户按 Ctrl-C | 随机的 `tool dispatch cancelled after extension cleanup`；并发 8 个 observe 只有 5 个成功 | `test_runner.py` + L3 的并发用例 |
-| 2 | **GBK 编码崩溃** | Windows 下 Python 默认用 cp936 解码，页面含阿拉伯文/俄文时抛 `UnicodeDecodeError`，且异常在 reader 线程抛出，主线程只看到 `None` | 读取任何多语言页面即崩，且报错信息毫无指向性 | `test_runner.py::TestEncoding` |
-| 3 | **VOM ref 前缀丢失** | 正则捕获组漏了 `e`，`@e1` 被存成 `"1"` | 传给 bsk `--ref` 的值非法，所有元素操作失效 | `test_pages.py` |
-| 4 | **截图清理失效** | `cleanup_shots` 只下探一层，而文件写在 `shots/<session>/` 两层 | 清理永远返回 0，磁盘无限增长 | `test_shots.py` |
-| 5 | **配置项形同虚设** | 各命令硬编码超时，忽略用户的 `command_timeout_sec` | 用户调大超时对慢页面毫无帮助 | `test_service.py` |
-| 6 | **权限提示与实现相反** | `validate_settings` 的文案说白名单"不生效"，实际是白名单优先 | 用户按提示操作得到相反结果 | `test_config.py` |
-| 7 | **多浏览器时静默随机选** | `probe_browser` 只在恰好 1 个时自动选，多个时返回空 → 交 bsk 自选；且 README 已承诺"会报错"但代码没做 | 用户连了 2 个浏览器时"有时候对有时候不对"，无从排查 | `verify_browser_ambiguity.py` |
-| 8 | **测试自身泄漏会话** | 某用例把假 id `"zzzz"` 写进 args builder，导致懒创建的真实会话在重建时被遗弃 | 全量回归后 daemon 残留会话 | `verify_integration.py` 的差集断言 + 兜底强清 |
-| 9 | **README 与实现方向相反** | `session_scope:"user"` 说"跨群共用"，实际键含 umo → 跨群独立 | 用户按文档理解会误判资源占用 | README 核对报告 |
+| 1 | stdin 自杀式取消 | `communicate()` 会在读取前关掉 stdin，而环境变量设了 `BSK_CANCEL_ON_STDIN_CLOSE=1`，bsk 把"stdin 被关"当成用户按 Ctrl-C | 随机的 `tool dispatch cancelled after extension cleanup`；并发 8 个 observe 只有 5 个成功 | `test_runner.py` + L3 的并发用例 |
+| 2 | GBK 编码崩溃 | Windows 下 Python 默认用 cp936 解码，页面含阿拉伯文/俄文时抛 `UnicodeDecodeError`，且异常在 reader 线程抛出，主线程只看到 `None` | 读取任何多语言页面即崩，且报错信息毫无指向性 | `test_runner.py::TestEncoding` |
+| 3 | VOM ref 前缀丢失 | 正则捕获组漏了 `e`，`@e1` 被存成 `"1"` | 传给 bsk `--ref` 的值非法，所有元素操作失效 | `test_pages.py` |
+| 4 | 截图清理失效 | `cleanup_shots` 只下探一层，而文件写在 `shots/<session>/` 两层 | 清理永远返回 0，磁盘无限增长 | `test_shots.py` |
+| 5 | 配置项形同虚设 | 各命令硬编码超时，忽略用户的 `command_timeout_sec` | 用户调大超时对慢页面毫无帮助 | `test_service.py` |
+| 6 | 权限提示与实现相反 | `validate_settings` 的文案说白名单"不生效"，实际是白名单优先 | 用户按提示操作得到相反结果 | `test_config.py` |
+| 7 | 多浏览器时静默随机选 | `probe_browser` 只在恰好 1 个时自动选，多个时返回空 → 交 bsk 自选；且 README 已承诺"会报错"但代码没做 | 用户连了 2 个浏览器时"有时候对有时候不对"，无从排查 | `verify_browser_ambiguity.py` |
+| 8 | 测试自身泄漏会话 | 某用例把假 id `"zzzz"` 写进 args builder，导致懒创建的真实会话在重建时被遗弃 | 全量回归后 daemon 残留会话 | `verify_integration.py` 的差集断言 + 兜底强清 |
+| 9 | README 与实现方向相反 | `session_scope:"user"` 说"跨群共用"，实际键含 umo → 跨群独立 | 用户按文档理解会误判资源占用 | README 核对报告 |
 
 ### 6.2 已确认的**固有行为**（不是 bug，但必须如实告知）
 
@@ -430,8 +430,8 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用**当�
 | `snapshot` 与 `observe` 输出等价 | 实测逐字节相同且都不带截图 | 只用 `observe`，避免多花一倍时间 |
 | `observe` 无独立 title/url 字段 | 只能从 `RootWebArea "..."` 正则提取 | `bsk/pages.py` 负责解析 |
 | observe 视口 ≠ 截图像素 | 910x604 vs 1850x1208（DPR≈2） | 不要用 observe 坐标点截图位置 |
-| **全页截图耗时（关键数据，文档多处引用）** | 本机实测：短页面 `example.com` 视口截图 **0.12s**、全页截图 **2.91s**；长页面 Wikipedia 条目全页截图 **11.72 / 11.11 / 10.91s**（1820x11741，4.5MB） | ① 整页截图默认预算取 **120s**（约 10 倍余量），不是拍脑袋的 180s；② **"必须两处一起调大才能用整页截图"是错误说法** —— 实测只用了框架 120s 上限的约 1/10，默认配置下什么都不用改（该说法曾写在 README/ARCHITECTURE 里，已删除）；③ 真正要做的是钳制，别被框架从外面掐断（见 §5 D6） |
-| **框架超时是"每一步"的，不是"整个工具"的** | `astr_agent_tool_exec.py:691` 是 `await asyncio.wait_for(anext(wrapper), timeout=tool_call_timeout)` —— 包在**每一次 `anext`** 上 | async generator 若中途 yield，计时器会重置。`bsk_screenshot` 正是先 yield 图片再 yield 文本；**但不要依赖这一点**去绕过超时 —— 钳制仍是必需的，因为它同时保证了"超时由插件报中文"这件事 |
+| **全页截图耗时（关键数据，文档多处引用）** | 本机实测：短页面 `example.com` 视口截图 0.12s、全页截图 2.91s；长页面 Wikipedia 条目全页截图 11.72 / 11.11 / 10.91s（1820x11741，4.5MB） | ① 整页截图默认预算取 120s（约 10 倍余量），不是拍脑袋的 180s；② **"必须两处一起调大才能用整页截图"是错误说法** —— 实测只用了框架 120s 上限的约 1/10，默认配置下什么都不用改（该说法曾写在 README/ARCHITECTURE 里，已删除）；③ 真正要做的是钳制，别被框架从外面掐断（见 §5 D6） |
+| **框架超时是"每一步"的，不是"整个工具"的** | `astr_agent_tool_exec.py:691` 是 `await asyncio.wait_for(anext(wrapper), timeout=tool_call_timeout)` —— 包在每一次 `anext` 上 | async generator 若中途 yield，计时器会重置。`bsk_screenshot` 正是先 yield 图片再 yield 文本；但不要依赖这一点去绕过超时 —— 钳制仍是必需的，因为它同时保证了"超时由插件报中文"这件事 |
 
 ---
 

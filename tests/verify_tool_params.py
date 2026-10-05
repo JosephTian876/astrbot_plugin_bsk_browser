@@ -1,13 +1,13 @@
 """核验：7 个工具的「签名参数名」与「docstring Args 段」是否一致。
 
 ## 为什么需要这个检查
-AstrBot 用 **docstring 的 Args 段**生成给模型的参数 schema，
-但调用时是按**函数签名的参数名**把值传进来的（`call_local_llm_tool` 里
+AstrBot 用 docstring 的 Args 段生成给模型的参数 schema，
+但调用时是按函数签名的参数名把值传进来的（`call_local_llm_tool` 里
 `handler(event, **tool_args)`）。
 
-如果两者**不一致**，模型按 schema 传参 → 框架按签名找不到对应的形参
+如果两者不一致，模型按 schema 传参 → 框架按签名找不到对应的形参
 → 抛 `Tool handler parameter mismatch`，用户看到一句英文报错，
-而这个 bug 在"直接 await 工具函数"的测试里**完全看不出来**（因为那种
+而这个 bug 在"直接 await 工具函数"的测试里完全看不出来（因为那种
 调用绕过了框架的参数注入）。
 
 本次真机实测就是被这类不匹配抓到的（测试里传错了参数名），
@@ -99,16 +99,16 @@ def main() -> int:
             if sig_params != doc_names and not missing_in_doc and not extra_in_doc:
                 detail.append("顺序不一致（AstrBot 按名字匹配，顺序不影响功能，但建议对齐）")
             msg = "；".join(detail) or "不一致"
-            print(f"         ★ {msg}")
+            print(f"         {msg}")
             failures.append(f"{tool_name}: {msg}")
 
         # --- 类型名合法性 ---
         for arg_name, arg_type, desc in doc_args:
             if not desc:
-                print(f"         ★ {arg_name} 缺少描述（模型不知道这个参数怎么填）")
+                print(f"         {arg_name} 缺少描述（模型不知道这个参数怎么填）")
                 failures.append(f"{tool_name}.{arg_name}: 缺少描述")
             if arg_type not in VALID_TYPES and arg_type not in PY_ALIASES:
-                print(f"         ★ {arg_name} 的类型名 {arg_type!r} 非法")
+                print(f"         {arg_name} 的类型名 {arg_type!r} 非法")
                 failures.append(f"{tool_name}.{arg_name}: 类型名非法")
 
     print()

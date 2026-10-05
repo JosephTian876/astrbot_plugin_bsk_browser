@@ -1,10 +1,10 @@
 """``bsk/runner.py`` 的单元测试。
 
-策略：**不依赖真实 bsk**。用一个"假的 bsk 可执行文件"——即一个 Python 脚本，
+策略：不依赖真实 bsk。用一个"假的 bsk 可执行文件"——即一个 Python 脚本，
 由测试动态生成，能按参数模拟各种退出码、编码、超时行为。这样测试可以在
 任何机器上跑，不需要装 bsk、不需要浏览器。
 
-覆盖的重点是那些**实测踩过的坑**：
+覆盖的重点是那些实测踩过的坑：
 - GBK 编码崩溃（必须显式 UTF-8 解码）
 - 错误 JSON 走 stdout；clap 参数错误走 stderr 纯文本
 - 超时必须能中断（不能因管道句柄挂死）
@@ -73,7 +73,7 @@ elif mode == "clap":
     sys.stderr.write("error: unexpected argument '--nope' found\\n")
     sys.exit(1)
 elif mode == "multilang":
-    # ★ 关键用例：模拟含阿拉伯文/俄文的页面文本，触发 GBK 坑
+    # 关键用例：模拟含阿拉伯文/俄文的页面文本，触发 GBK 坑
     payload = {{"text": "\\u0647\\u0630\\u0627 \\u041f\\u0440\\u0438\\u0432\\u0435\\u0442 \\u4f60\\u597d"}}
     sys.stdout.buffer.write(json.dumps(payload).encode("utf-8"))
 elif mode == "raw_high_bytes":
@@ -314,7 +314,7 @@ class TestRunSuccess(RunnerTestBase):
 
 
 class TestEncoding(RunnerTestBase):
-    """★ GBK 编码坑 —— 这是实测唯一真实崩溃过的地方。"""
+    """GBK 编码坑 —— 这是实测唯一真实崩溃过的地方。"""
 
     async def test_multilang_utf8_decodes(self) -> None:
         """阿拉伯文/俄文/中文必须正确解码，不能抛 UnicodeDecodeError。"""
@@ -382,7 +382,7 @@ class TestRunOrRaise(RunnerTestBase):
         self.assertTrue(ctx.exception.retryable)
 
     async def test_outcome_unknown_is_not_retryable(self) -> None:
-        """★ 最关键的安全语义：结果未知绝不能重试。"""
+        """最关键的安全语义：结果未知绝不能重试。"""
         runner = self.make_runner()
         with self.assertRaises(errors.BskOutcomeUnknown) as ctx:
             await runner.run_or_raise([str(self.fake_script), "outcome_unknown"])
@@ -407,7 +407,7 @@ class TestRunOrRaise(RunnerTestBase):
 
 
 class TestTimeout(RunnerTestBase):
-    """★ 超时 —— Windows 管道句柄可能让 communicate() 永不返回。"""
+    """超时 —— Windows 管道句柄可能让 communicate() 永不返回。"""
 
     async def test_timeout_returns_and_does_not_hang(self) -> None:
         """超时必须在合理时间内返回，不能因为管道句柄挂死。"""

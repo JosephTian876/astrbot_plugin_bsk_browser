@@ -1,6 +1,6 @@
 """``bsk observe`` 输出的 VOM 文本解析。
 
-``bsk observe --json`` 只返回 4 个字段，其中 ``text`` 是**带标记的缩进文本树**，
+``bsk observe --json`` 只返回 4 个字段，其中 ``text`` 是带标记的缩进文本树，
 不是 JSON 结构：
 
 .. code-block:: text
@@ -20,29 +20,29 @@
 标记              含义
 ===============  ==================================================
 ``@vom 1``       VOM 协议版本号
-``@view 910x604`` 视口尺寸（**CSS px**）
+``@view 910x604`` 视口尺寸（CSS px）
 ``@layers 1 …``  层数与焦点层
 ``L1 page``      第 1 层，类型 page
-``RootWebArea "…"`` **页面标题就在这里**（引号内）
+``RootWebArea "…"`` 页面标题就在这里（引号内）
 ``@eN role "…"``  可交互元素：ref + role + 名称 + 可选目标
 ===============  ==================================================
 
 关键事实（踩过的坑）：
 
-1. ``observe`` **没有**独立的 ``title`` / ``url`` 字段。标题**只能**从
+1. ``observe`` 没有独立的 ``title`` / ``url`` 字段。标题只能从
    ``RootWebArea "..."`` 里正则提取。
 2. ref 形如 ``@eN``（N 从 1 递增），存进 :class:`~bsk.models.PageRef` 时
-   **不带 ``@``**（即 ``e1``），因为 bsk 的 ``--ref`` 参数两种写法都收，
+   不带 ``@``（即 ``e1``），因为 bsk 的 ``--ref`` 参数两种写法都收，
    而带不带 ``@`` 混用最容易出错，这里统一成不带。
-3. ``@view`` 里的尺寸是 **CSS px**，**不是**截图的像素尺寸。高分屏
+3. ``@view`` 里的尺寸是 CSS px，不是截图的像素尺寸。高分屏
    （DPR≈2）下截图会大整整一倍：实测同一时刻 observe 报 ``910x604``，
-   而截图是 ``1850x1208``。所以**不要**拿 observe 的坐标去点截图里的位置，
+   而截图是 ``1850x1208``。所以不要拿 observe 的坐标去点截图里的位置，
    也不要直接比较这两组数字；必须先用 ``截图宽 / 视口宽`` 算出 DPR 再换算。
-4. ``paragraph "X"`` 下面紧跟的 ``StaticText "X"`` 内容**完全相同**，
+4. ``paragraph "X"`` 下面紧跟的 ``StaticText "X"`` 内容完全相同，
    摘要里必须去重，否则白白翻倍占用 LLM 上下文。
 
-本模块是**纯函数**集合：没有 IO、没有全局可变状态、不 import astrbot，
-可以脱离 AstrBot 与浏览器独立单测。所有输入都当作**外部不可信数据**处理，
+本模块是纯函数集合：没有 IO、没有全局可变状态、不 import astrbot，
+可以脱离 AstrBot 与浏览器独立单测。所有输入都当作外部不可信数据处理，
 畸形输入一律优雅降级，绝不抛异常。
 """
 
@@ -92,7 +92,7 @@ _RE_VIEW = re.compile(r"@view\s+(\d+)\s*[xX\u00d7]\s*(\d+)")
 #   - @e\d+    必须是 @ 紧跟 e 再跟数字。这样 @vom / @view / @layers
 #              以及正文里出现的 "@example" 都不会被误判成元素
 #   - \b       编号后面必须是词边界，避免把 @e1x 这类东西吃进来
-#   - role 是**可选**的，因为有的行没有 role
+#   - role 是可选的，因为有的行没有 role
 _RE_ELEMENT = re.compile(
     r"^\s*@(?P<ref>e\d+)\b"
     r"(?:\s+(?P<role>[A-Za-z][A-Za-z0-9_-]*))?"
@@ -114,7 +114,7 @@ _RE_ROOT_FALLBACK = re.compile(r'RootWebArea\s+"((?:[^"\\]|\\.)*)"')
 # 元素行开头的 @eN，用于从正文里剔除元素行
 _RE_ELEMENT_PREFIX = re.compile(r"^@e\d+\b")
 
-# 取一行里**第一个**完整引号对的内容（转义感知），用于抽取正文
+# 取一行里第一个完整引号对的内容（转义感知），用于抽取正文
 _RE_FIRST_QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 # target 前缀里的箭头符号，剥掉后才是干净的目标（→ iana.org → iana.org）
@@ -160,7 +160,7 @@ def _sanitize(value: str) -> str:
 def _unescape(value: str) -> str:
     """还原 JSON 风格的反斜杠转义。
 
-    只处理**已知**的转义序列（``\\"`` ``\\\\`` ``\\n`` ``\\uXXXX`` 等），
+    只处理已知的转义序列（``\\"`` ``\\\\`` ``\\n`` ``\\uXXXX`` 等），
     认不出来的 ``\\x`` 原样保留 —— 否则 Windows 路径 ``C:\\Users`` 会被吃掉
     一个反斜杠。
     """
@@ -206,11 +206,11 @@ def _finalize(value: str, limit: int) -> str:
 
 
 def _take_quoted(value: str) -> str:
-    """从一段**以引号开头**的文本里取出引号内的内容。
+    """从一段以引号开头的文本里取出引号内的内容。
 
     分三档，越往后越宽松：
 
-    1. 引号有闭合（``"abc"``）→ 取第一对引号之间的内容。贪婪匹配到**最后一个**
+    1. 引号有闭合（``"abc"``）→ 取第一对引号之间的内容。贪婪匹配到最后一个
        引号，所以名字里含裸引号也能取全，例如 ``"Say "hi""`` → ``Say "hi"``；
     2. 引号内有转义（``"a\\"b"``）→ 走转义感知匹配；
     3. 引号没闭合（``"abc``）→ 降级取引号后的全部内容。
@@ -297,9 +297,9 @@ def parse_vom_text(text: str) -> tuple[str, list[PageRef], tuple[int, int] | Non
         三元组 ``(标题, 元素列表, 视口尺寸)``：
 
         - 标题：``RootWebArea "..."`` 引号里的内容，找不到则为空串；
-        - 元素列表：按**出现顺序**排列的 :class:`~bsk.models.PageRef`，
+        - 元素列表：按出现顺序排列的 :class:`~bsk.models.PageRef`，
           ``ref`` 字段不带 ``@``；同一 ref 重复出现只保留第一次；
-        - 视口尺寸：``@view`` 里的 ``(宽, 高)``，单位是 **CSS px**；
+        - 视口尺寸：``@view`` 里的 ``(宽, 高)``，单位是 CSS px；
           解析不到、或者宽高不是正数时为 ``None``
           （返回 ``None`` 而不是 ``(0, 0)``，是为了避免下游拿它做
           DPR 换算时除零）。
@@ -371,7 +371,7 @@ def parse_observation(raw_json: dict) -> PageObservation:
         填好 ``title`` / ``refs`` / ``viewport`` 的观察结果。
 
     Note:
-        ``ref_count`` 取"JSON 声明值"与"实际解析出的元素个数"的**较大者**：
+        ``ref_count`` 取"JSON 声明值"与"实际解析出的元素个数"的较大者：
         JSON 缺字段时用实际值兜底，JSON 说页面有 100 个而 text 被截断只解析出
         5 个时，则如实反映页面真实规模。
     """
@@ -397,7 +397,7 @@ def _extract_text_lines(text: str) -> list[str]:
     会丢掉：``@vom`` / ``@view`` / ``@layers`` 头部标记、``L1 page`` 层声明、
     ``RootWebArea`` 行（标题已单列）、``@eN`` 元素行（refs 已单列）。
 
-    还会做**相邻去重**：实测 ``paragraph "X"`` 下面紧跟的
+    还会做相邻去重：实测 ``paragraph "X"`` 下面紧跟的
     ``StaticText "X"`` 内容一字不差，不去重的话摘要凭空大一倍。
     """
     if not isinstance(text, str) or not text:
@@ -439,11 +439,11 @@ def summarize(
         text: VOM 文本原文，用于抽取可见正文。
         title: 页面标题，来自 :func:`parse_vom_text`。
         refs: 可交互元素列表，来自 :func:`parse_vom_text`。
-        max_chars: 返回字符串的**最大字符数**（不是字节数）。默认 3000 字符，
+        max_chars: 返回字符串的最大字符数（不是字节数）。默认 3000 字符，
             对这个规模的中文文本约合 2000 左右 token，塞进上下文是安全的。
 
     Returns:
-        摘要文本。**长度保证不超过 ``max_chars``** —— 这一点是硬保证，
+        摘要文本。长度保证不超过 ``max_chars`` —— 这一点是硬保证，
         因为整棵 VOM 树可能有几万字符，直接塞给 LLM 会撑爆上下文。
         一旦发生截断，末尾一定带 :data:`TRUNCATION_NOTE` 提示
         （``max_chars`` 小到连提示都放不下时例外，此时只做硬截断）。

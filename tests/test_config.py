@@ -1,6 +1,6 @@
 """``bsk/config.py`` 的单元测试。
 
-重点不是"正常配置能解析"，而是**用户把配置填坏之后插件还能不能活**：
+重点不是"正常配置能解析"，而是用户把配置填坏之后插件还能不能活：
 
 - 字段缺失、整条配置是 ``None``、甚至传进来一个列表；
 - 数字被填成字符串（``"60"``）或写成小数；
@@ -9,7 +9,7 @@
 - ``allowed_users`` 的三种写法（list / 逗号分隔字符串 / 单个字符串）；
 - ``session_scope`` 填了不认识的值要回退成 ``umo``。
 
-另外有一条**跨文件一致性测试**：``_conf_schema.json`` 里每一项的 ``default``
+另外有一条跨文件一致性测试：``_conf_schema.json`` 里每一项的 ``default``
 必须与 ``config.py`` 的默认值完全相同。这两个文件由不同的人手改，一旦漂移，
 用户在 WebUI 看到的和插件实际用的就对不上，而且完全没有任何报错 —— 只能靠这条测试兜住。
 
@@ -116,7 +116,7 @@ class TestEmptyAndJunkInput(unittest.TestCase):
 
 
 class TestFullValidConfig(unittest.TestCase):
-    """全字段合法时必须**原样保留**。"""
+    """全字段合法时必须原样保留。"""
 
     def test_every_field_valid(self) -> None:
         raw = {
@@ -433,7 +433,7 @@ class TestValidateSettings(unittest.TestCase):
         """白名单非空但 admin_only 开启：如实说明实际生效规则是白名单优先。
 
         真实的权限判定在 ``main.py`` 的 ``_denied()``：白名单命中即放行，
-        **不**再看是否为管理员。因此这两项同时配置时，白名单里的非管理员
+        不再看是否为管理员。因此这两项同时配置时，白名单里的非管理员
         确实能用 —— 这是一个值得提醒用户的安全影响，而不是"白名单不生效"。
         """
         problems = validate_settings(
@@ -563,11 +563,11 @@ class TestMetadataFile(unittest.TestCase):
         """star_manager 要求 name 是合法 Python 标识符且等于插件目录名。
 
         AstrBot 用 ``__import__("data.plugins.<目录名>.main")`` 加载插件，
-        所以 ``metadata.name`` 必须与**插件所在目录名**一致，否则插件根本
+        所以 ``metadata.name`` 必须与插件所在目录名一致，否则插件根本
         不会被发现（``star_manager._get_modules`` 按目录名构造 import 路径）。
 
         Note:
-            当仓库被**改名导出**时（例如从 git tag 导出成
+            当仓库被改名导出时（例如从 git tag 导出成
             ``bsk-release-verify-194540`` 来验证发布产物），目录名与 name
             必然不同 —— 那不是缺陷，只是"还没被放进正确的目录名里"。
             这种情形下跳过该断言，避免在验证发布产物时产生误报。

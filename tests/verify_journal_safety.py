@@ -1,16 +1,16 @@
 """会话 journal 恢复行为验证（含最关键的"碰撞防护"）。
 
-**为什么单独验证这个**：``recover_orphans`` 会在插件启动时自动停掉一批会话。
-如果它的归属判断有漏洞，插件就会**误停别的程序的会话** —— 例如用户正在用的
+为什么单独验证这个：``recover_orphans`` 会在插件启动时自动停掉一批会话。
+如果它的归属判断有漏洞，插件就会误停别的程序的会话 —— 例如用户正在用的
 DSH 的浏览器会话。这是本插件里后果最严重的一类 bug，值得独立验证，
 而不是只依赖单元测试。
 
-bsk 的 session_id 只有 4 个小写字母（26^4 ≈ 45 万），**存在碰撞可能**：
+bsk 的 session_id 只有 4 个小写字母（26^4 ≈ 45 万），存在碰撞可能：
 我们记录的 ``mnaa`` 早已过期，之后另一个程序也建了一个 ``mnaa``。
 所以恢复时必须同时比对 ``agent_window_id``。
 
 本脚本用真实的 ``SessionJournal`` + 真实的 ``SessionManager``（假 runner）
-构造这些场景，验证**只停自己的**。
+构造这些场景，验证只停自己的。
 
 用法：
     python tests/verify_journal_safety.py
@@ -112,9 +112,9 @@ async def main() -> int:
         check("绝未使用 --all", "--all" not in " ".join(runner.stopped), "")
 
     # ------------------------------------------------------------------
-    # 用例 2：★ 碰撞防护 —— id 相同但窗口号不同，说明是别人的
+    # 用例 2：碰撞防护 —— id 相同但窗口号不同，说明是别人的
     # ------------------------------------------------------------------
-    print("\n--- 2. ★ id 碰撞：窗口号不同 → 必须跳过，一条 stop 都不能发 ---")
+    print("\n--- 2. id 碰撞：窗口号不同 → 必须跳过，一条 stop 都不能发 ---")
     with tempfile.TemporaryDirectory() as tmp:
         journal = SessionJournal(Path(tmp) / "s.json")
         # 我们记录的 abcd 属于窗口 111（早已消失）
@@ -126,7 +126,7 @@ async def main() -> int:
         cleaned = await manager.recover_orphans()
         check("清理数为 0（认出来不是自己的）", cleaned == 0, f"cleaned={cleaned}")
         check(
-            "★ 一条 stop 都没发（没误杀别人的会话）",
+            "一条 stop 都没发（没误杀别人的会话）",
             runner.stopped == [],
             f"stopped={runner.stopped} ← 必须是空列表",
         )

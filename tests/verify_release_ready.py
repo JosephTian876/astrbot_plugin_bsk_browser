@@ -1,12 +1,12 @@
 """发布前自检 —— 把"能不能上架"变成一条可重复执行的命令。
 
 发布到 AstrBot 插件市场是网页表单（https://cloud.astrbot.app/publish），
-提交前没人会替你检查元数据是否合规。这个脚本把**所有能在本地验证的规则**
+提交前没人会替你检查元数据是否合规。这个脚本把所有能在本地验证的规则
 一次性跑完，避免提交后被拒或装到用户机器上才发现问题。
 
 检查依据全部来自 AstrBot 4.28.1 源码（不是文档转述）：
 - ``star/updater.py:26``  必填字段 ``("name", "desc", "version", "author")``
-- ``star/updater.py:357`` 必填字段必须是非空**字符串**
+- ``star/updater.py:357`` 必填字段必须是非空字符串
 - ``star/star_manager.py:628`` 插件目录名必须是合法 Python 标识符
 - ``star/star_manager.py:671`` ``astrbot_version`` 必须是合法版本约束
 - ``config/default.py`` ``DEFAULT_VALUE_MAP`` 配置项 type 白名单
@@ -31,7 +31,7 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
-# ★ 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
+# 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
 # 本脚本要 import AstrBot 的校验器；若不同时设定 root，AstrBot 会把当前
 # 工作目录当 root（astrbot_path.py:35），就地生成含主配置的 data/ 目录。
 os.environ.setdefault(
@@ -93,7 +93,7 @@ def main() -> int:
         exists = (PROJECT / fname).is_file()
         check(f"存在 {fname}", exists, "" if exists else f"缺少：{why}")
 
-    # requirements.txt 其实是**可选**的：AstrBot 在 star_manager.py:359 里
+    # requirements.txt 其实是可选的：AstrBot 在 star_manager.py:359 里
     # 用的是 `if not os.path.exists(...): return`，缺文件直接跳过、不报错。
     # 但惯例上都会带一个（哪怕是空的），这样别人一看就知道本插件没有额外依赖。
     req = PROJECT / "requirements.txt"
@@ -345,13 +345,13 @@ def main() -> int:
     # ---------------------------------------------------------------
     # 6. 打包体积
     # ---------------------------------------------------------------
-    # 插件市场对上传 zip 有 16MB 上限。本检查的真正价值是**抓住"误提交大文件"**
+    # 插件市场对上传 zip 有 16MB 上限。本检查的真正价值是抓住"误提交大文件"
     # （例如把测试截图、视频、bsk 二进制提交进来），而不是卡一个好看的源码体积。
     #
     # 早先这里用 "< 1MB" 的硬阈值 —— 那是我当初拍的数，在合法的插件图标
     # （logo.png，AstrBot 要求必须叫这个名字，约 92KB）存在后就会误报。
     # 与其把阈值抬高了事，不如分成两条更有指向性的检查：
-    #   ① 相对**真实上限**留足余量（这才是市场会拒的原因）
+    #   ① 相对真实上限留足余量（这才是市场会拒的原因）
     #   ② 单个文件不得过大（真正导致体积失控的是某个大文件，不是文件数量）
     print("\n--- 打包体积 ---")
     MARKET_ZIP_LIMIT_MB = 16.0
@@ -394,7 +394,7 @@ def main() -> int:
     # AstrBot 解析数据路径时用「当前工作目录」当 root（astrbot_path.py:35），
     # 任何在项目目录下 import astrbot 的脚本都会就地生成 data/，
     # 里面是 AstrBot 主配置（可能含 API 密钥、管理员 QQ 号）。
-    # 这个目录**绝不能**进入版本库，也绝不该留在源码目录里。
+    # 这个目录绝不能进入版本库，也绝不该留在源码目录里。
     print("\n--- 工作区卫生 ---")
     runtime_dirs = ("data", "shots", "runtime")
     present = [d for d in runtime_dirs if (PROJECT / d).exists()]
@@ -403,7 +403,7 @@ def main() -> int:
         not present,
         (
             f"发现 {present} —— 这是 AstrBot 在本目录 import 时生成的，"
-            "必须删除且**不要提交**；若在版本库里请立即 git rm --cached"
+            "必须删除且不要提交；若在版本库里请立即 git rm --cached"
         )
         if present
         else "",
@@ -423,14 +423,14 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check(".gitignore 检查", False, repr(exc))
 
-    # ★ 静态扫描：所有会 import astrbot 的测试脚本都必须先钉住 ASTRBOT_ROOT。
+    # 静态扫描：所有会 import astrbot 的测试脚本都必须先钉住 ASTRBOT_ROOT。
     #
-    # 这是一个**反复复发**的问题：AstrBot 用「当前工作目录」当 root 解析数据
+    # 这是一个反复复发的问题：AstrBot 用「当前工作目录」当 root 解析数据
     # 路径（astrbot_path.py:35），任何在项目目录下 import astrbot 的脚本都会
     # 就地生成 data/cmd_config.json（AstrBot 主配置，含 API 密钥）。
     # 已经栽过 3 次，所以改成自动检查而不是靠人记得。
     #
-    # 注意：只认**真实的 import 语句**，不能用关键字搜索 ——
+    # 注意：只认真实的 import 语句，不能用关键字搜索 ——
     # 注释里提到 "AstrBotConfig" 会被误判（初版即如此，误报了 test_config.py）。
     def _imports_astrbot(tree: ast.AST) -> bool:
         for node in ast.walk(tree):
@@ -474,6 +474,113 @@ def main() -> int:
         )
         if offenders
         else "",
+    )
+
+    # ---------------------------------------------------------------
+    # 8. 面向用户的文案：不得混入 Markdown 标记
+    # ---------------------------------------------------------------
+    # 背景：工具返回值与日志会被原样发到 QQ / 微信等聊天平台，那里不渲染
+    # Markdown，所以文案里写加粗标记只会让用户看到一对星号。装饰星号同理 ——
+    # 混在提示里同样突兀，用户最初反馈的"AI 痕迹"里它最刺眼。
+    #
+    # 判据：标记出现在"值会被用到"的字符串里才算问题。用 AST 把所有
+    # "裸字符串表达式语句"的位置标记出来排除掉 —— 它们的值会被直接丢弃，
+    # 用户不可能看到。这一条同时覆盖了三类：模块/类/函数 docstring、
+    # `X = ...` 后面紧跟的说明字符串、以及类属性下方的 docstring。
+    #
+    # 取舍：这比"只查 `return`/`yield` 的常量"宽（能抓到 `problems.append(...)`
+    # 这类"返回给调用方、再由调用方打日志"的形态，实测真出过漏网），又比
+    # "逐个判断 AST 位置"简单可靠 —— 一个被丢弃的值不可能是用户可见文案。
+    #
+    # 刻意不检查 `_conf_schema.json`：AstrBot 配置页是用 markdown-it 渲染
+    # `hint`/`description` 的（WebUI 的 ConfigPage 经 DashboardTwoFactorDialog
+    # chunk 调 `renderInline` 后写入 innerHTML，已实测确认），那里的加粗标记会
+    # 正常显示成粗体，不是星号。所以"schema 里有标记却没报警"是有意为之，
+    # 不是漏检，请不要去"修"它。
+    print("\n--- 面向用户的文案 ---")
+
+    # 用 chr() 而不是字面量：本文件自身也在"不得含装饰星号"的语境里，
+    # 写字面量会让源码里出现那个符号，读代码的人反而要多想一层。
+    STAR = chr(0x2605)
+    BOLD = chr(0x2A) * 2
+
+    def _discarded_string_spans(tree: ast.AST) -> list[tuple[int, int, int, int]]:
+        """收集"值被丢弃的字符串常量"的位置区间（用于排除）。"""
+        spans: list[tuple[int, int, int, int]] = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                val = node.value
+                spans.append(
+                    (
+                        val.lineno,
+                        val.col_offset,
+                        val.end_lineno or val.lineno,
+                        val.end_col_offset or 0,
+                    )
+                )
+        return spans
+
+    # Python 3.12 起 f-string 不再产出 STRING token，字面段是 FSTRING_MIDDLE，
+    # 漏掉它就会放过 f-string 里的加粗标记。
+    import io
+    import tokenize
+
+    string_token_types = {tokenize.STRING}
+    if hasattr(tokenize, "FSTRING_MIDDLE"):  # pragma: no cover - 版本相关
+        string_token_types.add(tokenize.FSTRING_MIDDLE)
+
+    MARKS = (BOLD, STAR)
+    product_files = [PROJECT / "main.py", *sorted((PROJECT / "bsk").glob("*.py"))]
+    offenders = []
+    for py_file in product_files:
+        src = py_file.read_text(encoding="utf-8")
+        rel = py_file.relative_to(PROJECT).as_posix()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as exc:
+            offenders.append(f"{rel}(无法解析：{exc})")
+            continue
+        spans = _discarded_string_spans(tree)
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type not in string_token_types:
+                continue
+            hit = [m for m in MARKS if m in tok.string]
+            if not hit:
+                continue
+            end = getattr(tok, "end", None) or tok.start
+            if any(
+                (r1, c1) <= tok.start and end <= (r2, c2)
+                for r1, c1, r2, c2 in spans
+            ):
+                continue  # docstring / 说明字符串：值被丢弃，用户看不到
+            shown = "、".join("加粗标记" if m == BOLD else "装饰星号" for m in hit)
+            offenders.append(
+                f"{rel}:{tok.start[0]} 含 {shown}"
+                f"（{' '.join(tok.string.split())[:48]}）"
+            )
+    check(
+        "产品代码无面向用户的 Markdown 标记",
+        not offenders,
+        ("；".join(offenders[:5]) + ("…" if len(offenders) > 5 else ""))
+        if offenders
+        else "聊天与日志都不渲染 Markdown，星号会被用户原样看到",
+    )
+
+    # 装饰星号是纯粹的修饰符号，产品代码里一个都不该有（注释里也不行）：
+    # 用户最初反馈的"AI 痕迹"里它最刺眼，这里防止它再长回来。
+    star_files = [
+        py_file.relative_to(PROJECT).as_posix()
+        for py_file in product_files
+        if STAR in py_file.read_text(encoding="utf-8")
+    ]
+    check(
+        "产品代码不含装饰星号",
+        not star_files,
+        f"发现：{star_files}" if star_files else "",
     )
 
     # ---------------------------------------------------------------

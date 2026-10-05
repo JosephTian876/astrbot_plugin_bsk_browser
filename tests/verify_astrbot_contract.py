@@ -1,4 +1,4 @@
-"""L2 契约测试：在**真实 AstrBot 环境**里加载插件，验证工具注册。
+"""L2 契约测试：在真实 AstrBot 环境里加载插件，验证工具注册。
 
 这不是语法检查 —— 它让 AstrBot 自己解析 docstring 生成工具 schema。
 框架打印出 ``Added llm tool: bsk_*`` 才算通过。
@@ -32,8 +32,8 @@ def _ensure_paths() -> None:
     - ~/.astrbot：import data.plugins.<插件>
     - 本测试目录：import astrbot_test_doubles
 
-    另外**必须**把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时
-    优先读它，否则普通模式下会用**当前工作目录**（core/utils/astrbot_path.py:29-35）。
+    另外必须把 ``ASTRBOT_ROOT`` 钉到用户真实目录：AstrBot 解析数据路径时
+    优先读它，否则普通模式下会用当前工作目录（core/utils/astrbot_path.py:29-35）。
     不设置的话，在项目目录里运行会在项目内生成 ``data/cmd_config.json``
     （AstrBot 主配置，含 API 密钥与管理员 QQ 号）。
     """
@@ -47,7 +47,7 @@ def _ensure_paths() -> None:
     if os.path.isdir(astrbot_app) and astrbot_app not in sys.path:
         sys.path.insert(0, astrbot_app)
 
-    # ★ 先"设置"再"读取"：只在没设过时才写入，避免覆盖用户显式配置。
+    # 先"设置"再"读取"：只在没设过时才写入，避免覆盖用户显式配置。
     astrbot_root = os.environ.get(
         "ASTRBOT_ROOT", os.path.join(os.path.expanduser("~"), ".astrbot")
     )

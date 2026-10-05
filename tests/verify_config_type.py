@@ -1,9 +1,9 @@
 """生产配置形态验证：AstrBot 实际传给插件的 config 是什么类型？
 
-这是**只有真实运行路径才会暴露**的问题：源码里 AstrBot 传的是
+这是只有真实运行路径才会暴露的问题：源码里 AstrBot 传的是
 ``AstrBotConfig`` 实例（见 star_manager.py:1164），而不是普通 dict。
 如果 ``parse_settings`` 只接受 dict，用户在 WebUI 里改的任何配置
-都会**静默失效**、全部退回默认值 —— 而且不会有任何报错。
+都会静默失效、全部退回默认值 —— 而且不会有任何报错。
 
 本脚本用真实的 AstrBotConfig 类型构造配置，验证解析结果正确。
 """
@@ -22,7 +22,7 @@ ASTRBOT_APP = os.environ.get("ASTRBOT_APP_PATH", r"D:\AstrBot\backend\app")
 if os.path.isdir(ASTRBOT_APP):
     sys.path.insert(0, ASTRBOT_APP)
 
-# ★ 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
+# 钉住 AstrBot 的 root，避免它在项目目录里生成 data/。
 # AstrBot 解析数据路径时优先读 ASTRBOT_ROOT，否则普通模式下用当前工作目录
 # （core/utils/astrbot_path.py:29-35）。不设置就会在项目里凭空生成
 # data/cmd_config.json（含 AstrBot 主配置），曾经因此误提交过整个 data/ 目录。
@@ -101,7 +101,7 @@ def main() -> int:
         try:
             s_obj = parse_settings(cfg)
             check(
-                "★ AstrBotConfig 对象被正确解析（用户配置不丢失）",
+                "AstrBotConfig 对象被正确解析（用户配置不丢失）",
                 s_obj.command_timeout_sec == 99.0
                 and s_obj.admin_only is False
                 and s_obj.max_sessions == 6
@@ -111,7 +111,7 @@ def main() -> int:
                 f"bsk_path={s_obj.bsk_path!r}",
             )
         except Exception as exc:  # noqa: BLE001
-            check("★ AstrBotConfig 对象被正确解析（用户配置不丢失）", False, repr(exc))
+            check("AstrBotConfig 对象被正确解析（用户配置不丢失）", False, repr(exc))
 
         # 对照：如果解析失败，值会等于默认值 —— 这正是"静默失效"的样子
         s_default = parse_settings({})

@@ -1,20 +1,20 @@
-"""bsk 子进程调用层 —— 整个插件里**唯一**与子进程打交道的地方。
+"""bsk 子进程调用层 —— 整个插件里唯一与子进程打交道的地方。
 
 把 ``bsk <命令> --json`` 的调用细节全部封在这里，上层的 ``session.py`` /
 ``service.py`` 只需要 ``await runner.run([...])``，不必关心进程、编码、超时。
 
 设计要点（每一条都对应一个实测踩过的坑）：
 
-1. **列表参数、不过 shell** —— 用 ``create_subprocess_exec(*args)``，
+1. 列表参数、不过 shell —— 用 ``create_subprocess_exec(*args)``，
    避免命令注入，也避免 Windows 引号转义问题。
-2. **``communicate()`` 必须包超时** —— bsk 自动拉起后台 daemon 后，daemon 会继承
+2. ``communicate()`` 必须包超时 —— bsk 自动拉起后台 daemon 后，daemon 会继承
    stdout/stderr 管道句柄，导致子进程的管道永远不关闭、``communicate()`` 可能永不返回。
-3. **超时后的取消语义** —— 先关 stdin（bsk 会据此发送 cancel RPC 并等浏览器回收），
+3. 超时后的取消语义 —— 先关 stdin（bsk 会据此发送 cancel RPC 并等浏览器回收），
    给 15 秒宽限期；仍不退出才 ``kill()``。直接 SIGINT/kill 会跳过浏览器的清理逻辑。
-4. **显式 UTF-8 解码** —— AstrBot 自带 Python 在 Windows 下 ``sys.stdout.encoding`` 是
+4. 显式 UTF-8 解码 —— AstrBot 自带 Python 在 Windows 下 ``sys.stdout.encoding`` 是
    ``gbk``，而网页文本可能是阿拉伯文/俄文/中文。不指定编码会抛 ``UnicodeDecodeError``，
    而且是在 subprocess 的 reader 线程里抛，主线程只看到一个莫名其妙的 ``None``。
-5. **判成败只看退出码** —— 错误 JSON 走的是 **stdout** 而不是 stderr；
+5. 判成败只看退出码 —— 错误 JSON 走的是 stdout 而不是 stderr；
    而 clap 参数错误又是 stderr 纯文本。所以 JSON 解析必须容错，不能用来判成败。
 """
 
@@ -38,7 +38,7 @@ from .models import BskResult
 # 让浏览器端把中断的操作收尾）。bsk 官方的建议值是 15 秒 —— Windows 上
 # IPC 可能花 5s 连接 + 2s 取消 + 2s 收尾 + 最多 5s 释放传输。
 #
-# 为什么做成可配置：宽限期是**用户可感知的额外等待**。如果一条命令已经
+# 为什么做成可配置：宽限期是用户可感知的额外等待。如果一条命令已经
 # 等满超时（例如 navigate 的 45 秒），再无条件干等 15 秒体验很差。
 # 因此允许调用方按场景调小，默认仍取官方建议值。
 DEFAULT_CANCEL_GRACE_SEC = 15.0
@@ -49,7 +49,7 @@ MIN_CANCEL_GRACE_SEC = 1.0
 # 进程退出后，等待 stdout/stderr 抽取任务收尾的上限（秒）。
 #
 # 为什么需要：Windows 上 bsk 自动拉起的 daemon 会继承 stdout/stderr 的管道句柄，
-# 导致子进程退出后管道**仍然不关闭**，读取端永远等不到 EOF。
+# 导致子进程退出后管道仍然不关闭，读取端永远等不到 EOF。
 # 没有这个上限的话，命令会在已经成功之后卡住不返回。
 DRAIN_TIMEOUT_SEC = 2.0
 
@@ -57,7 +57,7 @@ DRAIN_TIMEOUT_SEC = 2.0
 async def _drain(stream: asyncio.StreamReader | None, sink: list[bytes]) -> None:
     """把子进程的一个输出管道读到 EOF 或出错为止。
 
-    单独抽出来是因为要**并发**读 stdout 和 stderr —— 顺序读会在其中一个
+    单独抽出来是因为要并发读 stdout 和 stderr —— 顺序读会在其中一个
     缓冲区写满时死锁（经典管道死锁）。
 
     Args:
@@ -81,11 +81,11 @@ async def _drain(stream: asyncio.StreamReader | None, sink: list[bytes]) -> None
 def _build_env() -> dict[str, str]:
     """构造子进程环境变量。
 
-    - ``BSK_CANCEL_ON_STDIN_CLOSE=1`` —— **Windows 上必需**。
+    - ``BSK_CANCEL_ON_STDIN_CLOSE=1`` —— Windows 上必需。
       没有它，关闭 stdin 不会触发 bsk 的取消逻辑，我们的优雅取消就形同虚设，
       最后只能硬 kill（会跳过浏览器端的收尾）。
 
-      ⚠️ 正因为设了它，**执行期间绝不能关 stdin**：bsk 会把"stdin 被关"
+      ⚠️ 正因为设了它，执行期间绝不能关 stdin：bsk 会把"stdin 被关"
       理解成"用户按了 Ctrl-C"，从而把正在执行的命令取消掉。
       所以本模块不使用 ``proc.communicate()``（它会立刻关 stdin），
       改为自己并发读取两个管道。详见 ``run()`` 的说明。
@@ -176,7 +176,7 @@ def _try_parse_json(text: str) -> Any | None:
         text: 进程 stdout。
 
     Returns:
-        解析出的对象；无法解析时返回 None（**不抛异常** —— 调用方只看退出码）。
+        解析出的对象；无法解析时返回 None（不抛异常 —— 调用方只看退出码）。
     """
     stripped = (text or "").strip()
     if not stripped:
@@ -203,7 +203,7 @@ def _extract_error_fields(data: Any) -> tuple[str, str, str, str]:
     """从错误 JSON 里取出 (code, message, hint, reason)。
 
     bsk 的错误结构是扁平的 ``{code, message, hint, exit_code, data?}``，
-    **没有 error 包装层**。但为了兼容未来可能的嵌套，这里两种都试。
+    没有 error 包装层。但为了兼容未来可能的嵌套，这里两种都试。
 
     Args:
         data: 解析后的 JSON，可能是任何类型。
@@ -245,7 +245,7 @@ class BskRunner:
         bsk_path: bsk 可执行文件路径（可为裸命令名，构造时解析一次）。
         default_timeout: 默认超时（秒）。
         cancel_grace: 超时后等待 bsk 优雅退出的宽限期（秒）。
-            这是**最坏情况**下的额外等待：正常时 bsk 收到 stdin 关闭会很快退出，
+            这是最坏情况下的额外等待：正常时 bsk 收到 stdin 关闭会很快退出，
             只有它卡死时才需要等满。默认取官方建议的 15 秒。
     """
 
@@ -284,14 +284,14 @@ class BskRunner:
         """执行一条 bsk 命令。
 
         Args:
-            args: 命令参数列表，**不含** bsk 自身路径。
+            args: 命令参数列表，不含 bsk 自身路径。
                 例如 ``["session", "start", "--no-focus", "--json"]``。
             timeout: 超时秒数；None 时用 ``default_timeout``。
             expect_json: 是否期望 JSON 输出。为 False 时不因解析失败而报错
                 （用于 ``--version`` 这类纯文本命令）。
 
         Returns:
-            ``BskResult``。**成功与失败都会返回**（失败时 ``ok=False``），
+            ``BskResult``。成功与失败都会返回（失败时 ``ok=False``），
             只有"bsk 根本没跑起来"才抛异常。
 
         Raises:
@@ -337,7 +337,7 @@ class BskRunner:
 
         # 进程已退出（或被我们终止）。给抽取任务一个有界的时间收尾：
         # Windows 上 daemon 可能继承了管道句柄，导致 EOF 永远不来，
-        # 所以**必须**有上限，不能无限等。
+        # 所以必须有上限，不能无限等。
         with contextlib.suppress(asyncio.TimeoutError, Exception):
             await asyncio.wait_for(
                 asyncio.gather(drain_out, drain_err, return_exceptions=True),
@@ -362,7 +362,7 @@ class BskRunner:
                 elapsed=elapsed,
             )
 
-        # ★ 必须显式指定 utf-8：Windows 中文环境下默认是 gbk，
+        # 必须显式指定 utf-8：Windows 中文环境下默认是 gbk，
         #   遇到阿拉伯文/俄文会抛 UnicodeDecodeError。
         stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
         stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
