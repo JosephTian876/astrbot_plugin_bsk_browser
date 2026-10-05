@@ -20,7 +20,8 @@
 
 设计约束（写代码时请勿破坏）：
 
-- 纯标准库，不 import astrbot，也不 import 本包其他模块，可独立单测；
+- 纯标准库，不 import astrbot，也不 import 内置 ``logging``；日志由 ``main.py``
+  注入（见 ``bsk/logger.py``），未注入时走 ``NULL_LOGGER``，可独立单测；
 - 本模块的任何方法都不抛异常（``load`` / ``add`` / ``remove`` / ``clear``）：
   它在插件启动路径上跑，一个异常就是插件加载失败；
 - 原子写：先写 ``<path>.tmp`` 再 ``os.replace()``，避免写一半被杀留下坏文件；
@@ -34,16 +35,15 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 import os
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from .logger import NULL_LOGGER, LoggerLike
+from .paths import JOURNAL_FILE_NAME, default_journal_path
 
 __all__ = [
     "JOURNAL_VERSION",
@@ -54,30 +54,6 @@ __all__ = [
 
 JOURNAL_VERSION = 1
 """文件格式版本。将来字段有变时靠它区分，现在只有一种。"""
-
-JOURNAL_DIR_NAME = "astrbot_bsk_browser"
-"""默认目录名（系统临时目录下）。刻意与截图目录区分开，便于人工排查。"""
-
-JOURNAL_FILE_NAME = "sessions.json"
-"""默认文件名。用 JSON 而不是二进制，是为了出问题时能直接用记事本打开看。"""
-
-
-def default_journal_path() -> Path:
-    """默认的 journal 文件位置：系统临时目录下的 ``astrbot_bsk_browser/sessions.json``。
-
-    为什么放临时目录而不是插件数据目录：AstrBot 的工作目录会随启动方式变化，
-    插件数据目录也不保证一定可写；而临时目录是"总是存在、总是可写"的那个位置。
-    代价是操作系统清理临时目录后记录会丢 —— 那时记录的会话多半也早就没了，
-    可以接受（journal 本来就是尽力而为的辅助机制）。
-
-    Returns:
-        journal 文件的绝对路径（不保证文件或目录存在）。
-    """
-    try:
-        base = Path(tempfile.gettempdir())
-    except Exception:  # noqa: BLE001 - 极端环境下 gettempdir 也可能炸
-        base = Path(".")
-    return base / JOURNAL_DIR_NAME / JOURNAL_FILE_NAME
 
 
 def _as_str(value: Any) -> str:
@@ -185,14 +161,18 @@ class SessionJournal:
 
     Args:
         path: journal 文件的路径。父目录不存在时会在写入时自动创建。
+        logger: 可选的日志接口（见 ``bsk/logger.py`` 的 ``LoggerLike``）。
+            由 ``main.py`` 注入插件 logger；不传（或传 ``None``）时走
+            ``NULL_LOGGER``：不产生输出，也绝不抛异常。
 
     Note:
         本类的公开方法都不抛异常。写失败只记 debug 日志：
         journal 是尽力而为的辅助机制，它的失败绝不该影响会话的正常创建与停止。
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, logger: LoggerLike | None = None) -> None:
         self._path = Path(path)
+        self._logger = logger or NULL_LOGGER
         # 一把锁保护"读-改-写"整个过程。add/remove 可能从不同协程被调到
         # （asyncio 是单线程事件循环，但用户工具函数之间没有互斥保证），
         # 而文件操作本身是同步阻塞的，用 threading.Lock 比 asyncio.Lock 更简单可靠。
@@ -281,7 +261,7 @@ class SessionJournal:
             #   或路径含中文时会抛 UnicodeDecodeError。
             text = self._path.read_text(encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 - 读不到就是"没有记录"
-            logger.debug("会话 journal 读取失败（按空处理）：%r", exc)
+            self._logger.debug("会话 journal 读取失败（按空处理）：%r", exc)
             return []
 
         # 用户用记事本打开并保存过的话，文件头可能被加上 UTF-8 BOM，
@@ -291,7 +271,7 @@ class SessionJournal:
         try:
             data = json.loads(text)
         except Exception as exc:  # noqa: BLE001 - 半截 JSON / 二进制垃圾
-            logger.debug("会话 journal 不是合法 JSON（按空处理）：%r", exc)
+            self._logger.debug("会话 journal 不是合法 JSON（按空处理）：%r", exc)
             return []
 
         # 正式格式：{"version": 1, "entries": [...]}。
@@ -303,7 +283,7 @@ class SessionJournal:
             raw_entries = data
 
         if not isinstance(raw_entries, list):
-            logger.debug("会话 journal 结构不认识（按空处理）")
+            self._logger.debug("会话 journal 结构不认识（按空处理）")
             return []
 
         result: list[JournalEntry] = []
@@ -328,7 +308,7 @@ class SessionJournal:
         try:
             text = json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as exc:  # noqa: BLE001 - 理论上不会发生，兜底
-            logger.debug("会话 journal 序列化失败（忽略）：%r", exc)
+            self._logger.debug("会话 journal 序列化失败（忽略）：%r", exc)
             return
 
         try:
@@ -342,7 +322,7 @@ class SessionJournal:
                     os.fsync(fh.fileno())
             os.replace(self.tmp_path, self._path)
         except Exception as exc:  # noqa: BLE001 - 写不进去也不能影响主流程
-            logger.debug("会话 journal 写入失败（忽略）：%r", exc)
+            self._logger.debug("会话 journal 写入失败（忽略）：%r", exc)
             with contextlib.suppress(Exception):
                 self.tmp_path.unlink(missing_ok=True)
 

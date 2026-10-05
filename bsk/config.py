@@ -113,14 +113,20 @@ DEFAULT_IDLE_RELEASE_SEC = 240.0
 """空闲多久主动释放会话（秒）。必须 < 300，见 ``BSK_SESSION_RECLAIM_SEC``。"""
 
 DEFAULT_SCREENSHOT_DIR = ""
-"""截图存放目录。空 = 用插件自己的数据目录。"""
+"""截图存放目录。空 = 插件数据目录下的 ``shots``
+（``data/plugin_data/astrbot_plugin_bsk_browser/shots``）。"""
 
 DEFAULT_JOURNAL_PATH = ""
-"""会话 journal 文件位置。空 = 系统临时目录下的 ``astrbot_bsk_browser/sessions.json``。
+"""会话 journal 文件位置。空 = 插件数据目录下的 ``sessions.json``
+（``data/plugin_data/astrbot_plugin_bsk_browser/sessions.json``）。
 
 journal 记录"本插件创建了哪些浏览器会话"。AstrBot 被强杀时 ``terminate()``
 不会执行，而 bsk daemon 独立于 AstrBot 继续活着 —— 那些会话（以及用户桌面上的
 浏览器窗口）就没人管了。下次启动时插件靠这份记录把它们按 id 精确停掉。
+
+"插件数据目录"由 ``main.py`` 解析后经 ``Settings.data_dir`` 注入；那一步失败时
+（数据目录不可写、``StarTools`` 不可用）会降级到系统临时目录下的
+``astrbot_bsk_browser/sessions.json``，任何一步都不抛异常。详见 ``bsk/paths.py``。
 
 刻意与 ``screenshot_dir`` 一样用"空 = 用默认位置"的语义：绝大多数用户不需要
 关心它，而真正需要排查的人可以填一个固定路径，方便直接打开看。
@@ -604,14 +610,26 @@ class Settings:
     """
 
     screenshot_dir: str
-    """截图存放目录。空字符串 = 用插件自己的数据目录。"""
+    """截图存放目录。空字符串 = 插件数据目录下的 ``shots``。"""
 
     journal_path: str
-    """会话 journal 文件位置。空字符串 = 系统临时目录下的默认位置。
+    """会话 journal 文件位置。空字符串 = 插件数据目录下的 ``sessions.json``。
 
     journal 是"我创建了哪些浏览器会话"的落盘记录，用于 AstrBot 被强杀后
     在下次启动时回收遗留的会话（见 ``bsk/journal.py`` 与
     ``SessionManager.recover_orphans``）。
+    """
+
+    data_dir: str
+    """插件数据目录（``data/plugin_data/astrbot_plugin_bsk_browser``）。
+
+    **注入项，不是用户配置项**：由 ``main.py`` 通过 ``StarTools.get_data_dir()``
+    取得后传给 :func:`parse_settings`，所以它刻意不写进 ``_conf_schema.json``
+    —— 用户不该也无法在配置页里填它。
+
+    空串表示"未注入"（拿不到数据目录），此时 journal 与截图的默认位置会降级到
+    系统临时目录（见 ``bsk/paths.py``）。它只在 ``screenshot_dir`` /
+    ``journal_path`` **为空**时才有影响：用户显式填了的那两项优先级最高。
     """
 
     max_page_chars: int
@@ -632,7 +650,7 @@ class Settings:
     """
 
 
-def parse_settings(raw: dict | None) -> Settings:
+def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
     """从 AstrBot 的原始配置 dict 构造 :class:`Settings`。
 
     任何非法值都回退到默认值，任何越界值都夹到边界，本函数永不抛异常。
@@ -641,9 +659,19 @@ def parse_settings(raw: dict | None) -> Settings:
     Args:
         raw: AstrBot 传来的原始配置。``None``、空 dict、甚至根本不是 dict
             都会被当成"没有配置"处理，全部走默认值。
+        data_dir: 插件数据目录，由 ``main.py`` 注入（见 :attr:`Settings.data_dir`）。
+            它是关键字参数，因为**它不是用户配置**：调用方要么显式传，
+            要么就接受"未注入"这个默认状态。默认空串照原样存下，
+            不做任何解析或校验 —— 路径的可用性判断与降级全部由
+            ``bsk/paths.py`` 在真正要用的时候做（那时才知道写不写得进去，
+            而且那一步保证不抛异常）。
 
     Returns:
         校验后的配置对象。
+
+    Note:
+        用户显式配置的 ``screenshot_dir`` / ``journal_path`` **优先级最高**：
+        ``data_dir`` 只在它们为空时才决定默认落点，绝不会覆盖它们。
     """
     if not isinstance(raw, dict):
         # AstrBot 正常会传 dict（AstrBotConfig 是 dict 子类），这里只是兜底。
@@ -690,8 +718,12 @@ def parse_settings(raw: dict | None) -> Settings:
         # 空字符串在这里是有意义的取值（表示"用默认目录"），所以不能让
         # _as_str 把它折成默认值 —— 它的默认值本来也就是空字符串，正好一致。
         screenshot_dir=_as_str(screenshot_dir, DEFAULT_SCREENSHOT_DIR),
-        # 同上：空 = 用系统临时目录下的默认位置，与 screenshot_dir 一个套路。
+        # 同上：空 = 用插件数据目录下的默认位置，与 screenshot_dir 一个套路。
         journal_path=_as_str(journal_path, DEFAULT_JOURNAL_PATH),
+        # 注入项（不是用户配置项）：原样收下，不做解析也不做存在性检查。
+        # 路径能不能用、不能用时降级到哪里，全部交给 bsk/paths.py 在使用时判定
+        # —— 那时才知道写不写得进去，而且那一步保证不抛异常。
+        data_dir=_as_str(data_dir, ""),
         max_page_chars=int(
             _clamp(
                 _as_int(raw.get("max_page_chars"), DEFAULT_MAX_PAGE_CHARS),

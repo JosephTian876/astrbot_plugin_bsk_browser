@@ -18,7 +18,6 @@ bsk 命令形式全部对照 `_raw-bsk-help.txt` 的真实帮助文本写，不�
 from __future__ import annotations
 
 import json
-import logging
 import math
 import time
 from dataclasses import dataclass
@@ -31,7 +30,8 @@ from .config import (
     as_timeout_seconds,
 )
 from .errors import CODE_BROWSER_AMBIGUOUS, BskBrowserAmbiguous, BskError
-from .journal import SessionJournal, default_journal_path
+from .journal import SessionJournal
+from .logger import NULL_LOGGER, LoggerLike
 from .models import (
     BrowserInstance,
     ConsoleLog,
@@ -41,6 +41,7 @@ from .models import (
     Screenshot,
 )
 from .pages import parse_observation, summarize
+from .paths import default_journal_path, default_shot_dir
 from .runner import BskRunner
 from .session import SessionManager
 from .shots import (
@@ -49,8 +50,6 @@ from .shots import (
     make_shot_path,
     verify_shot,
 )
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["BskService", "ActionResult", "ShotPayload"]
 
@@ -179,6 +178,12 @@ class BskService:
             由 ``main.py`` 读 ``context.get_config()`` 后传入（见
             :func:`bsk.config.read_framework_tool_timeout`）。``None`` / 非法值
             都表示"未知"，此时不做任何钳制，行为与没有这个参数时完全一致。
+        logger: 可选的日志接口（见 ``bsk/logger.py`` 的 ``LoggerLike``）。
+            由 ``main.py`` 从 ``astrbot.api`` 取来后注入，并**向下传给**
+            ``SessionManager`` 与 ``SessionJournal`` —— 它们各自的日志也要
+            走到插件专属 logger 上。不传（或传 ``None``）时全部走
+            ``NULL_LOGGER``：不产生输出，也绝不抛异常。本层不 import astrbot，
+            也不 import 内置 ``logging``（分层约束，有静态测试守着）。
     """
 
     def __init__(
@@ -188,30 +193,44 @@ class BskService:
         sessions: SessionManager | None = None,
         journal: SessionJournal | None = None,
         framework_tool_timeout: float | None = None,
+        logger: LoggerLike | None = None,
     ) -> None:
         self.settings = settings
+        self._logger = logger or NULL_LOGGER
         # 先落框架上限再建 runner/sessions：它是纯数据，不产生任何副作用。
         self.framework_tool_timeout = framework_tool_timeout
         self.runner = runner or BskRunner(
             settings.bsk_path,
             default_timeout=settings.command_timeout_sec,
         )
-        # journal 是"尽力而为"的辅助机制：构造它本身不做任何 IO（真正的读写
-        # 发生在建/停会话和 recover_orphans 里，且那些路径全部吞异常），
-        # 所以这里即便路径不可用也不会影响插件加载。
+        # journal 是"尽力而为"的辅助机制：解析默认位置时会试着建一次数据目录
+        # （判定"能不能用"的唯一可靠办法），但失败就降级到临时目录，
+        # 绝不抛异常、也绝不影响插件加载。真正的读写发生在建/停会话和
+        # recover_orphans 里，且那些路径全部吞异常。
         self.journal = journal if journal is not None else self._make_journal()
         self.sessions = sessions or SessionManager(
             self.runner,
             settings,
             browser_probe=self.probe_browser,
             journal=self.journal,
+            logger=self._logger,
         )
 
     def _make_journal(self) -> SessionJournal:
-        """按配置构造 journal；拿不到配置时退回默认位置。"""
+        """按配置构造 journal；没配就用插件数据目录下的默认位置。
+
+        用户显式填的 ``journal_path`` 优先级最高，注入的 ``data_dir`` 只在它为空
+        时才起作用（默认位置与降级顺序见 ``bsk/paths.py``）。日志同样注入下去，
+        让 journal 的读写失败能报在插件自己的 logger 上。
+        """
         configured = getattr(self.settings, "journal_path", "") or ""
         path = configured.strip() if isinstance(configured, str) else ""
-        return SessionJournal(path or default_journal_path())
+        if path:
+            return SessionJournal(path, logger=self._logger)
+        data_dir = getattr(self.settings, "data_dir", "") or ""
+        return SessionJournal(
+            default_journal_path(data_dir, self._logger), logger=self._logger
+        )
 
     # ------------------------------------------------------------------
     # 基础设施
@@ -437,7 +456,7 @@ class BskService:
                 return ""
             data = json.loads(proc.stdout.decode("utf-8", errors="replace") or "[]")
         except Exception as exc:  # noqa: BLE001 - 探测失败必须静默降级
-            logger.debug("浏览器探测失败，交给 bsk 选默认：%r", exc)
+            self._logger.debug("浏览器探测失败，交给 bsk 选默认：%r", exc)
             return ""
         # 走到这里说明探测成功了，于是"多浏览器歧义"是一条确定的结论，
         #   必须让它抛出去（下面这个方法会抛），不能和上面的失败混为一谈。
@@ -611,7 +630,7 @@ class BskService:
                 "如果用户之前在浏览某个页面，需要重新用 bsk_open 打开那个网址。）\n"
                 + observation.text
             )
-            logger.info("会话 %s 在读取时被重建，已在返回内容里标注页面已重置", key)
+            self._logger.info("会话 %s 在读取时被重建，已在返回内容里标注页面已重置", key)
 
         return observation
 
@@ -852,10 +871,12 @@ class BskService:
             # 写类动作的待遇：不确定态下不执行任意 JS（见 docstring 的 Note）。
             allow_uncertain=False,
         )
-        return self._check_evaluate_result(result.data, expression)
+        return self._check_evaluate_result(result.data, expression, self._logger)
 
     @staticmethod
-    def _check_evaluate_result(data: Any, expression: str) -> EvaluateResult:
+    def _check_evaluate_result(
+        data: Any, expression: str, logger: LoggerLike | None = None
+    ) -> EvaluateResult:
         """把 ``evaluate`` 的 JSON 载荷收敛成结果，失败时抛异常。
 
         抽成静态方法是为了能脱离会话管理单独测试这条判读逻辑 —— 它是整个
@@ -864,6 +885,9 @@ class BskService:
         Args:
             data: 已解析的 JSON 载荷（外部输入，可能是任何类型）。
             expression: 原始表达式，只用于错误文案里回显"是哪段脚本失败了"。
+            logger: 可选的日志接口（见 ``bsk/logger.py``）。静态方法没有 ``self``
+                可挂，所以日志对象显式传进来；不传时走 ``NULL_LOGGER``，
+                既不影响既有调用方，也保持"任何情况下都不抛异常"。
 
         Returns:
             ``ok=True`` 的 :class:`~bsk.models.EvaluateResult`。
@@ -911,7 +935,7 @@ class BskService:
             )
             message = f"evaluate 失败且无错误详情：{data!r:.200}"
 
-        logger.info("evaluate 里 JS 执行失败：%s", detail or "(无详情)")
+        (logger or NULL_LOGGER).info("evaluate 里 JS 执行失败：%s", detail or "(无详情)")
         raise BskError(
             message,
             friendly=friendly,
@@ -1081,9 +1105,9 @@ class BskService:
         try:
             removed = cleanup_shots(directory)
             if removed:
-                logger.debug("清理了 %d 张旧截图", removed)
+                self._logger.debug("清理了 %d 张旧截图", removed)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("截图清理失败（忽略）：%r", exc)
+            self._logger.debug("截图清理失败（忽略）：%r", exc)
 
         return ShotPayload(
             path=shot.path,
@@ -1110,15 +1134,17 @@ class BskService:
         return text
 
     def _default_shot_dir(self) -> str:
-        """未配置截图目录时的默认位置。
+        """未配置截图目录时的默认位置：插件数据目录下的 ``shots``。
 
-        用系统临时目录下的固定子目录，而不是当前工作目录 ——
-        AstrBot 的工作目录可能是只读的或随启动方式变化。
+        数据目录（``settings.data_dir``，由 ``main.py`` 注入）拿不到时由
+        ``bsk/paths.py`` 降级到系统临时目录 —— 这里不重复实现那套判断，
+        以保证"降级到哪"只有一处定义。
+
+        为什么不用当前工作目录：AstrBot 的工作目录可能是只读的，或随启动
+        方式变化；数据目录与临时目录都是明确的、可写的落点。
         """
-        import tempfile
-        from pathlib import Path
-
-        return str(Path(tempfile.gettempdir()) / "astrbot_bsk_shots")
+        data_dir = getattr(self.settings, "data_dir", "") or ""
+        return str(default_shot_dir(data_dir, self._logger))
 
     def shot_for_llm(self, payload: ShotPayload) -> str | None:
         """可选的降采样版本（data URL）。PIL 不可用时返回 None。
@@ -1129,7 +1155,7 @@ class BskService:
         try:
             return encode_for_llm(payload.path)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("降采样失败（忽略）：%r", exc)
+            self._logger.debug("降采样失败（忽略）：%r", exc)
             return None
 
     # ------------------------------------------------------------------

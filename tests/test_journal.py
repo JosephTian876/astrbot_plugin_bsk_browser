@@ -563,17 +563,46 @@ class TestClear(JournalTestCase):
 
 
 class TestDefaultPath(unittest.TestCase):
-    """默认路径的构成。"""
+    """默认路径的构成。
 
-    def test_default_path_shape(self) -> None:
-        path = default_journal_path()
+    默认位置有两个分支，两个都要测：注入 ``data_dir`` 时落在插件数据目录下
+    （``data/plugin_data/astrbot_plugin_bsk_browser``），未注入时退回旧的
+    系统临时目录行为。降级容错是审核明确要求保留的，所以它同样有守护测试。
+    """
+
+    def test_default_path_shape_under_data_dir(self) -> None:
+        """传入 ``data_dir`` 时：文件名固定，且落在该目录之下。"""
+        with tempfile.TemporaryDirectory(prefix="bsk-journal-datadir-") as tmp:
+            data_dir = Path(tmp) / "astrbot_plugin_bsk_browser"
+            path = default_journal_path(str(data_dir))
+
+            self.assertEqual(path.name, "sessions.json")
+            self.assertTrue(path.is_absolute())
+            self.assertTrue(
+                path.resolve().is_relative_to(data_dir.resolve()),
+                f"{path} 不在 {data_dir} 之下",
+            )
+
+    def test_default_path_is_under_system_temp_when_data_dir_missing(self) -> None:
+        """未注入 ``data_dir``（空串）→ 退回系统临时目录下的 ``astrbot_bsk_browser``。
+
+        这条路径必须保留：``StarTools.get_data_dir()`` 失败时插件会传空串进来，
+        那时 journal 仍要有个可写的位置，且不能因为拿不到数据目录就抛异常。
+        """
+        path = default_journal_path("")
+
         self.assertEqual(path.name, "sessions.json")
         self.assertEqual(path.parent.name, "astrbot_bsk_browser")
-        self.assertTrue(path.is_absolute())
-
-    def test_default_path_is_under_system_temp(self) -> None:
         temp = Path(tempfile.gettempdir()).resolve()
-        self.assertEqual(default_journal_path().parent.parent.resolve(), temp)
+        self.assertEqual(path.parent.parent.resolve(), temp)
+
+    def test_default_path_never_raises_for_any_data_dir(self) -> None:
+        """非法 ``data_dir`` 一律降级，绝不在插件启动路径上抛异常。"""
+        for data_dir in ("", "   ", "\x00bad", 42, None):
+            with self.subTest(data_dir=repr(data_dir)):
+                path = default_journal_path(data_dir)  # type: ignore[arg-type]
+                self.assertEqual(path.name, "sessions.json")
+                self.assertTrue(path.is_absolute())
 
 
 class TestJournalEntry(unittest.TestCase):

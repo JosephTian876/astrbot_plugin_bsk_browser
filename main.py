@@ -27,12 +27,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .bsk.config import (
     Settings,
@@ -45,9 +45,13 @@ from .bsk.models import ConsoleLog
 from .bsk.service import BskService
 from .bsk.session import SessionManager
 
-logger = logging.getLogger(__name__)
-
 __all__ = ["BskBrowserPlugin"]
+
+# 插件自己的名字。用于解析插件数据目录，必须与 metadata.yaml 的 name 一致。
+# 显式写死是刻意的：``StarTools.get_data_dir()`` 不带名字时会去猜调用方模块，
+# 那在插件加载期并不可靠（猜不到就抛 RuntimeError），而这里的名字本来就是
+# 确定的常量。
+PLUGIN_NAME = "astrbot_plugin_bsk_browser"
 
 # 后台空闲回收的检查间隔（秒）。
 # 不需要很频繁：会话空闲阈值是分钟级的，30 秒粒度足够，且开销可忽略。
@@ -125,7 +129,12 @@ class BskBrowserPlugin(Star):
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
-        self.settings: Settings = parse_settings(config)
+
+        # 先解析插件数据目录：journal 与截图的默认落点都基于它
+        # （持久化数据必须落在 data/plugin_data/<插件名> 下，见 bsk/paths.py）。
+        # 这一步永不抛异常：拿不到就返回空串，由 bsk/paths.py 降级到系统临时目录。
+        data_dir = self._resolve_data_dir()
+        self.settings: Settings = parse_settings(config, data_dir=data_dir)
 
         # 读出框架自己的单次工具调用上限（AstrBot 主配置里的 tool_call_timeout），
         # 交给 bsk/ 层做超时钳制。这个读取永不抛异常（读不到就是 None），
@@ -133,12 +142,65 @@ class BskBrowserPlugin(Star):
         # 绝不该让插件起不来（见 bsk.config.read_framework_tool_timeout）。
         self.framework_tool_timeout: float | None = self._read_framework_timeout()
 
+        # logger 以参数注入给 bsk/ 层：那边不 import astrbot（分层约束），
+        # 也不 import 内置 logging（审核要求），只认 bsk/logger.py 的接口。
+        # astrbot_logger 是框架的插件 logger 代理，会按调用方模块名路由到
+        # 本插件专属的 logger 上，所以 bsk/ 各处打出来的日志归属仍然正确。
         self.service = BskService(
-            self.settings, framework_tool_timeout=self.framework_tool_timeout
+            self.settings,
+            framework_tool_timeout=self.framework_tool_timeout,
+            logger=astrbot_logger,
         )
 
         self._reap_task: asyncio.Task[None] | None = None
         self._closed = False
+
+    def _resolve_data_dir(self) -> str:
+        """解析插件数据目录（``data/plugin_data/astrbot_plugin_bsk_browser``）。
+
+        三步降级，每一步失败都只记 warning：
+
+        1. ``StarTools.get_data_dir("astrbot_plugin_bsk_browser")`` —— 显式传插件名，
+            不依赖调用栈推断（``get_data_dir()`` 不带名字时会去猜调用方模块，
+            在插件加载期并不可靠，且失败抛的是 ``RuntimeError``）；
+        2. 退回 ``get_astrbot_data_path()/plugin_data/<插件名>`` —— 与第 1 步
+            同一套目录约定，只是不代为创建；
+        3. 再失败 → 返回空串，由 ``bsk/paths.py`` 走系统临时目录降级。
+
+        Returns:
+            可用的插件数据目录（字符串）；全部失败时返回空串。
+
+        Note:
+            本方法**绝不抛异常**，也绝不返回 ``None``：它在插件加载路径上，
+            一个异常就是插件整个加载失败，而"数据目录拿不到"最多只是让 journal
+            与截图落到临时目录。这里也不做"能不能写"的判断 —— 那由
+            ``bsk/paths.py`` 在真正要用的时候做（它会 mkdir 并检查可写性，
+            同样保证不抛异常），判断逻辑只有一处。
+        """
+        try:
+            data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+            if data_dir:
+                return str(data_dir)
+            astrbot_logger.warning(
+                "[bsk_browser] 插件数据目录解析结果为空，改用降级路径。"
+            )
+        except Exception as exc:  # noqa: BLE001 - 拿不到数据目录不该让插件起不来
+            astrbot_logger.warning(
+                "[bsk_browser] 获取插件数据目录失败（%r），尝试用 AstrBot 数据路径拼接。",
+                exc,
+            )
+
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            return str(Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME)
+        except Exception as exc:  # noqa: BLE001
+            astrbot_logger.warning(
+                "[bsk_browser] 拼接插件数据目录也失败（%r），"
+                "会话记录与截图将退到系统临时目录。",
+                exc,
+            )
+        return ""
 
     def _read_framework_timeout(self) -> float | None:
         """从 ``context.get_config()`` 里读出框架的工具调用超时。
@@ -157,7 +219,7 @@ class BskBrowserPlugin(Star):
                 return None
             config_obj = getter()
         except Exception as exc:  # noqa: BLE001 - 读不到就是未知，不影响加载
-            logger.debug("读取 AstrBot 主配置失败（按未知处理）：%r", exc)
+            astrbot_logger.debug("读取 AstrBot 主配置失败（按未知处理）：%r", exc)
             return None
         return read_framework_tool_timeout(config_obj)
 
@@ -311,7 +373,7 @@ class BskBrowserPlugin(Star):
         try:
             return bool(event.is_admin())
         except Exception as exc:  # noqa: BLE001
-            logger.debug("is_admin() 调用失败，按非管理员处理：%r", exc)
+            astrbot_logger.debug("is_admin() 调用失败，按非管理员处理：%r", exc)
             return False
 
     def _evaluate_denied(self, event: AstrMessageEvent) -> str | None:

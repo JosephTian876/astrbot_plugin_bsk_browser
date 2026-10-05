@@ -38,7 +38,9 @@
 
 设计约束（写代码时请勿破坏）：
 
-- 零第三方依赖，不 import astrbot，可脱离框架单测；
+- 零第三方依赖，不 import astrbot，也不 import 内置 ``logging``；日志由
+  ``main.py`` 注入（见 ``bsk/logger.py``），未注入时走 ``NULL_LOGGER``，
+  可脱离框架单测；
 - 不自己起后台任务：空闲回收由 ``main.py`` 定时调用 ``reap_idle()``；
 - 时间戳一律用 ``time.monotonic()``（``time.time()`` 会被系统时钟跳变影响）；
   例外是 journal 的 ``created_at``，那个要跨进程比较，必须用墙钟；
@@ -52,7 +54,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import logging
 import os
 import time
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ from .errors import (
     BskVersionError,
 )
 from .journal import JournalEntry, SessionJournal
+from .logger import NULL_LOGGER, LoggerLike
 from .models import BrowserInstance, BskResult, BskSession
 from .runner import DEFAULT_CANCEL_GRACE_SEC, DRAIN_TIMEOUT_SEC, BskRunner
 
@@ -80,8 +82,6 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型检查期存在，运行时不 
     # 放在 TYPE_CHECKING 里可以两边都跑通：真正 import 它会把本模块
     # 和对方的进度绑死，而运行时我们只用 getattr 读几个属性。
     from .config import Settings
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "SessionManager",
@@ -470,10 +470,12 @@ class SessionManager:
         stop_total_budget_sec: float | None = None,
         stop_attempt_overhead_sec: float = STOP_ATTEMPT_OVERHEAD_SEC,
         stop_attempt_backstop_sec: float | None = None,
+        logger: LoggerLike | None = None,
     ) -> None:
         self._runner = runner
         self._browser_probe = browser_probe
         self._journal = journal
+        self._logger = logger or NULL_LOGGER
 
         # stop 重试的可调参数。只给测试用：生产路径一律用模块常量的默认值。
         # 非法值（<=0、非数字）一律回退到常量，避免调用方传 0 导致
@@ -675,7 +677,7 @@ class SessionManager:
                         #   再由下一轮用新的 session_id 重新构造参数。
                         self._counters["not_found_rebuilds"] += 1
                         await self._restart(entry, stop_old=False)
-                        logger.info(
+                        self._logger.info(
                             "会话 %s 已失效，已重建为 %s，重试一次",
                             key,
                             entry.session.session_id,
@@ -720,7 +722,7 @@ class SessionManager:
             await self._wait_idle(entry, RELEASE_WAIT_SEC)
             return await self._stop_entry(entry)
         except Exception as exc:  # noqa: BLE001 - 清理路径必须吞掉一切
-            logger.warning("释放会话 %s 时出现意外错误：%r", key, exc)
+            self._logger.warning("释放会话 %s 时出现意外错误：%r", key, exc)
             self._record_stop_error(f"{key}: {exc!r}")
             return False
 
@@ -781,7 +783,7 @@ class SessionManager:
             return 0
         count = await self._shutdown_entries(victims)
         self._counters["reaped"] += count
-        logger.info("空闲回收了 %d 个浏览器会话", count)
+        self._logger.info("空闲回收了 %d 个浏览器会话", count)
         return count
 
     async def recover_orphans(self) -> int:
@@ -825,7 +827,7 @@ class SessionManager:
         try:
             recorded = journal.load()
         except Exception as exc:  # noqa: BLE001 - journal 自身已经吞异常，这里再兜一层
-            logger.debug("读取会话 journal 失败（忽略）：%r", exc)
+            self._logger.debug("读取会话 journal 失败（忽略）：%r", exc)
             return 0
 
         if not recorded:
@@ -836,7 +838,7 @@ class SessionManager:
             live = await self._list_live_sessions()
         except Exception as exc:  # noqa: BLE001
             # 包括"daemon 没在跑"：那不是错误，会话自然也随着 daemon 一起没了。
-            logger.debug("session list 失败，跳过孤儿会话恢复：%r", exc)
+            self._logger.debug("session list 失败，跳过孤儿会话恢复：%r", exc)
             live = None
 
         if live is None:
@@ -854,7 +856,7 @@ class SessionManager:
                 #   - 有这个 id，但 agent_window_id 对不上 —— 那是别人的会话，
                 #     只是恰好撞了 id。绝不能停。
                 skipped += 1
-                logger.debug(
+                self._logger.debug(
                     "跳过遗留会话 %s（agent_window_id=%s）：daemon 侧不匹配",
                     entry.session_id,
                     entry.agent_window_id,
@@ -866,7 +868,7 @@ class SessionManager:
                 skipped += 1
 
         if stopped or skipped:
-            logger.info(
+            self._logger.info(
                 "恢复清理：停掉 %d 个上次遗留的浏览器会话，跳过 %d 个不匹配的",
                 stopped,
                 skipped,
@@ -942,7 +944,7 @@ class SessionManager:
         try:
             await self.release_all()
         except Exception as exc:  # noqa: BLE001 - 关闭路径绝不抛
-            logger.warning("close() 释放会话时出现意外错误：%r", exc)
+            self._logger.warning("close() 释放会话时出现意外错误：%r", exc)
         finally:
             self._entries.clear()
             self._closed = True
@@ -974,7 +976,7 @@ class SessionManager:
                 if self._entries.get(key) is entry and not entry.closed:
                     yield entry
                     return
-                logger.debug("会话槽位 %s 在等待锁期间已被释放，重新获取", key)
+                self._logger.debug("会话槽位 %s 在等待锁期间已被释放，重新获取", key)
             finally:
                 entry.lock.release()
         raise BskError(
@@ -1096,7 +1098,7 @@ class SessionManager:
                 code="bad_session_payload",
                 exit_code=result.exit_code,
             )
-        logger.info(
+        self._logger.info(
             "已创建浏览器会话 %s（browser=%s）",
             session.session_id,
             session.browser_instance_id or browser_id or "默认",
@@ -1128,7 +1130,7 @@ class SessionManager:
         except BskBrowserAmbiguous:
             raise
         except Exception as exc:  # noqa: BLE001 - 探测失败只是回退，不是错误
-            logger.debug("browser_probe 探测失败，回退到 bsk 默认浏览器：%r", exc)
+            self._logger.debug("browser_probe 探测失败，回退到 bsk 默认浏览器：%r", exc)
             return ""
 
     async def _stop_entry(self, entry: _Entry) -> bool:
@@ -1235,7 +1237,7 @@ class SessionManager:
                 # 再发一次只会立刻超时，纯粹浪费 terminate() 的时间。
                 # 首次尝试不走这个判断（它的额度由总预算本身保证）。
                 self._counters["stop_retry_budget_skips"] += 1
-                logger.warning(
+                self._logger.warning(
                     "停止会话 %s 的剩余预算 %.2fs 不足以再试一次，放弃重试",
                     session_id,
                     remaining,
@@ -1277,11 +1279,11 @@ class SessionManager:
                     # 靠重试救回来的（上一次报了 not_found 之外的错，这次 bsk 说
                     # 会话没了）—— 单列一个计数器，便于诊断"瞬时故障有多常见"。
                     self._counters["stop_recovered"] += 1
-                    logger.info(
+                    self._logger.info(
                         "会话 %s 在第 %d 次尝试时确认已停止", session_id, attempt
                     )
                 else:
-                    logger.debug("会话 %s 已不存在，无需停止", session_id)
+                    self._logger.debug("会话 %s 已不存在，无需停止", session_id)
                 return True
             except Exception as exc:  # noqa: BLE001 - 清理路径吞掉一切
                 last_exc = exc
@@ -1292,7 +1294,7 @@ class SessionManager:
                 if not _is_transient_stop_error(exc):
                     # 重试无意义（bsk 没装 / 版本不匹配 / 命令本身有问题）。
                     # 立刻放弃，别浪费 terminate() 的时间预算。
-                    logger.debug(
+                    self._logger.debug(
                         "停止会话 %s 失败且不属于瞬时故障，不再重试：%r",
                         session_id,
                         exc,
@@ -1300,7 +1302,7 @@ class SessionManager:
                     break
                 # 预算检查与 stop_retries 记数统一放在循环开头（各只有一处），
                 # 这里只负责打日志并等待。
-                logger.warning(
+                self._logger.warning(
                     "停止会话 %s 第 %d 次失败（瞬时故障），%.2fs 后重试：%r",
                     session_id,
                     attempt,
@@ -1319,18 +1321,18 @@ class SessionManager:
                 self._journal_remove(session_id)
                 if attempt > 1:
                     self._counters["stop_recovered"] += 1
-                    logger.info(
+                    self._logger.info(
                         "会话 %s 在第 %d 次尝试时停止成功（瞬时故障已恢复）",
                         session_id,
                         attempt,
                     )
                 else:
-                    logger.info("已停止浏览器会话 %s", session_id)
+                    self._logger.info("已停止浏览器会话 %s", session_id)
                 return True
 
         self._counters["stop_failed"] += 1
         self._record_stop_error(f"{session_id}: {last_exc}")
-        logger.warning(
+        self._logger.warning(
             "停止会话 %s 失败（共尝试 %d 次，上限 %d）：%r",
             session_id,
             attempt,
@@ -1397,7 +1399,7 @@ class SessionManager:
             await self._wait_idle(entry, RELEASE_WAIT_SEC)
             return await self._stop_entry(entry)
         except Exception as exc:  # noqa: BLE001 - 清理路径吞掉一切
-            logger.warning("关闭会话槽位 %s 时出现意外错误：%r", entry.key, exc)
+            self._logger.warning("关闭会话槽位 %s 时出现意外错误：%r", entry.key, exc)
             self._record_stop_error(f"{entry.key}: {exc!r}")
             return False
 
@@ -1419,7 +1421,7 @@ class SessionManager:
             await self._stop_entry(popped)
             evicted += 1
             self._counters["evicted"] += 1
-            logger.info(
+            self._logger.info(
                 "会话数已达上限 %d，淘汰最久未使用的会话 %s（key=%s）",
                 self._max_sessions,
                 popped.session.session_id or "(未建立)",
@@ -1452,7 +1454,7 @@ class SessionManager:
         while entry.lock.locked() and time.monotonic() < deadline:
             await asyncio.sleep(RELEASE_POLL_STEP_SEC)
         if entry.lock.locked():
-            logger.warning("等待会话 %s 空闲超过 %.1fs，仍继续停止", entry.key, timeout)
+            self._logger.warning("等待会话 %s 空闲超过 %.1fs，仍继续停止", entry.key, timeout)
             return False
         return True
 
@@ -1482,7 +1484,7 @@ class SessionManager:
     def _mark_uncertain(self, entry: _Entry, why: str) -> None:
         """把会话标记为不确定态：动作结果未知，此后拒绝新的操作动作。"""
         entry.session.uncertain = True
-        logger.warning(
+        self._logger.warning(
             "会话 %s 进入不确定态（%s）：后续动作将被拒绝，"
             "需要人工确认页面状态或 release 后重建",
             entry.session.session_id or entry.key,
@@ -1531,7 +1533,7 @@ class SessionManager:
                 )
             )
         except Exception as exc:  # noqa: BLE001 - 只影响可恢复性，不影响本次会话
-            logger.debug("写会话 journal 失败（忽略）：%r", exc)
+            self._logger.debug("写会话 journal 失败（忽略）：%r", exc)
 
     def _journal_remove(self, session_id: str) -> None:
         """会话已被正常停掉，从 journal 里移除它的记录。"""
@@ -1540,7 +1542,7 @@ class SessionManager:
         try:
             self._journal.remove(session_id)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("清理会话 journal 记录失败（忽略）：%r", exc)
+            self._logger.debug("清理会话 journal 记录失败（忽略）：%r", exc)
 
     def _journal_clear(self) -> None:
         """清空 journal。"""
@@ -1549,4 +1551,4 @@ class SessionManager:
         try:
             self._journal.clear()
         except Exception as exc:  # noqa: BLE001
-            logger.debug("清空会话 journal 失败（忽略）：%r", exc)
+            self._logger.debug("清空会话 journal 失败（忽略）：%r", exc)

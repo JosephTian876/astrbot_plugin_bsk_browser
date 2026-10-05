@@ -53,6 +53,11 @@ ALLOWED_SCHEMA_TYPES = frozenset(
 )
 
 
+# 由 ``main.py`` 注入、而非用户在配置页填写的字段。它们不该出现在 schema 里，
+# 因此下面两处"schema ↔ Settings 一一对应"的检查都要把它们排除掉。
+INJECTED_FIELDS = frozenset({"data_dir"})
+
+
 class TestDefaults(unittest.TestCase):
     """默认值本身必须符合设计约束（与 _conf_schema.json 的一致性另测）。"""
 
@@ -485,8 +490,17 @@ class TestConfSchemaFile(unittest.TestCase):
         cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 
     def test_all_settings_fields_are_present(self) -> None:
-        expected = {f.name for f in fields(Settings)}
+        # INJECTED_FIELDS 是"由 main.py 注入、用户不可配置"的字段，它们不该出现在
+        # schema 里（用户在配置页填不了）。除此之外必须严格一一对应：
+        # 少一个 = 配置项在代码里没有落点，多一个 = 代码读了用户填不了的东西。
+        expected = {f.name for f in fields(Settings)} - INJECTED_FIELDS
         self.assertEqual(set(self.schema), expected)
+
+    def test_injected_fields_are_not_in_schema(self) -> None:
+        """注入项绝不能出现在 schema 里 —— 那会让用户以为自己能配它。"""
+        for name in INJECTED_FIELDS:
+            with self.subTest(field=name):
+                self.assertNotIn(name, self.schema)
 
     def test_all_types_are_in_astrbot_whitelist(self) -> None:
         """非法 type 会让 AstrBotConfig 抛 TypeError，插件加载失败。"""
@@ -617,7 +631,9 @@ class TestMetadataFile(unittest.TestCase):
         self.assertTrue(self.meta["short_desc"].strip())
 
     def test_version_is_semver_like(self) -> None:
-        self.assertEqual(self.meta["version"], "0.1.0")
+        # 刻意钉死具体版本号：市场端对 metadata.yaml 的 version 与已提交版本记录
+        # 做精确相等校验，改版本必须是有意识的动作，不能让任何 x.y.z 静默通过。
+        self.assertEqual(self.meta["version"], "0.1.1")
 
 
 if __name__ == "__main__":
