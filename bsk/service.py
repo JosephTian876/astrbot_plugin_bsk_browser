@@ -1,15 +1,15 @@
 """业务编排层 —— ``main.py`` 的每个工具函数都转调这里。
 
 这一层把 ``runner`` / ``session`` / ``pages`` / ``shots`` 拼成完整用例，
-并负责**所有面向模型的文案**（成功摘要、错误提示、下一步建议）。
+并负责所有面向模型的文案（成功摘要、错误提示、下一步建议）。
 
 设计原则：
 
-- **不 import astrbot**：可以脱离框架单测；参数是普通 Python 值，
+- 不 import astrbot：可以脱离框架单测；参数是普通 Python 值，
   不是 ``AstrMessageEvent``。事件相关的处理（权限、发送图片）留在 ``main.py``。
-- **面向模型返回字符串**：工具调用的返回值最终会进 LLM 上下文，
-  所以必须简洁、结构化、且**长度可控**（绝不能把整棵 VOM 树塞进去）。
-- **错误不抛给模型看**：内部捕获 ``BskError``，转成"发生了什么 + 该怎么办"，
+- 面向模型返回字符串：工具调用的返回值最终会进 LLM 上下文，
+  所以必须简洁、结构化、且长度可控（绝不能把整棵 VOM 树塞进去）。
+- 错误不抛给模型看：内部捕获 ``BskError``，转成"发生了什么 + 该怎么办"，
   让模型能自我纠正（例如会话过期后自动重建），而不是看到一段堆栈。
 
 bsk 命令形式全部对照 `_raw-bsk-help.txt` 的真实帮助文本写，不凭记忆。
@@ -55,9 +55,9 @@ logger = logging.getLogger(__name__)
 __all__ = ["BskService", "ActionResult", "ShotPayload"]
 
 
-# --- 各命令的**内置下限建议值**（秒）---
+# --- 各命令的内置下限建议值（秒）---
 #
-# 语义：这些值回答的是"这条命令**至少**需要多久"，它们是**下限**，不是最终超时。
+# 语义：这些值回答的是"这条命令至少需要多久"，它们是下限，不是最终超时。
 # 最终超时只有一个来源 —— ``BskService._timeout()``，规则只有两条：
 #
 #     最终超时 = min( max(内置下限, 用户配置的 command_timeout_sec),
@@ -67,7 +67,7 @@ __all__ = ["BskService", "ActionResult", "ShotPayload"]
 # 第二条整个不生效，行为与加它之前完全一致）。
 #
 # 依据：ARCHITECTURE §5 D6 与实机耗时（observe 0.06-0.09s、navigate 0.62-1.44s）。
-# 下限的第一条原则是**外层超时必须大于 bsk 自身的 --timeout**，否则我们会先把它
+# 下限的第一条原则是外层超时必须大于 bsk 自身的 --timeout，否则我们会先把它
 # 掐掉，而它其实正要成功返回。
 
 TIMEOUT_QUICK = 5.0
@@ -80,30 +80,30 @@ TIMEOUT_ACTION = 30.0
 """click / fill / press 等交互的下限。与 bsk 自身默认 --timeout 30s 对齐。"""
 
 TIMEOUT_EVALUATE = 45.0
-"""``evaluate`` 的下限。**必须大于** bsk 自身默认的 ``--timeout`` 30s。
+"""``evaluate`` 的下限。必须大于 bsk 自身默认的 ``--timeout`` 30s。
 
 与 ``TIMEOUT_NAVIGATE`` 同样的理由（见本模块顶部"下限的第一条原则"）：
-``bsk evaluate`` 自己的 ``--timeout`` 默认就是 **30s**（实测帮助文本
+``bsk evaluate`` 自己的 ``--timeout`` 默认就是 30s（实测帮助文本
 ``--timeout <TIMEOUT>  Hard timeout (default 30s)``）。我们外层只给 30s 的话，
 会在它正要成功返回的瞬间把它掐掉 —— 而超时表现为"这段 JS 跑了太久"，
 用户完全看不出其实是我们的超时预算算错了。所以下限取 45s：比 bsk 自己的
 超时大 15s，留足它把结果写回 stdout 的时间。
 
 Note:
-    这里**不**给 bsk 传 ``--timeout``：让它保持自己的 30s 默认值。
+    这里不给 bsk 传 ``--timeout``：让它保持自己的 30s 默认值。
     这样"bsk 内部超时"与"我们的外层超时"有明确的先后关系（30s 先到，
     报 ``exit=4`` 并带友好提示；45s 只是防止 bsk 卡死的兜底），
     比把两个超时设成同一个值更容易推理。
 """
 
 TIMEOUT_NAVIGATE = 45.0
-"""navigate 的下限。必须 **大于** bsk 自身默认的 30s。"""
+"""navigate 的下限。必须 大于 bsk 自身默认的 30s。"""
 
 TIMEOUT_SCREENSHOT = 30.0
 """视口截图的下限。"""
 
 TIMEOUT_FULLPAGE = 120.0
-"""全页截图的**默认内置下限**（用户没配 ``fullpage_timeout_sec`` 时用它）。
+"""全页截图的默认内置下限（用户没配 ``fullpage_timeout_sec`` 时用它）。
 
 ⚠️ 真正的取值走 ``settings.fullpage_timeout_sec``（默认值就是这里这个数，
 见 :data:`bsk.config.DEFAULT_FULLPAGE_TIMEOUT_SEC`）。本常量现在只承担两个角色：
@@ -111,7 +111,7 @@ TIMEOUT_FULLPAGE = 120.0
 1. 配置缺失/畸形时的兜底；
 2. 启动告警的阈值（"框架上限是否小于全页截图的默认预算"）。
 
-★ 数值从 180 改成 120 是**用户拍的板**：180 秒对实测的 11.72 秒过于宽松
+数值从 180 改成 120 是用户拍的板：180 秒对实测的 11.72 秒过于宽松
 （15 倍余量），而 120 秒既贴着"实测的约 10 倍"这个合理余量，又与 AstrBot
 框架的默认 ``tool_call_timeout``（120 秒）对齐 —— 用户想表达的就是
 "整页截图最多等 2 分钟"。
@@ -123,18 +123,18 @@ TIMEOUT_FULLPAGE = 120.0
     长页面 Wikipedia     全页截图  11.72s / 11.11s / 10.91s（1820x11741，4.5MB）
 
 最慢的一次只用了 11.72 秒，距 120 秒上限约 1/10。所以"必须两处一起调大才能用
-全页截图"是**多余的警告**，默认配置下通常什么都不用改（此前的文档说法就是错的，
+全页截图"是多余的警告，默认配置下通常什么都不用改（此前的文档说法就是错的，
 已更正）。
 
-★ 真正需要处理的是另一件事：**别让框架从外面把我们掐断**。框架上限一旦小于我们的
+真正需要处理的是另一件事：别让框架从外面把我们掐断。框架上限一旦小于我们的
 最终超时，用户看到的会是框架抛的英文 ``tool <name> execution timeout after N
 seconds.``，而不是我们写的中文提示，而且"会话可能留下未完成状态"会被完全掩盖。
 所以 ``BskService._timeout`` 会把最终值钳到"框架上限 − 5 秒"之下
 （见 :data:`bsk.config.FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC`）。框架上限读不到时
 不钳制 —— 那说明我们拿不到事实，就不该凭猜测改行为。
 
-⚠️ 注意这个默认值恰好**等于**框架的默认上限（都是 120），所以默认配置下钳制就会
-生效：实际拿到的是 115 秒。这是**正确行为**，不是缺陷 —— 它保证超时由插件先报出
+⚠️ 注意这个默认值恰好等于框架的默认上限（都是 120），所以默认配置下钳制就会
+生效：实际拿到的是 115 秒。这是正确行为，不是缺陷 —— 它保证超时由插件先报出
 中文提示。启动时会打印一条解释性告警（见 ``BskService.startup_warnings``）。
 """
 
@@ -154,7 +154,7 @@ class ShotPayload:
     """截图的交付物。
 
     ``path`` 给 AstrBot 发送图片用；``for_llm`` 是给模型看的文本描述
-    （**不要把图片二进制塞给模型**，除非用户显式要求看图）。
+    （不要把图片二进制塞给模型，除非用户显式要求看图）。
     """
 
     path: str
@@ -178,7 +178,7 @@ class BskService:
         framework_tool_timeout: 框架（AstrBot）自己的单次工具调用超时（秒），
             由 ``main.py`` 读 ``context.get_config()`` 后传入（见
             :func:`bsk.config.read_framework_tool_timeout`）。``None`` / 非法值
-            都表示"未知"，此时**不做任何钳制**，行为与没有这个参数时完全一致。
+            都表示"未知"，此时不做任何钳制，行为与没有这个参数时完全一致。
     """
 
     def __init__(
@@ -218,7 +218,7 @@ class BskService:
     # ------------------------------------------------------------------
 
     def _timeout(self, builtin: float) -> float:
-        """把内置建议值、用户配置与**框架上限**合成最终超时。
+        """把内置建议值、用户配置与框架上限合成最终超时。
 
         规则只有两条（见模块顶部 ``TIMEOUT_*`` 的说明）::
 
@@ -230,23 +230,23 @@ class BskService:
         - ``settings.command_timeout_sec`` 是"用户愿意等多久"，已经由
           :mod:`bsk.config` 夹取到 ``[5, 110]``。
         - 取较大值，两者都不会被违背。
-        - 最后再与"框架上限 − 安全余量"取较小值：**插件要在框架动手之前自己超时**，
+        - 最后再与"框架上限 − 安全余量"取较小值：插件要在框架动手之前自己超时，
           这样用户看到的是我们写的中文提示（含"该改哪个配置"），而不是框架抛的
           英文 ``tool <name> execution timeout after N seconds.``。
 
-        ★ 框架上限读不到时（``None``）**第二条整个不生效**，结果与加这条规则之前
+        框架上限读不到时（``None``）第二条整个不生效，结果与加这条规则之前
         逐字节相同。理由：读不到说明我们没有事实依据，凭猜测缩短用户愿意等待的
         时间比"可能被框架掐断"更糟。
 
-        ★ 余量的作用与取值理由见 :data:`bsk.config.FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC`：
-        框架从**它开始等**的那一刻计时，而 bsk 返回后我们还要校验截图、渲染中文、
+        余量的作用与取值理由见 :data:`bsk.config.FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC`：
+        框架从它开始等的那一刻计时，而 bsk 返回后我们还要校验截图、渲染中文、
         序列化结果、交给框架发图片 —— 这些都算在同一个窗口里。留 5 秒就不会出现
         "bsk 刚好返回、框架同时掐断"的临界情况。
 
-        ★ 钳制用的那个"上限"本身**不会低于** :data:`bsk.config.FRAMEWORK_TIMEOUT_FLOOR_SEC`：
+        钳制用的那个"上限"本身不会低于 :data:`bsk.config.FRAMEWORK_TIMEOUT_FLOOR_SEC`：
         超时太小比超时更糟（每条命令都在起点被掐死，现象是"插件完全不能用"）。
         用户把框架上限设得极小时，我们宁可自己多等几秒、让它去报那句英文错误 ——
-        也不会把命令压成"秒失败"。注意下限加在**上限**上，所以它只会在真正发生
+        也不会把命令压成"秒失败"。注意下限加在上限上，所以它只会在真正发生
         钳制时起作用，不会把本来就短的命令（例如 5 秒的只读命令）抬高。
 
         Args:
@@ -259,7 +259,7 @@ class BskService:
             这里用 ``getattr`` 而不是 ``self.settings.command_timeout_sec``：
             配置对象可能是测试桩、旧版本的 ``Settings``、或任何"同名属性"的
             鸭子类型对象（``SessionManager`` 出于同样的理由也这么做）。
-            缺属性时**回退到内置下限**，绝不让超时变成 0 或抛 ``AttributeError``
+            缺属性时回退到内置下限，绝不让超时变成 0 或抛 ``AttributeError``
             ——那会把一条本来能成功的命令直接掐死在起点。
         """
         base = self._base_timeout(builtin)
@@ -285,9 +285,9 @@ class BskService:
     def fullpage_budget(self) -> float:
         """全页截图的"用户愿意等多久"（秒），来自 ``settings.fullpage_timeout_sec``。
 
-        这是**用户可调**的那一项（WebUI → 插件配置 → 整页截图超时，默认 120，
+        这是用户可调的那一项（WebUI → 插件配置 → 整页截图超时，默认 120，
         可填 30–600）。它只作用于 ``screenshot --full-page`` 那一条命令；
-        **视口截图不读它**（固定 :data:`TIMEOUT_SCREENSHOT`）。
+        视口截图不读它（固定 :data:`TIMEOUT_SCREENSHOT`）。
 
         Returns:
             用户配置的秒数；配置对象缺这个字段、或取值非法（None / 字符串 /
@@ -296,7 +296,7 @@ class BskService:
             ``Settings``，"缺字段"必须是安全的降级而不是 ``AttributeError``。
 
         Note:
-            这里**只读配置**，不做钳制 —— 钳制统一在 :meth:`_timeout` 里做，
+            这里只读配置，不做钳制 —— 钳制统一在 :meth:`_timeout` 里做，
             保证"最终值永远低于框架上限"这条不变量只有一个实现点。
         """
         configured = getattr(self.settings, "fullpage_timeout_sec", None)
@@ -328,7 +328,7 @@ class BskService:
         由 ``main.py`` 在构造时通过 ``framework_tool_timeout=`` 注入
         （它把 ``self.context.get_config()`` 的结果交给
         :func:`bsk.config.read_framework_tool_timeout` 解析）。
-        本层**不 import astrbot**，只认这个已经归一化好的数值。
+        本层不 import astrbot，只认这个已经归一化好的数值。
 
         所有"长得像配置"的东西都可能被塞进来（测试桩、旧对象、字符串），
         所以这里再过一遍 :func:`bsk.config.as_timeout_seconds`：拿不准就是
@@ -344,17 +344,17 @@ class BskService:
     def startup_warnings(self) -> list[str]:
         """插件启动时要打印的告警（中文，包含"该去改哪个配置项"）。
 
-        只在**真有风险**时才有内容：框架上限已知、且小于或等于全页截图的预算
+        只在真有风险时才有内容：框架上限已知、且小于或等于全页截图的预算
         （``fullpage_budget()``，默认 :data:`TIMEOUT_FULLPAGE` = 120 秒）时提示。
 
-        ★ 默认配置下**这条必然出现**（本机实测框架上限 = 120，与默认预算相等），
-        这是**正确**的：它如实说明"整页截图的预算顶到了框架上限，会被钳成 115 秒"。
-        措辞上刻意**不写成报错**：默认值对实测的 11.72 秒已有约 10 倍余量，
+        默认配置下这条必然出现（本机实测框架上限 = 120，与默认预算相等），
+        这是正确的：它如实说明"整页截图的预算顶到了框架上限，会被钳成 115 秒"。
+        措辞上刻意不写成报错：默认值对实测的 11.72 秒已有约 10 倍余量，
         绝大多数用户什么都不用做。只有极慢的页面/网络才需要同时调大两处。
 
         为什么阈值取"≤ 预算"而不是"≤ 用户配的 command_timeout_sec"：全页截图走的是
         自己那一项（``fullpage_timeout_sec``），与 ``command_timeout_sec`` 的上界
-        （110 秒）无关。反过来，框架上限大于预算时（或读不到时）**一条都不打印**。
+        （110 秒）无关。反过来，框架上限大于预算时（或读不到时）一条都不打印。
 
         Returns:
             告警文案列表（可能为空）。
@@ -370,7 +370,7 @@ class BskService:
             f"{budget:g} 秒）已经顶到 AstrBot 单次工具调用的上限（{limit:g} 秒），"
             f"所以实际生效的是 {clamped}（框架上限减 "
             f"{FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC:g} 秒的安全余量）。"
-            "这不是错误，也**不影响正常使用**：实测长页面整页截图约 11 秒、"
+            "这不是错误，也不影响正常使用：实测长页面整页截图约 11 秒、"
             "短页面约 3 秒（默认 120 秒的预算就有约 10 倍余量），"
             "默认配置下什么都不用改。"
             "这样安排的好处是：万一真的超时，会由插件先报出中文提示"
@@ -401,14 +401,14 @@ class BskService:
         只在用户没有显式配置 ``browser_instance_id`` 时才会被调用。
         返回空串表示"探测不出，让 bsk 自己选默认浏览器"。
 
-        三条分支**必须**分清楚（这是本方法存在的意义）：
+        三条分支必须分清楚（这是本方法存在的意义）：
 
-        - **探测本身失败**（bsk 没装、命令报错、输出不是 JSON）→ 返回空串。
+        - 探测本身失败（bsk 没装、命令报错、输出不是 JSON）→ 返回空串。
           探测是优化，不该阻止会话创建，所以这里静默降级。
-        - **恰好 1 个浏览器** → 返回它的 ``instance_id``，替用户省掉一步配置。
+        - 恰好 1 个浏览器 → 返回它的 ``instance_id``，替用户省掉一步配置。
           这是最常见的场景（实测本机就是这一种），必须保持免配置可用。
-        - **≥2 个浏览器** → 抛 :class:`~bsk.errors.BskBrowserAmbiguous`。
-          **绝不能**返回空串：那等于让 bsk 自己随便挑一个，用户明明连着
+        - ≥2 个浏览器 → 抛 :class:`~bsk.errors.BskBrowserAmbiguous`。
+          绝不能返回空串：那等于让 bsk 自己随便挑一个，用户明明连着
           Edge + Chrome，插件却静默操作其中一个 —— 现象是"有时候对这个、
           有时候对那个"，无从排查。宁可明确报错，把每个实例的 ``instance_id``
           列出来让用户去配置。
@@ -417,7 +417,7 @@ class BskService:
             BskBrowserAmbiguous: 同时连着多个浏览器且用户没有指定用哪一个。
 
         Note:
-            抛"歧义"异常的部分**刻意写在 try 之外**（见 ``_pick_browser_from_probe``）：
+            抛"歧义"异常的部分刻意写在 try 之外（见 ``_pick_browser_from_probe``）：
             上面那个 ``except Exception`` 是给"探测失败"用的，如果歧义异常也被
             它吞掉，就会退化成"静默随机选一个"，正是本次要消灭的行为。
         """
@@ -439,7 +439,7 @@ class BskService:
         except Exception as exc:  # noqa: BLE001 - 探测失败必须静默降级
             logger.debug("浏览器探测失败，交给 bsk 选默认：%r", exc)
             return ""
-        # ★ 走到这里说明探测**成功**了，于是"多浏览器歧义"是一条确定的结论，
+        # 走到这里说明探测成功了，于是"多浏览器歧义"是一条确定的结论，
         #   必须让它抛出去（下面这个方法会抛），不能和上面的失败混为一谈。
         return self._pick_browser_from_probe(data)
 
@@ -458,7 +458,7 @@ class BskService:
             BskBrowserAmbiguous: 有 2 个及以上可用的浏览器实例。
 
         Note:
-            **只有带非空 ``instance_id`` 的实例才算"可用"**：``instance_id``
+            只有带非空 ``instance_id`` 的实例才算"可用"：``instance_id``
             正是用户要填进配置的那个值，空 id 既不能选中、也无法让用户填写。
             所以"1 个可用 + N 个空 id"仍按唯一可用实例处理，而不是报一个
             列不出第二个实例的歧义错误（那样的提示会让用户莫名其妙）。
@@ -489,7 +489,7 @@ class BskService:
         """构造"多个浏览器，无法确定用哪一个"的可操作错误。
 
         文案要求（面向模型，最终会由 ``main.py`` 的 ``except BskError``
-        变成给 LLM 的字符串）：必须让模型知道**去哪个配置项填哪个值**，
+        变成给 LLM 的字符串）：必须让模型知道去哪个配置项填哪个值，
         所以逐条列出 ``instance_id``，并给出配置项的名字。
 
         Note:
@@ -572,7 +572,7 @@ class BskService:
     async def observe(self, key: str) -> PageObservation:
         """读取当前页面的语义结构（VOM）。
 
-        只调 ``observe``，**不调 ``snapshot``** —— 实机验证两者输出逐字节相同，
+        只调 ``observe``，不调 ``snapshot`` —— 实机验证两者输出逐字节相同，
         且都不带截图，同时调用纯属浪费一倍时间。
 
         Note:
@@ -580,8 +580,8 @@ class BskService:
             看一眼页面也是安全的，而且正是用户判断"到底发生了什么"所需要的。
 
         Note:
-            ★ 如果这条命令触发了**会话重建**（原会话被 bsk 空闲回收），
-            返回的页面会是**空白页** —— 实测确认：重建后 ``RootWebArea``
+            如果这条命令触发了会话重建（原会话被 bsk 空闲回收），
+            返回的页面会是空白页 —— 实测确认：重建后 ``RootWebArea``
             没有标题、``text`` 只剩几十个字符、``ref_count=0``。
 
             这一点必须让模型知道，否则它会把"空白页"当成"这个网页本来就
@@ -607,7 +607,7 @@ class BskService:
             # 会话是刚刚重建的，页面状态没有恢复 —— 补一句让模型别误判。
             observation.text = (
                 "（注意：浏览器会话刚刚因空闲过久被回收并自动重建，"
-                "当前是**新开的空白页**，之前打开的网页和填过的内容已经丢失。"
+                "当前是新开的空白页，之前打开的网页和填过的内容已经丢失。"
                 "如果用户之前在浏览某个页面，需要重新用 bsk_open 打开那个网址。）\n"
                 + observation.text
             )
@@ -645,9 +645,9 @@ class BskService:
         命令形式严格对照 bsk 真实帮助文本：
 
         - ``click`` / ``hover`` / ``scroll-to`` / ``focus`` / ``blur``：
-          target 是**位置参数**，可以是 ``@e3``、``e3`` 或 CSS 选择器。
+          target 是位置参数，可以是 ``@e3``、``e3`` 或 CSS 选择器。
         - ``fill``：需要 ``--value``，target 是位置参数。
-        - ``press``：**按键是位置参数**（不是 target），可选 ``--ref`` 指定先聚焦的元素。
+        - ``press``：按键是位置参数（不是 target），可选 ``--ref`` 指定先聚焦的元素。
         - ``select``：需要 ``--value``（可重复），target 是位置参数。
         - ``wheel``：用 ``--delta-x`` / ``--delta-y``。
 
@@ -699,7 +699,7 @@ class BskService:
         """把动作参数翻译成 bsk 命令行参数（不含 --session，由 session 层补）。
 
         Raises:
-            BskError: 动作不支持或缺少必需参数。**在调用 bsk 前就报错**，
+            BskError: 动作不支持或缺少必需参数。在调用 bsk 前就报错，
                 避免把非法参数传给 bsk 换来一个难懂的 clap 错误。
         """
         from .errors import BskError as _Err
@@ -731,7 +731,7 @@ class BskService:
         if action == "press":
             if not key_spec:
                 raise _Err("press 需要 key", friendly="请提供要按下的键，例如 Enter、Escape、Ctrl+A。")
-            # ★ press 的按键是**位置参数**；target 通过 --ref 传入（可选）。
+            # press 的按键是位置参数；target 通过 --ref 传入（可选）。
             argv = ["press", key_spec]
             if target:
                 argv.extend(["--ref", target])
@@ -772,7 +772,7 @@ class BskService:
         """把 bsk 的返回转成一句人话。
 
         大多数交互命令的 JSON 结构没有稳定契约（不同命令字段不同），
-        所以这里**只提取确定存在的字段**，其余交给模型去看下一次 observe。
+        所以这里只提取确定存在的字段，其余交给模型去看下一次 observe。
         """
         note = ""
         changed = False
@@ -792,7 +792,7 @@ class BskService:
     async def evaluate(self, key: str, expression: str) -> EvaluateResult:
         """在页面里执行一段 JavaScript 表达式，返回它的值。
 
-        ⚠️ **这是本插件风险最高的能力**：它在用户**已登录**的页面里跑任意脚本。
+        ⚠️ 这是本插件风险最高的能力：它在用户已登录的页面里跑任意脚本。
         ``main.py`` 那边有三条权限分支挡着（独立开关 + 强制管理员），本方法
         只负责"把命令发出去并正确判读结果"。
 
@@ -800,13 +800,13 @@ class BskService:
 
             bsk evaluate [OPTIONS] --session <SESSION> <EXPRESSION>
 
-        - ``EXPRESSION`` 是**位置参数**（不是 ``--expression``）；
+        - ``EXPRESSION`` 是位置参数（不是 ``--expression``）；
         - ``--await-promise`` 默认 true（Promise 会被 await，实测
           ``Promise.resolve('resolved-value')`` 直接返回值本身）；
         - ``--return-by-value`` 默认 true（拿到的就是普通 JSON 值）；
-        - ``--timeout`` 默认 30s —— 我们**不覆盖它**，理由见 ``TIMEOUT_EVALUATE``。
+        - ``--timeout`` 默认 30s —— 我们不覆盖它，理由见 ``TIMEOUT_EVALUATE``。
 
-        ★★ **本方法存在的最重要理由：JS 抛异常时 bsk 的退出码仍然是 0。**
+        本方法存在的最重要理由：JS 抛异常时 bsk 的退出码仍然是 0。
 
         实测（原文见 ``models.EvaluateError`` 的 docstring）：:
 
@@ -814,10 +814,10 @@ class BskService:
             { "ok": false, "tab_id": ..., "error": {"text": "Error: boom", ...} }
             exit=0
 
-        所以**只看退出码会把失败当成功**，然后拿着一个 ``None`` 或错误的
+        所以只看退出码会把失败当成功，然后拿着一个 ``None`` 或错误的
         ``value`` 去回答用户。判成败必须读返回 JSON 里的 ``ok`` 字段。
         ``SessionManager.execute`` 不会替我们做这件事（它按退出码判成败，
-        对 bsk 的其他命令都是对的），所以这一步必须在**这里**做。
+        对 bsk 的其他命令都是对的），所以这一步必须在这里做。
 
         Args:
             key: 会话键（umo 等）。
@@ -825,28 +825,28 @@ class BskService:
 
         Returns:
             :class:`~bsk.models.EvaluateResult`。``ok=True`` 才代表 JS 真的
-            跑成功了；``ok=False`` 时本方法**抛异常**而不是返回，见下。
+            跑成功了；``ok=False`` 时本方法抛异常而不是返回，见下。
 
         Raises:
             BskError: 分两种情况，``friendly`` 都是给模型看的中文。
 
-                1. **JS 自己抛异常**（进程退出码 0、``ok: false``）—— 这是
+                1. JS 自己抛异常（进程退出码 0、``ok: false``）—— 这是
                    "表达式写错了"，属于用户/模型可以自我纠正的问题，
                    ``friendly`` 里带上 JS 报错原文与行列，便于直接定位；
                 2. bsk 进程本身的失败（超时、会话没了、扩展断了等），
                    由 ``SessionManager.execute`` 按退出码抛出，原样冒泡。
 
         Note:
-            ``allow_uncertain=True``：求值**本身**可能是只读的，但**不是**
+            ``allow_uncertain=True``：求值本身可能是只读的，但不是
             必然只读（模型可以传一段会改页面的 JS）。这里持保守立场 ——
             上一次操作结果未知时，宁愿拒绝执行任意脚本，也不要在一个状态
             不明的页面上跑一段"不知道会做什么"的 JS。理由：不确定态下的
-            脚本很可能是**上一次失败操作的重复**（例如重复提交）。所以这个
-            参数**刻意传 False**（默认值），与 click/fill 同一档。
+            脚本很可能是上一次失败操作的重复（例如重复提交）。所以这个
+            参数刻意传 False（默认值），与 click/fill 同一档。
         """
         result = await self.sessions.execute(
             key,
-            # ★ EXPRESSION 是位置参数；--json 让输出可机器解析。
+            # EXPRESSION 是位置参数；--json 让输出可机器解析。
             lambda sid: ["evaluate", expression, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_EVALUATE),
             # 写类动作的待遇：不确定态下不执行任意 JS（见 docstring 的 Note）。
@@ -856,7 +856,7 @@ class BskService:
 
     @staticmethod
     def _check_evaluate_result(data: Any, expression: str) -> EvaluateResult:
-        """把 ``evaluate`` 的 JSON 载荷收敛成结果，**失败时抛异常**。
+        """把 ``evaluate`` 的 JSON 载荷收敛成结果，失败时抛异常。
 
         抽成静态方法是为了能脱离会话管理单独测试这条判读逻辑 —— 它是整个
         evaluate 功能最容易出错、也最要命的一环。
@@ -871,7 +871,7 @@ class BskService:
         Raises:
             BskError: 载荷里 ``ok`` 不为真，或结构完全不认识。
         """
-        # 载荷不是 dict：说明输出被截断、或 bsk 改了什么。**按失败处理**
+        # 载荷不是 dict：说明输出被截断、或 bsk 改了什么。按失败处理
         # ——绝不能猜成成功，那会把一次未定义的求值当成有返回值。
         if not isinstance(data, dict):
             raise BskError(
@@ -888,7 +888,7 @@ class BskService:
         if evaluation.ok:
             return evaluation
 
-        # --- ★ 走这里 = JS 抛异常了，但**进程退出码是 0** ---
+        # --- 走这里 = JS 抛异常了，但进程退出码是 0 ---
         error = evaluation.error
         detail = error.text.strip() if error and error.text.strip() else ""
         location = error.location() if error else ""
@@ -916,21 +916,21 @@ class BskService:
             message,
             friendly=friendly,
             code="evaluate_js_error",
-            # 退出码是 0（实测），这里显式写成 0 而不是 -1：它就是**进程层面
-            # 成功**、业务层面失败的最好证据，日志里一眼能看出来。
+            # 退出码是 0（实测），这里显式写成 0 而不是 -1：它就是进程层面
+            # 成功、业务层面失败的最好证据，日志里一眼能看出来。
             exit_code=0,
         )
 
     def render_evaluate(self, result: EvaluateResult, expression: str) -> str:
-        """把求值结果渲染成给模型看的文本，并**做长度截断**。
+        """把求值结果渲染成给模型看的文本，并做长度截断。
 
         为什么必须截断：``value`` 是任意 JSON，可以非常大。实测
         ``Array.from({length:2000},(_,i)=>'item-'+i)`` 的命令输出有
-        **32947 个字符**；如果模型写 ``document.body.innerHTML`` 或
+        32947 个字符；如果模型写 ``document.body.innerHTML`` 或
         ``JSON.stringify(localStorage)``，拿到几十万字符也是常事。
         不截断会直接撑爆上下文（与 ``max_page_chars`` 同一个先例）。
 
-        截断上限**复用** ``settings.max_page_chars``：不再新增一个配置项，
+        截断上限复用 ``settings.max_page_chars``：不再新增一个配置项，
         因为用户对这一项的理解（"一次给模型多少字"）正好适用于这里，
         多一个旋钮只会让配置更难理解。
 
@@ -971,14 +971,14 @@ class BskService:
     def _render_dialogs(dialogs: list[Any]) -> str:
         """渲染被自动处理的弹窗。
 
-        ★ 这段文案是**安全提示**，不是装饰：实测 ``confirm`` 会被 bsk 自动
+        这段文案是安全提示，不是装饰：实测 ``confirm`` 会被 bsk 自动
         确认为「确定」（``handled: "accepted"``），也就是说页面本来能让人
         亲自拦一下的那个确认框，在 evaluate 路径上直接消失了。模型必须知道
         这件事，才能在回执里如实告诉用户"这个确认框是被自动点的，不是你点的"。
         """
         parts = [
             f"⚠️ 执行期间页面弹出了 {len(dialogs)} 个对话框，"
-            "已被 bsk **自动处理**（不是用户点的）："
+            "已被 bsk 自动处理（不是用户点的）："
         ]
         for dialog in dialogs[:10]:
             kind = getattr(dialog, "type", "") or "未知类型"
@@ -994,7 +994,7 @@ class BskService:
     def _format_evaluate_value(value: Any) -> str:
         """把 JS 的返回值渲染成文本。
 
-        分三种情况：字符串**原样返回**（不加引号，因为模型读起来最自然）、
+        分三种情况：字符串原样返回（不加引号，因为模型读起来最自然）、
         其余 JSON 用 ``json.dumps`` 美化、无法序列化的对象退回 ``repr``。
 
         Note:
@@ -1040,16 +1040,16 @@ class BskService:
         Note:
             必须自己指定 ``--out``：bsk 默认写到系统 TEMP 且文件名含时间戳，
             我们拿不到确定的路径，也管不了清理。
-            ``--out`` 会**覆盖**已有文件，所以路径必须唯一。
+            ``--out`` 会覆盖已有文件，所以路径必须唯一。
 
         Note:
-            **两条分支的超时来源不同，不要合并**：
+            两条分支的超时来源不同，不要合并：
 
             - 全页截图（``--full-page``）用用户配置的 ``fullpage_timeout_sec``
               （默认 :data:`TIMEOUT_FULLPAGE`，可调到 600 秒）；
             - 视口截图固定用 :data:`TIMEOUT_SCREENSHOT`（30 秒）。
 
-            视口截图不需要用户配置：实测只要 **0.12 秒**，30 秒已有 250 倍余量，
+            视口截图不需要用户配置：实测只要 0.12 秒，30 秒已有 250 倍余量，
             跟着全页截图一起变成 120 秒只会让人误以为"截图都变慢了"。
         """
         directory = self.settings.screenshot_dir or self._default_shot_dir()
@@ -1095,7 +1095,7 @@ class BskService:
         )
 
     def _describe_shot(self, shot: Screenshot, full_page: bool) -> str:
-        """给模型的截图描述。**不返回图片本身**，只描述它。"""
+        """给模型的截图描述。不返回图片本身，只描述它。"""
         kind = "全页截图" if full_page else "视口截图"
         parts = [f"已生成{kind}"]
         if shot.width and shot.height:
@@ -1104,7 +1104,7 @@ class BskService:
             parts.append(f"{shot.byte_size / 1024:.0f} KB")
         text = "，".join(parts) + "。图片已直接发给你。"
         if full_page:
-            # 刻意**不**在这里喊"必须同时调大两处"：实测长页面全页截图约 11 秒，
+            # 刻意不在这里喊"必须同时调大两处"：实测长页面全页截图约 11 秒，
             # 远低于默认预算（见 TIMEOUT_FULLPAGE），正常情况下什么都不用改。
             text += "（全页截图比视口截图慢，长页面通常需要几秒到十几秒。）"
         return text
@@ -1203,7 +1203,7 @@ class BskService:
             实际清理掉的会话数量。
 
         Note:
-            本方法**绝不抛异常**（转发对象的实现已经保证），所以调用方不必
+            本方法绝不抛异常（转发对象的实现已经保证），所以调用方不必
             再套一层 try/except 来防止插件加载失败。
         """
         return await self.sessions.recover_orphans()
@@ -1216,7 +1216,7 @@ class BskService:
         """读取控制台日志。
 
         Note:
-            返回里 ``entries`` 字段**可能整个不存在**（实测），
+            返回里 ``entries`` 字段可能整个不存在（实测），
             ``ConsoleLog.from_json`` 已经处理成空列表。
         """
         result = await self.sessions.execute(
@@ -1231,7 +1231,7 @@ class BskService:
         """读取网络请求日志。
 
         ⚠️ 实测 ``url`` 字段可能内联巨大的 ``data:image/png;base64,...``，
-        渲染给模型时**必须截断**，否则会瞬间吃光上下文。
+        渲染给模型时必须截断，否则会瞬间吃光上下文。
         """
         result = await self.sessions.execute(
             key,
@@ -1256,8 +1256,12 @@ class BskService:
         for entry in log.entries[:limit]:
             url = (entry.url or "")[:url_max]
             if entry.kind == "failure":
-                # failure 条目**没有 status 字段**，只有 error_text。
-                lines.append(f"[{entry.sequence}] 失败 {entry.method} {url}")
+                # failure 条目没有 status 字段，只有 error_text。
+                # 失败原因是这一条唯一有用的信息（如 net::ERR_FAILED），
+                # 不打印它就只剩下"失败了"三个字。
+                reason = (entry.error_text or "").strip()
+                suffix = f" —— {reason}" if reason else ""
+                lines.append(f"[{entry.sequence}] 失败 {entry.method} {url}{suffix}")
             elif entry.level:
                 lines.append(f"[{entry.sequence}] {entry.level}: {entry.text[:300]}")
             else:

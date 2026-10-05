@@ -1,31 +1,31 @@
-"""``bsk/service.py`` 的单元测试 —— 重点是**超时合成规则**。
+"""``bsk/service.py`` 的单元测试 —— 重点是超时合成规则。
 
-背景（这次要修的**真实设计缺陷**）：``service.py`` 曾经在调用处直接写
+背景（这次要修的真实设计缺陷）：``service.py`` 曾经在调用处直接写
 ``timeout=TIMEOUT_OBSERVE`` 这样的硬编码值，用户在插件配置里填的
 ``command_timeout_sec`` 只影响 ``session start`` 那一条命令，其余命令完全不理会它。
 后果是"把超时从 60 调到 110 一点用都没有"，而且 README 不得不写一段绕口的话来解释。
 
-现在的语义只有**一条规则**::
+现在的语义只有一条规则::
 
     最终超时 = max(该命令的内置下限建议值, settings.command_timeout_sec)
 
-- 内置值是"这条命令**至少**需要多久"（例如 ``navigate`` 是 45 秒，必须大于 bsk
+- 内置值是"这条命令至少需要多久"（例如 ``navigate`` 是 45 秒，必须大于 bsk
   自身的 ``--timeout`` 30 秒，否则我们会先把它掐掉）；
 - 用户值是"我愿意等多久"；
 - 取较大值，两者都不会被违背。
 
 本文件因此覆盖三类断言：
 
-1. **规则本身**（``_timeout`` 的纯函数行为），含两条边界保护：
+1. 规则本身（``_timeout`` 的纯函数行为），含两条边界保护：
    用户调到最小 5 秒时 ``navigate`` 仍然是 45；用户调到最大 110 秒时
    ``TIMEOUT_FULLPAGE``（180）不被压低。
-2. **防御性**：配置对象缺少 ``command_timeout_sec`` 属性时回退到内置值，
+2. 防御性：配置对象缺少 ``command_timeout_sec`` 属性时回退到内置值，
    不许抛 ``AttributeError``，也不许把超时算成 0（那会把命令掐死在起点）。
-3. **集成式**：用一个假 runner **记录实际传给子进程的 timeout**，验证
-   ``service.observe()`` 等用例传下去的是**合成后的值**，而不是硬编码的 15。
+3. 集成式：用一个假 runner 记录实际传给子进程的 timeout，验证
+   ``service.observe()`` 等用例传下去的是合成后的值，而不是硬编码的 15。
 
 假 runner 的写法参考 ``tests/test_session.py`` 的 ``FakeRunner``（那个文件不动），
-但这里用**真实的** ``SessionManager``，这样 ``service → session → runner`` 整条
+但这里用真实的 ``SessionManager``，这样 ``service → session → runner`` 整条
 超时透传链路都被覆盖，而不是只测了 service 自己那一层。
 
 pytest 在本机不可用（实测 ``ModuleNotFoundError``），所以用标准库 ``unittest``；
@@ -62,7 +62,7 @@ from bsk.service import (  # noqa: E402
     BskService,
 )
 
-# 被测的全部内置下限建议值。新增一个 TIMEOUT_* 常量时**必须**加进来，
+# 被测的全部内置下限建议值。新增一个 TIMEOUT_* 常量时必须加进来，
 # 否则下面的"单一规则"遍历测试就覆盖不到它。
 ALL_BUILTIN_TIMEOUTS: tuple[float, ...] = (
     TIMEOUT_QUICK,
@@ -115,7 +115,7 @@ class FakeRunner:
     def timeout_for(self, command: str, nth: int = 0) -> float | None:
         """取某个命令第 nth 次调用时实际传入的超时。
 
-        不能用 ``list.index()``：两次 ``observe`` 的参数可能**逐字节相同**，
+        不能用 ``list.index()``：两次 ``observe`` 的参数可能逐字节相同，
         index 永远只会找到第一个。
         """
         matches = [i for i, c in enumerate(self.calls) if self._command_of(c) == command]
@@ -154,7 +154,7 @@ class FakeRunner:
 
 
 def make_settings(**overrides: Any) -> Any:
-    """造一份**真实的** ``Settings``（走 ``parse_settings``，含夹取）。
+    """造一份真实的 ``Settings``（走 ``parse_settings``，含夹取）。
 
     用真类型而不是 ``SimpleNamespace``，是为了让"配置对象字段名漂移"这类
     回归能被测出来（见 ``test_works_with_real_settings_type``）。
@@ -184,24 +184,24 @@ class TestTimeoutRule(unittest.TestCase):
     """``BskService._timeout`` 的合成规则。"""
 
     def test_builtin_wins_when_larger(self) -> None:
-        """★ 内置值大于用户值时取内置：用户设 10，observe 仍是 15。"""
+        """内置值大于用户值时取内置：用户设 10，observe 仍是 15。"""
         service, _ = make_service(make_settings(command_timeout_sec=10.0))
 
         self.assertEqual(service._timeout(TIMEOUT_OBSERVE), TIMEOUT_OBSERVE)
         self.assertEqual(service._timeout(TIMEOUT_OBSERVE), 15.0)
 
     def test_user_wins_when_larger(self) -> None:
-        """★ 用户值大于内置值时取用户：用户设 100，navigate 变成 100。"""
+        """用户值大于内置值时取用户：用户设 100，navigate 变成 100。"""
         service, _ = make_service(make_settings(command_timeout_sec=100.0))
 
         self.assertEqual(service._timeout(TIMEOUT_NAVIGATE), 100.0)
         self.assertNotEqual(service._timeout(TIMEOUT_NAVIGATE), TIMEOUT_NAVIGATE)
 
     def test_min_user_value_still_keeps_navigate_floor(self) -> None:
-        """★ 最关键的一条：用户设最小值 5，``navigate`` 的下限保护仍然生效。
+        """最关键的一条：用户设最小值 5，``navigate`` 的下限保护仍然生效。
 
         这正是老缺陷的反面：以前用户调到 5 也还是 45（但那是硬编码，与配置无关）；
-        现在 45 是**明确的下限语义** —— bsk 自身的 ``--timeout`` 是 30 秒，
+        现在 45 是明确的下限语义 —— bsk 自身的 ``--timeout`` 是 30 秒，
         我们绝不能比它先超时，否则会把它正要成功返回的命令掐掉。
         """
         service, _ = make_service(
@@ -212,11 +212,11 @@ class TestTimeoutRule(unittest.TestCase):
         self.assertEqual(service._timeout(TIMEOUT_NAVIGATE), 45.0)
 
     def test_max_user_value_against_slow_and_fast_commands(self) -> None:
-        """★ 用户设最大值 110：全页截图保留下限；observe 被抬到 110。
+        """用户设最大值 110：全页截图保留下限；observe 被抬到 110。
 
         Note:
             全页截图的下限已按用户拍板从 180 改为 120（见 ``TIMEOUT_FULLPAGE``），
-            所以这里不再断言"180 不被压低"，而是断言它**仍然是 120**：
+            所以这里不再断言"180 不被压低"，而是断言它仍然是 120：
             用户把 command_timeout_sec 拉满（110）也压不动它。
         """
         service, _ = make_service(
@@ -228,7 +228,7 @@ class TestTimeoutRule(unittest.TestCase):
         self.assertEqual(service._timeout(TIMEOUT_OBSERVE), 110.0)
 
     def test_is_exactly_max_for_every_builtin(self) -> None:
-        """★ 只有**一条**规则：对每个内置值与若干用户值都恰好等于 ``max()``。
+        """只有一条规则：对每个内置值与若干用户值都恰好等于 ``max()``。
 
         这条测试是"别把规则改成快命令取 min、慢命令取 max"的护栏 ——
         那种复杂规则对新手无法解释，正是这次要消灭的东西。
@@ -244,7 +244,7 @@ class TestTimeoutRule(unittest.TestCase):
                     )
 
     def test_builtin_is_a_true_floor_for_all_commands(self) -> None:
-        """任何用户取值都不能让最终超时**低于**内置下限。"""
+        """任何用户取值都不能让最终超时低于内置下限。"""
         service, _ = make_service(
             make_settings(command_timeout_sec=COMMAND_TIMEOUT_MIN_SEC)
         )
@@ -290,7 +290,7 @@ class TestTimeoutDefensive(unittest.TestCase):
         return BskService(settings, runner=FakeRunner())
 
     def test_missing_attribute_falls_back_to_builtin(self) -> None:
-        """★ 缺 ``command_timeout_sec`` 属性时回退到内置值，不抛异常。"""
+        """缺 ``command_timeout_sec`` 属性时回退到内置值，不抛异常。"""
         service = self._service_with_raw_settings(types.SimpleNamespace())
 
         for builtin in ALL_BUILTIN_TIMEOUTS:
@@ -303,9 +303,9 @@ class TestTimeoutDefensive(unittest.TestCase):
         self.assertEqual(service._timeout(TIMEOUT_OBSERVE), TIMEOUT_OBSERVE)
 
     def test_junk_values_fall_back_to_builtin(self) -> None:
-        """★ 属性存在但取值荒唐（None/字符串/布尔/nan/inf/0/负数）时回退到内置值。
+        """属性存在但取值荒唐（None/字符串/布尔/nan/inf/0/负数）时回退到内置值。
 
-        重点是**不能变成 0**：超时 0 会让每条命令一启动就被掐死，
+        重点是不能变成 0：超时 0 会让每条命令一启动就被掐死，
         那比"用内置下限"糟糕得多。
         """
         junk_values: tuple[Any, ...] = (
@@ -363,7 +363,7 @@ class TestObserveTimeout(ServiceIntegrationCase):
     """``observe`` 是这次缺陷最典型的受害者（内置 15 秒）。"""
 
     async def test_observe_uses_synthesised_timeout_not_hardcoded(self) -> None:
-        """★ 用户设 100 → observe 实际传下去的是 100，不是硬编码的 15。"""
+        """用户设 100 → observe 实际传下去的是 100，不是硬编码的 15。"""
         service, runner = self.make(command_timeout_sec=100.0)
 
         await service.observe("umo-1")
@@ -402,7 +402,7 @@ class TestEveryCommandTimeout(ServiceIntegrationCase):
         self.assertEqual(runner.timeout_for("observe"), 100.0)
 
     async def test_navigate_floor_with_min_config(self) -> None:
-        """★ 用户设 5 时 navigate 仍是 45 —— 这条命令的下限保护最关键。"""
+        """用户设 5 时 navigate 仍是 45 —— 这条命令的下限保护最关键。"""
         service, runner = self.make(command_timeout_sec=5.0)
 
         await service.open_page("umo-1", "https://example.com")
@@ -432,9 +432,9 @@ class TestEveryCommandTimeout(ServiceIntegrationCase):
         self.assertEqual(runner.timeout_for("screenshot"), 90.0)
 
     async def test_screenshot_fullpage_keeps_its_default_budget(self) -> None:
-        """★ 用户设最大值 110 时，全页截图仍然是它自己的预算（120，不被压低）。
+        """用户设最大值 110 时，全页截图仍然是它自己的预算（120，不被压低）。
 
-        这条同时是"全页截图**不**跟着 command_timeout_sec 走"的回归保护：
+        这条同时是"全页截图不跟着 command_timeout_sec 走"的回归保护：
         它的取值来自独立的 ``fullpage_timeout_sec``（默认 120，见
         ``DEFAULT_FULLPAGE_TIMEOUT_SEC``）。
         """
@@ -499,7 +499,7 @@ class TestEveryCommandTimeout(ServiceIntegrationCase):
 
     async def test_session_start_floor_is_not_lowered_by_service(self) -> None:
         """``session start`` 的超时由 ``SessionManager`` 管（它有自己的下限），
-        但**至少**不能低于用户配置 —— 而它的默认下限就是用户配置。
+        但至少不能低于用户配置 —— 而它的默认下限就是用户配置。
         """
         service, runner = self.make(command_timeout_sec=100.0)
 
@@ -509,7 +509,7 @@ class TestEveryCommandTimeout(ServiceIntegrationCase):
 
 
 class TestTimeoutNeverZeroOrNone(ServiceIntegrationCase):
-    """★ 传给子进程的超时永远是一个正数 —— 这是"每个调用点都改到了"的硬证据。
+    """传给子进程的超时永远是一个正数 —— 这是"每个调用点都改到了"的硬证据。
 
     漏改的调用点会传 ``None``（runner 会退化成它自己的 default_timeout）
     或者硬编码值；``None`` 在这里一律判失败。
@@ -555,13 +555,13 @@ class TestTimeoutNeverZeroOrNone(ServiceIntegrationCase):
 
 
 class TestBuiltinConstants(unittest.TestCase):
-    """内置常量必须**保留**（它们是"下限建议值"，语义比裸数字清晰）。"""
+    """内置常量必须保留（它们是"下限建议值"，语义比裸数字清晰）。"""
 
     def test_constants_still_exist_with_documented_values(self) -> None:
-        """★ 常量不许被删或改数值 —— 它们是 ARCHITECTURE §5 D6 那张表。
+        """常量不许被删或改数值 —— 它们是 ARCHITECTURE §5 D6 那张表。
 
         Note:
-            ``TIMEOUT_FULLPAGE`` 已按用户拍板从 **180 改为 120**：它现在的角色是
+            ``TIMEOUT_FULLPAGE`` 已按用户拍板从 180 改为 120：它现在的角色是
             "用户没配 ``fullpage_timeout_sec`` 时的默认内置下限"，取值与
             ``DEFAULT_FULLPAGE_TIMEOUT_SEC`` 一致（有专门测试钉住这一点）。
         """
@@ -573,7 +573,7 @@ class TestBuiltinConstants(unittest.TestCase):
         self.assertEqual(TIMEOUT_FULLPAGE, 120.0)
 
     def test_navigate_floor_exceeds_bsk_own_timeout(self) -> None:
-        """navigate 的下限必须**大于** bsk 自身默认的 ``--timeout`` 30 秒。
+        """navigate 的下限必须大于 bsk 自身默认的 ``--timeout`` 30 秒。
 
         否则我们会先把它掐掉，而它其实正要成功返回 —— 这是下限存在的理由本身。
         """
@@ -582,14 +582,14 @@ class TestBuiltinConstants(unittest.TestCase):
     def test_fullpage_default_exceeds_plugin_clamp_ceiling(self) -> None:
         """全页截图的默认预算仍然高于 ``command_timeout_sec`` 的夹取上界。
 
-        这条语义**没有变**：即便用户把 command_timeout_sec 拉满（110），
+        这条语义没有变：即便用户把 command_timeout_sec 拉满（110），
         全页截图也用自己那一项（默认 120）。变的是数值来源 —— 现在它是可配置的
         （``fullpage_timeout_sec``），而不是写死的常量。
         """
         self.assertGreater(TIMEOUT_FULLPAGE, COMMAND_TIMEOUT_MAX_SEC)
 
     def test_fullpage_constant_matches_settings_default(self) -> None:
-        """★ ``TIMEOUT_FULLPAGE`` 必须等于 ``Settings.fullpage_timeout_sec`` 的默认值。
+        """``TIMEOUT_FULLPAGE`` 必须等于 ``Settings.fullpage_timeout_sec`` 的默认值。
 
         两者若漂移，会出现"用户什么都没配，但 service 用的值和配置页显示的不一样"
         —— 正是最难排查的那类问题（配置一致性脚本只比对 schema 与 Settings，
@@ -601,9 +601,9 @@ class TestBuiltinConstants(unittest.TestCase):
         self.assertEqual(parse_settings({}).fullpage_timeout_sec, TIMEOUT_FULLPAGE)
 
     def test_works_with_real_settings_type(self) -> None:
-        """★ 用真实 ``Settings`` 跑一遍，钉死"字段名漂移"这种静默故障。
+        """用真实 ``Settings`` 跑一遍，钉死"字段名漂移"这种静默故障。
 
-        ``_timeout`` 是按**名字**读配置的：名字一旦和 ``Settings`` 对不上，
+        ``_timeout`` 是按名字读配置的：名字一旦和 ``Settings`` 对不上，
         就会静默退回内置值（不报错，但用户的配置全部失效）—— 那正是这次
         要修的病。这条测试把它钉住。
         """
@@ -624,24 +624,24 @@ class TestBuiltinConstants(unittest.TestCase):
 
 
 # ======================================================================
-# 5. 多浏览器歧义：**明确报错**，而不是静默随机选一个
+# 5. 多浏览器歧义：明确报错，而不是静默随机选一个
 #
-# 背景（这次要修的**真实体验缺陷**）：``probe_browser()`` 以前只在"恰好 1 个"
+# 背景（这次要修的真实体验缺陷）：``probe_browser()`` 以前只在"恰好 1 个"
 # 时返回 instance_id，其余情况一律返回空串。于是用户同时连着 Edge + Chrome
 #（或同一浏览器的两个 profile）却没配 ``browser_instance_id`` 时，插件不传
 # ``--browser``，bsk 就自己随便挑一个 —— 用户看到的现象是"有时候对这个、
 # 有时候对那个"，既不知道是哪个，也不知道为什么，无从排查。
-# 而 README 早就**声称**"连了好几个时会报错要求你指定"，代码却没实现。
+# 而 README 早就声称"连了好几个时会报错要求你指定"，代码却没实现。
 #
 # 现在的规则（三条分支必须分清，下面逐个钉住）：
 #
-#   1. 探测**失败**（bsk 没装/命令报错/输出不是 JSON）→ 返回空串，静默降级；
-#   2. **恰好 1 个** → 自动返回它的 instance_id（**免配置**，最常见的场景）；
-#   3. **≥2 个且用户没配** → 抛 ``BskBrowserAmbiguous``，列出所有实例；
-#   4. 用户**显式配了** ``browser_instance_id`` → 直接用配置的，
-#      **不做歧义检查**（用户已经明确表态了）。
+#   1. 探测失败（bsk 没装/命令报错/输出不是 JSON）→ 返回空串，静默降级；
+#   2. 恰好 1 个 → 自动返回它的 instance_id（免配置，最常见的场景）；
+#   3. ≥2 个且用户没配 → 抛 ``BskBrowserAmbiguous``，列出所有实例；
+#   4. 用户显式配了 ``browser_instance_id`` → 直接用配置的，
+#      不做歧义检查（用户已经明确表态了）。
 #
-# 假 subprocess：``probe_browser`` 走的是**同步** ``subprocess.run``，
+# 假 subprocess：``probe_browser`` 走的是同步 ``subprocess.run``，
 # 所以这里替换掉 ``subprocess.run`` 本身，而不是真的去执行 bsk
 #（本机可能真的有浏览器连着，测试绝不能依赖这一点，也绝不能碰到它）。
 # ======================================================================
@@ -661,7 +661,7 @@ def browsers_payload(*instances: tuple[str, str]) -> list[dict[str, Any]]:
 
     Args:
         *instances: 若干 ``(instance_id, browser_name)`` 二元组。
-            ``label`` 一律填**空字符串** —— 实测它经常是空的，
+            ``label`` 一律填空字符串 —— 实测它经常是空的，
             而"展示时必须能兜底"正是要测的东西之一。
     """
     return [
@@ -705,7 +705,7 @@ def fake_subprocess_run(
 def browser_id_of(start_call: list[str]) -> str:
     """从 ``session start`` 的参数列表里取出 ``--browser`` 的值。
 
-    返回空串表示**没传** ``--browser``（也就是"交给 bsk 自己选"）。
+    返回空串表示没传 ``--browser``（也就是"交给 bsk 自己选"）。
     """
     if "--browser" not in start_call:
         return ""
@@ -714,14 +714,14 @@ def browser_id_of(start_call: list[str]) -> str:
 
 
 class TestPickBrowserFromProbe(unittest.TestCase):
-    """``BskService._pick_browser_from_probe``：**探测成功**之后的选浏览器规则。
+    """``BskService._pick_browser_from_probe``：探测成功之后的选浏览器规则。
 
     单独抽出来测是因为它是个纯函数：输入 bsk 的 JSON 载荷，输出
     instance_id 或抛歧义异常，完全不碰子进程与浏览器。
     """
 
     def test_zero_browsers_returns_empty_and_never_raises(self) -> None:
-        """★ 0 个浏览器 → 空串（不抛歧义），维持"交给 bsk 自己报错"的现有行为。
+        """0 个浏览器 → 空串（不抛歧义），维持"交给 bsk 自己报错"的现有行为。
 
         不能在这里报歧义：歧义的含义是"有好几个、不知道选哪个"，
         一个都没有时报"请从下面几个里选"会让用户完全摸不着头脑。
@@ -729,7 +729,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
         self.assertEqual(BskService._pick_browser_from_probe([]), "")
 
     def test_single_browser_is_selected_automatically(self) -> None:
-        """★★ 回归保护（本文件最重要的一条）：恰好 1 个 → 自动选中，免配置。
+        """回归保护（本文件最重要的一条）：恰好 1 个 → 自动选中，免配置。
 
         这是最常见的场景（实测本机就只有一个 edge），一旦这里退化成报错，
         所有"本来不用配置就能用"的用户全部被打断 —— 那是比原缺陷更糟的倒退。
@@ -739,10 +739,10 @@ class TestPickBrowserFromProbe(unittest.TestCase):
         self.assertEqual(BskService._pick_browser_from_probe(payload), "c900a3da")
 
     def test_two_browsers_raise_ambiguous_with_both_ids(self) -> None:
-        """★ 2 个且未配置 → 抛歧义异常，且文案里**两个 instance_id 都在**。
+        """2 个且未配置 → 抛歧义异常，且文案里两个 instance_id 都在。
 
         文案里必须有两个 id：只说"有多个浏览器"用户没法照着做，
-        他需要把其中一个**原样复制**到配置里。
+        他需要把其中一个原样复制到配置里。
         """
         payload = browsers_payload(("c900a3da", "edge"), ("ab12cd34", "chrome"))
 
@@ -757,7 +757,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
         self.assertFalse(ctx.exception.retryable)
 
     def test_two_browsers_message_shows_browser_name_not_only_label(self) -> None:
-        """★ label 为空时展示不能崩，且要用 ``browser_name`` 兜底。
+        """label 为空时展示不能崩，且要用 ``browser_name`` 兜底。
 
         实测 ``label`` 经常是空字符串。只依赖 label 的文案会变成
         ``-  (c900a3da)``，用户看不出哪个是 Edge、哪个是 Chrome。
@@ -774,7 +774,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
         self.assertNotIn("-  (", friendly)
 
     def test_label_is_preferred_when_present_but_id_still_shown(self) -> None:
-        """label 非空时用 label 做展示名，但 **instance_id 必须仍然可见**。
+        """label 非空时用 label 做展示名，但 instance_id 必须仍然可见。
 
         用户要复制的是 instance_id；只显示 "工作用的 Chrome" 等于没说。
         """
@@ -792,7 +792,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
         self.assertIn("c900a3da", line)
 
     def test_message_is_actionable(self) -> None:
-        """★ 文案必须可操作：说清"去哪个配置项、填什么"。
+        """文案必须可操作：说清"去哪个配置项、填什么"。
 
         这段文字最终会经 ``main.py`` 的 ``except BskError`` 变成给模型的
         字符串，模型要据此告诉用户去改什么配置 —— 只说"有多个浏览器"
@@ -823,7 +823,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
                 self.assertIn(instance_id, ctx.exception.friendly)
 
     def test_unresponsive_instance_is_marked_but_still_listed(self) -> None:
-        """无响应的实例**照样列出**，但明确标注"不建议选它"。
+        """无响应的实例照样列出，但明确标注"不建议选它"。
 
         刻意不静默过滤掉它：那也是一种"替用户做决定"。它确实连着，
         用户有权知道自己有两个实例，以及该避开哪一个。
@@ -848,7 +848,7 @@ class TestPickBrowserFromProbe(unittest.TestCase):
                 self.assertEqual(BskService._pick_browser_from_probe(junk), "")
 
     def test_entries_without_instance_id_are_ignored(self) -> None:
-        """★ 没有 instance_id 的条目不算"可用的浏览器"。
+        """没有 instance_id 的条目不算"可用的浏览器"。
 
         instance_id 正是用户要填进配置的值：它空的既选不中也填不了，
         拿它去凑"多个"只会报一个列不出第二个实例的歧义错误。
@@ -866,16 +866,16 @@ class TestPickBrowserFromProbe(unittest.TestCase):
 
 
 class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
-    """``probe_browser`` 经**真实** ``SessionManager`` 走的端到端行为。
+    """``probe_browser`` 经真实 ``SessionManager`` 走的端到端行为。
 
     这一组才是真正的回归保护：``session.py`` 的 ``_resolve_browser_instance``
-    出于容错会吞掉探测异常，所以"抛异常"本身**不足以保证**用户能看到 ——
+    出于容错会吞掉探测异常，所以"抛异常"本身不足以保证用户能看到 ——
     必须证明它确实穿过了那一层，而不是被吞成静默降级。
     """
 
     def setUp(self) -> None:
         super().setUp()
-        # 在**没有**任何补丁的情况下，绝不允许真的去执行 bsk。
+        # 在没有任何补丁的情况下，绝不允许真的去执行 bsk。
         # 任何一次真实调用都会撞上这个断言（下面的用例各自按需覆盖它）。
         self._patchers: list[Any] = []
         self._patch_run(mock.Mock(side_effect=AssertionError("不该真的执行 bsk")))
@@ -895,12 +895,12 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
         """让 ``bsk browsers --json`` 返回给定载荷。"""
         self._patch_run(fake_subprocess_run(payload, returncode=returncode))
 
-    # --- 分支 2：恰好 1 个 → 免配置（★ 回归保护）---
+    # --- 分支 2：恰好 1 个 → 免配置（回归保护）---
 
     async def test_single_browser_is_used_without_any_config(self) -> None:
-        """★ 未配置 + 只有 1 个浏览器 → 会话照常建立，并自动带上 --browser。
+        """未配置 + 只有 1 个浏览器 → 会话照常建立，并自动带上 --browser。
 
-        这就是"免配置体验"本身：它**绝不能**因为这次改动变成报错。
+        这就是"免配置体验"本身：它绝不能因为这次改动变成报错。
         """
         self.patch_browsers(browsers_payload(("c900a3da", "edge")))
         service, runner = self.make(browser_instance_id="")
@@ -914,7 +914,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
     # --- 分支 1：0 个 → 静默降级 ---
 
     async def test_zero_browsers_creates_session_without_browser_flag(self) -> None:
-        """★ 0 个浏览器 → 不报歧义，照常建会话且**不传** --browser。
+        """0 个浏览器 → 不报歧义，照常建会话且不传 --browser。
 
         设计选择：这一档维持"交给 bsk 自己报错"的现有行为。bsk 那句
         "没有已连接的浏览器"本身就是准确的诊断，插件在这里另造一句
@@ -929,13 +929,13 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
         self.assertEqual(browser_id_of(start_call), "")
         self.assertNotIn("--browser", start_call)
 
-    # --- 分支 3：≥2 个 → 歧义错误（★ 本次改动的主角）---
+    # --- 分支 3：≥2 个 → 歧义错误（本次改动的主角）---
 
     async def test_two_browsers_raise_ambiguous_through_real_manager(self) -> None:
-        """★★ 2 个且未配置 → 异常必须穿过 ``SessionManager`` 冒到调用方。
+        """2 个且未配置 → 异常必须穿过 ``SessionManager`` 冒到调用方。
 
         ``_resolve_browser_instance`` 里那条 ``except Exception`` 是为了
-        "探测失败不影响建会话"。歧义**不是**探测失败，如果被它一起吞掉，
+        "探测失败不影响建会话"。歧义不是探测失败，如果被它一起吞掉，
         就会退回"不传 --browser、bsk 随便选一个"的老毛病 —— 而且更隐蔽，
         因为异常看起来"处理过了"。这条测试专门钉死这一点。
         """
@@ -968,7 +968,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
     # --- 分支 4：配了就必须尊重配置，不做歧义检查 ---
 
     async def test_configured_browser_wins_even_with_two_connected(self) -> None:
-        """★★ 2 个浏览器但用户配了 id → 用配置的，**不报歧义**。
+        """2 个浏览器但用户配了 id → 用配置的，不报歧义。
 
         用户已经明确表态了。这时再去"检测歧义"就是多管闲事，
         而且会让他刚填好的配置失效 —— 最让人恼火的那种 bug。
@@ -982,7 +982,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
         self.assertEqual(browser_id_of(start_call), "ab12cd34")
 
     async def test_configured_browser_never_even_probes(self) -> None:
-        """★ 配了 id 时**连探测都不该发生**（上面 setUp 的断言会抓住真实调用）。
+        """配了 id 时连探测都不该发生（上面 setUp 的断言会抓住真实调用）。
 
         这既是"尊重配置"，也顺带保证了这种场景下不多花一次子进程开销。
         """
@@ -996,7 +996,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
     # --- 分支 1 的变体：探测本身失败 → 保持原有容错语义 ---
 
     async def test_probe_command_failure_still_creates_session(self) -> None:
-        """★ ``bsk browsers`` 报错（退出码非 0）→ 建会话**照常成功**。
+        """``bsk browsers`` 报错（退出码非 0）→ 建会话照常成功。
 
         这是刻意保留的容错语义：探测只是"帮用户省一步配置"的优化，
         它失败不该让整个插件不可用。
@@ -1036,7 +1036,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
     # --- 调用频率：不许在热路径上多探测 ---
 
     async def test_probe_happens_once_per_session_not_per_command(self) -> None:
-        """★ 探测次数 = 建会话次数，**不**随后续命令增长。
+        """探测次数 = 建会话次数，不随后续命令增长。
 
         ``probe_browser`` 走的是同步 ``subprocess.run``，每次都有真实开销。
         检查必须搭在"建会话的那一次探测"上，绝不能变成每条命令都探一次。
@@ -1076,7 +1076,7 @@ class TestAmbiguousBrowserErrorShape(unittest.TestCase):
         return ctx.exception
 
     def test_is_a_bsk_error_so_main_py_catches_it(self) -> None:
-        """★ 必须是 ``BskError`` 子类。
+        """必须是 ``BskError`` 子类。
 
         ``main.py`` 只捕获 ``BskError`` 来生成给用户的中文提示；
         不是它子类的话会掉进 ``except Exception`` 那条"未预期的错误"分支，
@@ -1095,7 +1095,7 @@ class TestAmbiguousBrowserErrorShape(unittest.TestCase):
         self.assertIn("\n", exc.friendly, "多实例清单需要换行才读得懂")
 
     def test_friendly_text_explains_next_step(self) -> None:
-        """★ ``friendly`` 必须自解释：症状 + 下一步动作，模型要照着转述。"""
+        """``friendly`` 必须自解释：症状 + 下一步动作，模型要照着转述。"""
         friendly = self._make().friendly
 
         self.assertIn("检测到 2 个已连接的浏览器", friendly)
@@ -1114,22 +1114,22 @@ class TestAmbiguousBrowserErrorShape(unittest.TestCase):
 # ======================================================================
 # 6. evaluate（执行任意 JavaScript）—— 高风险能力
 #
-# 背景：``bsk evaluate`` 能在用户**已登录**的页面里跑任意 JS，是本插件风险最高
+# 背景：``bsk evaluate`` 能在用户已登录的页面里跑任意 JS，是本插件风险最高
 # 的能力（默认关闭 + 强制管理员，见 main.py 的 ``_evaluate_denied``）。
 #
-# 本层要钉死的是**判读逻辑**，其中最重要的一条来自实测：
+# 本层要钉死的是判读逻辑，其中最重要的一条来自实测：
 #
-#     ★ JavaScript 抛异常时，bsk 进程的**退出码仍然是 0**。
+#     JavaScript 抛异常时，bsk 进程的退出码仍然是 0。
 #
 #     实测原文（bsk 0.3.2）：
 #         $ bsk evaluate "throw new Error('boom')" --session ycvt --json
 #         { "ok": false, "tab_id": ..., "error": {"text": "Error: boom", ...} }
 #         exit=0
 #
-#     所以只看退出码会把**失败当成功**，然后拿着一个没有值的结构去回答用户。
+#     所以只看退出码会把失败当成功，然后拿着一个没有值的结构去回答用户。
 #     下面 ``TestEvaluateJsErrorWithZeroExit`` 就是这个坑的回归测试。
 #
-# 全部用例都用假 runner，**绝不真的执行 JS**（那会在用户浏览器里跑代码）。
+# 全部用例都用假 runner，绝不真的执行 JS（那会在用户浏览器里跑代码）。
 # ======================================================================
 
 from bsk.errors import (  # noqa: E402
@@ -1149,7 +1149,7 @@ from bsk.service import TIMEOUT_EVALUATE, BskService  # noqa: E402,F811
 class EvaluateFakeRunner:
     """可编排返回值的假 runner：专门给 evaluate 用例用。
 
-    与上面的 ``FakeRunner`` 分开写（而不是改它）是为了**不动既有测试**：
+    与上面的 ``FakeRunner`` 分开写（而不是改它）是为了不动既有测试：
     那个类的返回值是按命令名硬编码的，而这里需要"按用例指定任意载荷"。
     """
 
@@ -1174,7 +1174,7 @@ class EvaluateFakeRunner:
         self.timeouts.append(timeout)
         if self.raises is not None:
             raise self.raises
-        # ★ 建会话永远返回真实形状的 start 载荷，与 payload 无关 ——
+        # 建会话永远返回真实形状的 start 载荷，与 payload 无关 ——
         #   否则 evaluate 的载荷会被当成 session start 的返回，会话建不起来。
         if args[:2] == ["session", "start"]:
             data: Any = {"session_id": "mnaa", "browser_instance_id": "c900a3da"}
@@ -1210,7 +1210,7 @@ class TestEvaluateSuccess(EvaluateServiceCase):
     """``ok: true`` 的成功载荷 → 返回结果对象，不抛异常。"""
 
     async def test_returns_value_from_ok_payload(self) -> None:
-        """★ 实测成功原文：``{"ok": true, "tab_id": ..., "value": 2}``。"""
+        """实测成功原文：``{"ok": true, "tab_id": ..., "value": 2}``。"""
         service, _ = self.make({"ok": True, "tab_id": 1398286752, "value": 2})
 
         result = await service.evaluate("umo-1", "1+1")
@@ -1222,7 +1222,7 @@ class TestEvaluateSuccess(EvaluateServiceCase):
         self.assertEqual(result.tab_id, 1398286752)
 
     async def test_expression_is_positional_argument(self) -> None:
-        """★ ``EXPRESSION`` 必须是**位置参数**（实测帮助文本如此）。"""
+        """``EXPRESSION`` 必须是位置参数（实测帮助文本如此）。"""
         service, runner = self.make({"ok": True, "value": "Example Domain"})
 
         await service.evaluate("umo-1", "document.title")
@@ -1236,7 +1236,7 @@ class TestEvaluateSuccess(EvaluateServiceCase):
         self.assertNotIn("--expression", call)
 
     async def test_undefined_value_is_reported_as_no_value(self) -> None:
-        """★ 实测：求值成 undefined 时 bsk **整个省掉** ``value`` 字段。
+        """实测：求值成 undefined 时 bsk 整个省掉 ``value`` 字段。
 
         这时 ``has_value`` 必须是 False —— 否则渲染出来的会是 "返回值：None"，
         模型会以为脚本真的返回了一个 null。
@@ -1270,13 +1270,13 @@ class TestEvaluateSuccess(EvaluateServiceCase):
         self.assertNotIn('"Example Domain"', rendered)
 
 
-# --- 6.2 ★★ 最关键：JS 抛异常但退出码为 0 -------------------------------
+# --- 6.2 最关键：JS 抛异常但退出码为 0 -------------------------------
 
 
 class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
-    """★★ 本功能**最容易漏掉**的用例：退出码 0 不等于成功。
+    """本功能最容易漏掉的用例：退出码 0 不等于成功。
 
-    bsk 的 ``evaluate`` 在 JS 抛异常时返回 ``ok: false``，但**进程退出码是 0**。
+    bsk 的 ``evaluate`` 在 JS 抛异常时返回 ``ok: false``，但进程退出码是 0。
     如果实现只看退出码（``SessionManager.execute`` 就是这么判的，对别的命令都对），
     这次失败会被当成成功，模型会拿着一个空值编答案。
 
@@ -1288,7 +1288,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
     """
 
     async def test_throw_is_failure_despite_exit_code_zero(self) -> None:
-        """★ 实测原文：exit=0，但 ``ok: false`` 且带 error 结构。"""
+        """实测原文：exit=0，但 ``ok: false`` 且带 error 结构。"""
         payload = {
             "ok": False,
             "tab_id": 1398286752,
@@ -1304,7 +1304,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
             await service.evaluate("umo-1", "throw new Error('boom')")
 
         exc = ctx.exception
-        # 关键断言：它被**判为失败**，而不是返回一个 ok=True 的结果。
+        # 关键断言：它被判为失败，而不是返回一个 ok=True 的结果。
         self.assertEqual(exc.code, "evaluate_js_error")
         # 退出码就是 0 —— 这正是"不能只看退出码"的证据。
         self.assertEqual(exc.exit_code, 0)
@@ -1350,7 +1350,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
         self.assertIn("SyntaxError", ctx.exception.friendly)
 
     async def test_js_error_does_not_retry_or_rebuild_session(self) -> None:
-        """★ JS 报错**不是**会话故障：不许触发会话重建/重试。
+        """JS 报错不是会话故障：不许触发会话重建/重试。
 
         会话层的重试只应该由 ``not_found`` / ``session_busy`` 触发。JS 自己
         写错了是确定性的，重试一百次结果一样，只会白花一次往返。
@@ -1379,7 +1379,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
         self.assertIn("重试", ctx.exception.friendly)
 
     async def test_unknown_payload_shape_is_failure_not_success(self) -> None:
-        """★ 拿不到 ``ok`` 字段时按**失败**处理（宁可误报失败，不可误报成功）。"""
+        """拿不到 ``ok`` 字段时按失败处理（宁可误报失败，不可误报成功）。"""
         for junk in ({}, {"unexpected": 1}, [], "not json", None):
             service, _ = self.make(junk)
             with self.subTest(payload=junk):
@@ -1387,7 +1387,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
                     await service.evaluate("umo-1", "document.title")
 
     async def test_missing_ok_field_is_failure(self) -> None:
-        """有 ``value`` 但**没有** ``ok``：结构不完整，不能当成成功。"""
+        """有 ``value`` 但没有 ``ok``：结构不完整，不能当成成功。"""
         service, _ = self.make({"value": 2, "tab_id": 1})
 
         with self.assertRaises(BskError):
@@ -1398,7 +1398,7 @@ class TestEvaluateJsErrorWithZeroExit(EvaluateServiceCase):
 
 
 class TestEvaluateTruncation(EvaluateServiceCase):
-    """★ JS 可以返回巨大对象，不截断会撑爆模型上下文。"""
+    """JS 可以返回巨大对象，不截断会撑爆模型上下文。"""
 
     async def test_huge_array_is_truncated(self) -> None:
         """实测 ``Array.from({length:2000},...)`` 的命令输出有 32947 字符。
@@ -1472,7 +1472,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
     """超时/会话失效等错误必须保持既有分类语义（由 session 层抛出）。"""
 
     async def test_timeout_is_classified_as_bsk_timeout(self) -> None:
-        """★ 超时必须归类成 ``BskTimeout``，``friendly`` 是给模型看的中文。
+        """超时必须归类成 ``BskTimeout``，``friendly`` 是给模型看的中文。
 
         实测 bsk 自己超时报 ``exit=4``、``code: "timeout"``：
             { "code": "timeout", "message": "tool RPC timed out after 2s",
@@ -1530,7 +1530,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
         self.assertEqual(result.value, "recovered")
 
     async def test_uses_synthesised_timeout_with_floor(self) -> None:
-        """★ evaluate 遵守唯一的超时规则：max(TIMEOUT_EVALUATE, 用户配置)。"""
+        """evaluate 遵守唯一的超时规则：max(TIMEOUT_EVALUATE, 用户配置)。"""
         service, runner = self.make({"ok": True, "value": 1}, command_timeout_sec=5.0)
 
         await service.evaluate("umo-1", "1+1")
@@ -1539,7 +1539,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
         self.assertEqual(TIMEOUT_EVALUATE, 45.0)
 
     async def test_evaluate_floor_exceeds_bsk_own_timeout(self) -> None:
-        """★ 下限必须**大于** bsk 自身默认的 ``--timeout 30s``。
+        """下限必须大于 bsk 自身默认的 ``--timeout 30s``。
 
         否则我们会先把它掐掉，而它正要成功返回 —— 与 ``navigate`` 同一条原则。
         """
@@ -1554,7 +1554,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
         self.assertEqual(runner.timeouts[-1], 100.0)
 
     async def test_follows_single_rule_for_all_builtins(self) -> None:
-        """★ 与既有测试同一条护栏：evaluate 也只是 ``max(内置, 用户)`` 的一个实例。"""
+        """与既有测试同一条护栏：evaluate 也只是 ``max(内置, 用户)`` 的一个实例。"""
         for user_value in (5.0, 30.0, 45.0, 60.0, 110.0):
             service, _ = self.make({"ok": True, "value": 1}, command_timeout_sec=user_value)
             with self.subTest(user=user_value):
@@ -1563,7 +1563,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
                 )
 
     async def test_does_not_pass_bsk_timeout_flag(self) -> None:
-        """★ 不给 bsk 传 ``--timeout``：让它保持自己的 30s 默认值。
+        """不给 bsk 传 ``--timeout``：让它保持自己的 30s 默认值。
 
         这样"bsk 内部超时"与"我们的外层超时"有明确先后关系（见 TIMEOUT_EVALUATE）。
         """
@@ -1578,7 +1578,7 @@ class TestEvaluateErrors(EvaluateServiceCase):
 
 
 class TestEvaluateDialogs(EvaluateServiceCase):
-    """★ 实测：``evaluate`` 会自动**确认**页面的 confirm 弹窗。
+    """实测：``evaluate`` 会自动确认页面的 confirm 弹窗。
 
     实测原文：
         $ bsk evaluate "confirm('bsk-evaluate-probe')" --session ycvt --json
@@ -1586,7 +1586,7 @@ class TestEvaluateDialogs(EvaluateServiceCase):
           "dialogs": [{"type": "confirm", "message": "bsk-evaluate-probe",
                        "handled": "accepted", ...}] }
 
-    ``handled: "accepted"`` 意味着页面本来能让人亲自拦一下的确认框**消失了**。
+    ``handled: "accepted"`` 意味着页面本来能让人亲自拦一下的确认框消失了。
     这必须显式告诉模型，否则它会以为"用户点了确定"。
     """
 
@@ -1620,7 +1620,7 @@ class TestEvaluateDialogs(EvaluateServiceCase):
         self.assertEqual(dialog.handled, "accepted")
 
     async def test_rendered_text_warns_dialog_was_auto_handled(self) -> None:
-        """★ 渲染必须点明"自动处理、不是用户点的" —— 这是安全信息。"""
+        """渲染必须点明"自动处理、不是用户点的" —— 这是安全信息。"""
         service, _ = self.make(
             {
                 "ok": True,
@@ -1639,7 +1639,7 @@ class TestEvaluateDialogs(EvaluateServiceCase):
         self.assertIn("不是用户点的", rendered)
 
     async def test_no_dialogs_field_is_fine(self) -> None:
-        """★ 实测：没有弹窗时 ``dialogs`` 字段**整个不存在**。"""
+        """实测：没有弹窗时 ``dialogs`` 字段整个不存在。"""
         service, _ = self.make({"ok": True, "value": 2})
 
         result = await service.evaluate("umo-1", "1+1")
@@ -1674,7 +1674,7 @@ class TestEvaluateRenderShape(EvaluateServiceCase):
         self.assertIn("1", rendered)
 
     async def test_undefined_is_explained_not_printed_as_none(self) -> None:
-        """★ 不能给模型看 "返回值：None"（Python 的字面量）——那会误导它。"""
+        """不能给模型看 "返回值：None"（Python 的字面量）——那会误导它。"""
         service, _ = self.make({"ok": True})
 
         result = await service.evaluate("umo-1", "undefined")
@@ -1684,7 +1684,7 @@ class TestEvaluateRenderShape(EvaluateServiceCase):
         self.assertNotIn("None", rendered)
 
     async def test_non_serialisable_value_does_not_crash(self) -> None:
-        """★ 实测 ``document.body`` 返回 ``{}``（DOM 节点无法按值序列化），
+        """实测 ``document.body`` 返回 ``{}``（DOM 节点无法按值序列化），
         但载荷仍可能是任何东西。渲染绝不能抛异常 —— 脚本已经执行过了。
         """
         class Weird:
@@ -1730,7 +1730,7 @@ class TestEvaluateModels(unittest.TestCase):
         self.assertIsNone(result.error)
 
     def test_error_location_omits_meaningless_zero_column(self) -> None:
-        """★ 实测 ``column`` 经常是 0 —— 别渲染成"第 1 行第 0 列"。"""
+        """实测 ``column`` 经常是 0 —— 别渲染成"第 1 行第 0 列"。"""
         error = EvaluateError.from_json({"text": "Error: boom", "line": 1, "column": 0})
 
         self.assertNotIn("第 0 列", error.location())
@@ -1754,7 +1754,7 @@ class TestEvaluateModels(unittest.TestCase):
 # ======================================================================
 # 7. 框架上限钳制：别被 AstrBot 从外面掐断
 #
-# 背景（这次要修的第二个**真实**问题，与文档错误是两件事）：
+# 背景（这次要修的第二个真实问题，与文档错误是两件事）：
 #
 #   ● 文档错误（已被实测推翻）：README/ARCHITECTURE 曾写"全页截图必须同时调大
 #     插件的 command_timeout_sec 与 AstrBot 的 tool_call_timeout"。实测长页面
@@ -1762,11 +1762,11 @@ class TestEvaluateModels(unittest.TestCase):
 #     而框架默认上限是 120 秒 —— 只用了约 1/10，留了 108 秒余量。所以那条警告
 #     在实践中是多余的，已从文档里删掉。
 #
-#   ● 真实问题（本段要钉住的）：插件给全页截图准备的最终超时是 **180 秒**，
+#   ● 真实问题（本段要钉住的）：插件给全页截图准备的最终超时是 180 秒，
 #     而框架默认只等 120 秒。于是插件允许自己等 180 秒，框架却在 120 秒时把它
 #     掐断 —— 用户看到的是框架抛的英文
 #     `tool <name> execution timeout after 120 seconds.`，
-#     **而不是插件精心写的中文提示**（"网页响应太慢……该改哪个配置"）。
+#     而不是插件精心写的中文提示（"网页响应太慢……该改哪个配置"）。
 #     这既难懂，也让"会话可能留下未完成状态"这件事被掩盖。
 #
 # 修法（插件侧，不要求用户改任何配置）：
@@ -1774,10 +1774,10 @@ class TestEvaluateModels(unittest.TestCase):
 #     最终超时 = min( max(内置下限, 用户配置), 框架上限 - 安全余量 )
 #
 # 三条不变量（下面逐个钉死）：
-#   1. 框架上限**已知**时，最终超时严格低于它（不会被框架抢先掐断）；
-#   2. 框架上限**未知**（None / 读不到 / 结构畸形）时，结果与改动前逐字节相同
+#   1. 框架上限已知时，最终超时严格低于它（不会被框架抢先掐断）；
+#   2. 框架上限未知（None / 读不到 / 结构畸形）时，结果与改动前逐字节相同
 #      —— 拿不到事实就不该凭猜测缩短用户愿意等待的时间；
-#   3. 钳制**不会低于**一个合理下限（否则退化成"秒失败"，比超时更糟）。
+#   3. 钳制不会低于一个合理下限（否则退化成"秒失败"，比超时更糟）。
 # ======================================================================
 
 from bsk.config import (  # noqa: E402
@@ -1791,7 +1791,7 @@ def make_clamped_service(
 ) -> tuple[BskService, FakeRunner]:
     """构造注入了框架上限的服务 + 假 runner。
 
-    与上面的 ``make_service`` 分开写（而不是改它）是为了**不动既有测试**：
+    与上面的 ``make_service`` 分开写（而不是改它）是为了不动既有测试：
     那个函数没有"框架上限"这个形参，而既有用例必须继续按老方式构造
     （等价于"框架上限未知"，行为不变）。
 
@@ -1817,7 +1817,7 @@ class TestFrameworkTimeoutClamp(unittest.TestCase):
     """框架上限已知时，最终超时被钳到上限以下。"""
 
     def test_fullpage_is_clamped_below_framework_limit(self) -> None:
-        """★ 核心用例：框架 120 秒时，全页截图的 180 秒被钳到 115 秒。"""
+        """核心用例：框架 120 秒时，全页截图的 180 秒被钳到 115 秒。"""
         service = BskService(
             make_settings(command_timeout_sec=110.0),
             runner=FakeRunner(),
@@ -1845,7 +1845,7 @@ class TestFrameworkTimeoutClamp(unittest.TestCase):
         self.assertGreaterEqual(FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC, 1.0)
 
     def test_short_commands_are_not_touched_when_below_the_ceiling(self) -> None:
-        """★ 钳制只压"本来就超限"的命令，不动其他的（observe 仍是 110）。"""
+        """钳制只压"本来就超限"的命令，不动其他的（observe 仍是 110）。"""
         service = BskService(
             make_settings(command_timeout_sec=110.0),
             runner=FakeRunner(),
@@ -1894,7 +1894,7 @@ class TestFrameworkTimeoutClamp(unittest.TestCase):
 
 
 class TestFrameworkTimeoutUnknown(unittest.TestCase):
-    """★ 框架上限未知时，行为与改动前**逐字节相同**（不许凭猜测缩短超时）。"""
+    """框架上限未知时，行为与改动前逐字节相同（不许凭猜测缩短超时）。"""
 
     JUNK_LIMITS: tuple[Any, ...] = (
         None,
@@ -1919,13 +1919,13 @@ class TestFrameworkTimeoutUnknown(unittest.TestCase):
         )
 
     def test_none_keeps_old_behaviour_exactly(self) -> None:
-        """★ 不传框架上限：结果与 ``max(内置下限, 用户配置)`` 完全一致。"""
+        """不传框架上限：结果与 ``max(内置下限, 用户配置)`` 完全一致。"""
         service = self._service(None)
 
         for builtin in ALL_BUILTIN_TIMEOUTS:
             with self.subTest(builtin=builtin):
                 self.assertEqual(service._timeout(builtin), max(builtin, 110.0))
-        # 全页截图仍然是它自己的预算（120）—— 读不到框架上限就**不**缩短它。
+        # 全页截图仍然是它自己的预算（120）—— 读不到框架上限就不缩短它。
         self.assertEqual(service._timeout(TIMEOUT_FULLPAGE), TIMEOUT_FULLPAGE)
         self.assertEqual(service._timeout(TIMEOUT_FULLPAGE), 120.0)
 
@@ -1953,7 +1953,7 @@ class TestFrameworkTimeoutUnknown(unittest.TestCase):
 
         Note:
             期望值是 ``min(builtin, 115)`` 而不是 ``min(builtin, 115)`` 再抬到下限：
-            钳制的下限（10 秒）加在**上限**上，不会把本来就短的命令抬高 ——
+            钳制的下限（10 秒）加在上限上，不会把本来就短的命令抬高 ——
             5 秒的只读命令仍然拿 5 秒。这是刻意的：下限是为了防止钳制把命令
             压成"秒失败"，不是为了给短命令加时间。
         """
@@ -1966,7 +1966,7 @@ class TestFrameworkTimeoutUnknown(unittest.TestCase):
         for builtin in ALL_BUILTIN_TIMEOUTS:
             with self.subTest(builtin=builtin):
                 self.assertEqual(service._timeout(builtin), min(builtin, 115.0))
-        # 5 秒的只读命令**不该**被抬高到 10 秒。
+        # 5 秒的只读命令不该被抬高到 10 秒。
         self.assertEqual(service._timeout(TIMEOUT_QUICK), 5.0)
 
     def test_none_limit_equals_no_parameter(self) -> None:
@@ -1988,7 +1988,7 @@ class TestFrameworkTimeoutUnknown(unittest.TestCase):
 
 
 class TestFrameworkTimeoutFloor(unittest.TestCase):
-    """★ 钳制不得把超时压到"秒失败"级别。"""
+    """钳制不得把超时压到"秒失败"级别。"""
 
     def test_tiny_framework_limit_does_not_go_below_floor(self) -> None:
         """框架上限 12 秒时，公式会算出 7，但最终值是下限 10。"""
@@ -2056,7 +2056,7 @@ class TestFrameworkTimeoutCeiling(unittest.TestCase):
 
 
 class TestFrameworkTimeoutStartupWarning(unittest.TestCase):
-    """启动告警：**只在真有风险时**才提示（不吓唬用户，也不隐瞒极端情况）。"""
+    """启动告警：只在真有风险时才提示（不吓唬用户，也不隐瞒极端情况）。"""
 
     def _service(self, limit: Any) -> BskService:
         return BskService(
@@ -2066,10 +2066,10 @@ class TestFrameworkTimeoutStartupWarning(unittest.TestCase):
         )
 
     def test_default_120_seconds_warns(self) -> None:
-        """★ 默认配置必然告警：框架 120 = 全页截图预算 120 → 会被钳到 115。
+        """默认配置必然告警：框架 120 = 全页截图预算 120 → 会被钳到 115。
 
         这正是它该做的事（用户明确确认过）：如实说明"预算顶到了框架上限"，
-        同时说明**默认值已足够**（实测最长 11.7 秒），不要让人以为出了故障。
+        同时说明默认值已足够（实测最长 11.7 秒），不要让人以为出了故障。
         """
         warnings = self._service(120.0).startup_warnings()
 
@@ -2083,10 +2083,10 @@ class TestFrameworkTimeoutStartupWarning(unittest.TestCase):
         self.assertIn("不影响正常使用", text)
 
     def test_warning_does_not_read_like_an_error(self) -> None:
-        """★ 告警措辞必须读起来像解释，不像报错（用户明确要求）。
+        """告警措辞必须读起来像解释，不像报错（用户明确要求）。
 
         因为它默认必然出现 —— 如果写成"失败/异常"，所有用户一装就以为坏了。
-        注意"错误"这个词**只允许**出现在"这不是错误"这种否定句里，所以这里
+        注意"错误"这个词只允许出现在"这不是错误"这种否定句里，所以这里
         先断言否定句存在，再检查其余告警词一个都不出现。
         """
         text = self._service(120.0).startup_warnings()[0]
@@ -2128,7 +2128,7 @@ class TestFrameworkTimeoutStartupWarning(unittest.TestCase):
 
         self.assertIn("中文提示", text)
         self.assertIn("重启", text)
-        # 必须说明我们**已经**做了什么（钳制到 115），否则用户以为插件没处理。
+        # 必须说明我们已经做了什么（钳制到 115），否则用户以为插件没处理。
         self.assertIn("115", text)
         # 必须点名插件里的那一项，用户才知道第二处该动哪里。
         self.assertIn("fullpage_timeout_sec", text)
@@ -2140,7 +2140,7 @@ class TestFrameworkTimeoutStartupWarning(unittest.TestCase):
 
 
 class TestFrameworkClampReachesSubprocess(ServiceIntegrationCase):
-    """★ 钳制不能只停在 ``_timeout()`` 里 —— 实际传给子进程的必须是钳制后的值。"""
+    """钳制不能只停在 ``_timeout()`` 里 —— 实际传给子进程的必须是钳制后的值。"""
 
     def make_clamped(
         self, framework_limit: Any, **overrides: Any
@@ -2182,7 +2182,7 @@ class TestFrameworkClampReachesSubprocess(ServiceIntegrationCase):
 
         Note:
             ``session start`` 那条命令由 ``SessionManager`` 管（它有自己的一套
-            预算推导，见 ``session.START_TIMEOUT_FLOOR_SEC``），**不经过**
+            预算推导，见 ``session.START_TIMEOUT_FLOOR_SEC``），不经过
             ``service._timeout()``，所以不在本断言的范围内 —— 这里只钉
             "由 service 合成超时的那些命令"。
         """
@@ -2207,24 +2207,24 @@ class TestFrameworkClampReachesSubprocess(ServiceIntegrationCase):
 
 
 # ======================================================================
-# 8. `fullpage_timeout_sec`：整页截图的超时**可配置**
+# 8. `fullpage_timeout_sec`：整页截图的超时可配置
 #
 # 背景（用户拍板的新需求）：
 #
-#   ● 整页截图的内置下限从硬编码的 180 秒改为**可配置的** 120 秒默认值
+#   ● 整页截图的内置下限从硬编码的 180 秒改为可配置的 120 秒默认值
 #     （`settings.fullpage_timeout_sec`，范围 30–600）；
 #   ● 改小是因为 180 秒对实测的 11.72 秒过于宽松（15 倍余量），120 秒既贴着
 #     "约 10 倍余量"这个合理值，又与框架默认上限对齐（用户想表达的是"最多 2 分钟"）；
 #   ● 上限给到 600 秒，让放宽了框架 `tool_call_timeout` 的用户能真的用上更大的值。
 #
-# 本段要钉死三条**容易写错**的点：
-#   1. 全页截图读的是**配置项**，不是硬编码常量（否则用户改了没用）；
-#   2. **视口截图完全不受这个配置影响**（回归保护：这是最容易连带改坏的地方，
+# 本段要钉死三条容易写错的点：
+#   1. 全页截图读的是配置项，不是硬编码常量（否则用户改了没用）；
+#   2. 视口截图完全不受这个配置影响（回归保护：这是最容易连带改坏的地方，
 #      视口截图实测只要 0.12 秒，跟着变成 120 秒纯属误伤）；
 #   3. 配置项自己也要被夹取（30–600），越界值不能变成"永不超时"或"秒失败"。
 #
-# 另外还要钉住用户明确提出的**语义区分**：
-#   这一项管的是"调用浏览器这段最多等多久"，**与模型出 token 的快慢无关**
+# 另外还要钉住用户明确提出的语义区分：
+#   这一项管的是"调用浏览器这段最多等多久"，与模型出 token 的快慢无关
 #   —— 框架的 tool_call_timeout 同样不包含模型生成时间。文档里不能说
 #   "调大它能让慢模型不出错"（那是错的），本段用文案断言把这条守住。
 # ======================================================================
@@ -2246,7 +2246,7 @@ class TestFullpageTimeoutIsConfigurable(unittest.TestCase):
         self.assertEqual(parse_settings({}).fullpage_timeout_sec, 120.0)
 
     def test_user_value_is_used(self) -> None:
-        """★ 用户配 300（并放宽了框架上限）时，全页截图真的拿到 300。"""
+        """用户配 300（并放宽了框架上限）时，全页截图真的拿到 300。"""
         service = BskService(
             make_settings(fullpage_timeout_sec=300.0),
             runner=FakeRunner(),
@@ -2267,7 +2267,7 @@ class TestFullpageTimeoutIsConfigurable(unittest.TestCase):
         self.assertEqual(service._timeout(service.fullpage_budget()), 90.0)
 
     def test_config_value_is_clamped_to_the_allowed_range(self) -> None:
-        """★ 越界值被夹到 ``[30, 600]``（不是原样使用）。"""
+        """越界值被夹到 ``[30, 600]``（不是原样使用）。"""
         cases = (
             (1.0, FULLPAGE_TIMEOUT_MIN_SEC),
             (0.0, FULLPAGE_TIMEOUT_MIN_SEC),
@@ -2297,7 +2297,7 @@ class TestFullpageTimeoutIsConfigurable(unittest.TestCase):
         )
 
     def test_budget_reads_config_not_a_hardcoded_constant(self) -> None:
-        """★ 字段名漂移会把用户配置静默吞掉 —— 这条按**名字**钉住它。"""
+        """字段名漂移会把用户配置静默吞掉 —— 这条按名字钉住它。"""
         from dataclasses import fields as _fields
 
         from bsk.config import Settings as _Settings
@@ -2330,13 +2330,13 @@ class TestFullpageTimeoutIsConfigurable(unittest.TestCase):
 
 
 class TestViewportScreenshotUnaffected(unittest.TestCase):
-    """★ 回归保护：``fullpage_timeout_sec`` **绝不能**影响视口截图。"""
+    """回归保护：``fullpage_timeout_sec`` 绝不能影响视口截图。"""
 
     def test_viewport_ignores_the_fullpage_setting(self) -> None:
-        """★ 改 ``fullpage_timeout_sec`` **不影响**视口截图的超时。
+        """改 ``fullpage_timeout_sec`` 不影响视口截图的超时。
 
         做法：同一个 ``command_timeout_sec`` 下，只改 fullpage 配置，
-        断言视口截图那条路径算出的值**不变**。
+        断言视口截图那条路径算出的值不变。
         （视口截图的值本身是 ``max(TIMEOUT_SCREENSHOT, command_timeout_sec)``，
         这里固定 command_timeout_sec=5，把它隔离出来，只看 fullpage 配置的影响。）
         """
@@ -2365,7 +2365,7 @@ class TestViewportScreenshotUnaffected(unittest.TestCase):
 
 
 class TestFullpageTimeoutStillClampedByFramework(unittest.TestCase):
-    """★ 新配置项同样受框架上限钳制（这是它与旧常量的关键区别）。"""
+    """新配置项同样受框架上限钳制（这是它与旧常量的关键区别）。"""
 
     def test_large_configured_value_is_clamped_by_the_framework(self) -> None:
         """用户填 600，但框架仍是默认 120 → 实际拿到 115（不是 600）。"""
@@ -2379,7 +2379,7 @@ class TestFullpageTimeoutStillClampedByFramework(unittest.TestCase):
         self.assertEqual(service._timeout(service.fullpage_budget()), 115.0)
 
     def test_large_configured_value_is_usable_once_framework_is_raised(self) -> None:
-        """★ 只有**同时**放宽框架上限，600 才能真的用上（两处一起调才有效）。"""
+        """只有同时放宽框架上限，600 才能真的用上（两处一起调才有效）。"""
         service = BskService(
             make_settings(fullpage_timeout_sec=600.0),
             runner=FakeRunner(),
@@ -2389,7 +2389,7 @@ class TestFullpageTimeoutStillClampedByFramework(unittest.TestCase):
         self.assertEqual(service._timeout(service.fullpage_budget()), 600.0)
 
     def test_default_pair_yields_115(self) -> None:
-        """★ 默认组合（两边都是 120）算出 115 —— 用户要知道这个连带关系。"""
+        """默认组合（两边都是 120）算出 115 —— 用户要知道这个连带关系。"""
         service = BskService(
             make_settings(fullpage_timeout_sec=120.0),
             runner=FakeRunner(),
@@ -2413,10 +2413,10 @@ class TestFullpageTimeoutDocumentationWording(unittest.TestCase):
         ]
 
     def test_docs_explain_the_scope_of_this_setting(self) -> None:
-        """★ 必须写明它只管"浏览器操作"耗时，与模型出字快慢无关。
+        """必须写明它只管"浏览器操作"耗时，与模型出字快慢无关。
 
         用户提出的理由是"有的模型很慢"，但技术上 ``tool_call_timeout`` 限制的是
-        工具执行耗时，**不包含**模型生成 token 的时间 —— 所以文档必须划清界限，
+        工具执行耗时，不包含模型生成 token 的时间 —— 所以文档必须划清界限，
         不能暗示"调大它能让慢模型不出错"。
         """
         joined = "\n".join(self._texts())
@@ -2430,7 +2430,7 @@ class TestFullpageTimeoutDocumentationWording(unittest.TestCase):
                 for phrase in (
                     "与模型生成回复的快慢无关",
                     "与模型出 token",
-                    "不包含**模型出 token",
+                    "不包含模型出 token",
                     "与模型生成 token",
                 )
             ),
@@ -2438,7 +2438,7 @@ class TestFullpageTimeoutDocumentationWording(unittest.TestCase):
         )
 
     def test_docs_explain_the_dual_clamp_relation(self) -> None:
-        """★ 必须说明"在这里填超过框架上限的值不会等更久"这个连带关系。"""
+        """必须说明"在这里填超过框架上限的值不会等更久"这个连带关系。"""
         joined = "\n".join(self._texts())
 
         self.assertIn("tool_call_timeout", joined)
@@ -2458,6 +2458,452 @@ class TestFullpageTimeoutDocumentationWording(unittest.TestCase):
 
         self.assertNotIn("需要两处一起调大才可能成功", readme)
         self.assertNotIn("只改一处仍然会在 120 秒处被打断", readme)
+
+
+# ======================================================================
+# 9. 控制台 / 网络日志：``read_console`` / ``read_network`` / ``render_console``
+#
+# 背景：``read_console`` / ``read_network`` / ``render_console`` 早已实现，
+# 但 ``main.py`` 没有调用点（模型拿不到），所以此前只有"超时是否透传"被覆盖。
+# 这一段补上它们自身的行为契约，重点是三类实测形态：
+#
+#   1. 空结果时 ``entries`` 字段整个消失（不是空数组），
+#      ``ConsoleLog.from_json`` 必须容错成空列表，且渲染成明确说明而不是空串；
+#   2. ``network`` 会把整段 ``data:image/png;base64,...`` 内联进 ``url``，
+#      必须截断，否则瞬间吃光模型上下文（本机实测单条 4422 字符）;
+#   3. ``kind == "failure"`` 的条目没有 status 字段，只有 error_text，
+#      渲染时不能去读 status，也不能把失败原因丢掉。
+# ======================================================================
+
+
+class ConsolePayloadRunner(FakeRunner):
+    """在 ``FakeRunner`` 基础上，允许为 console/network 指定返回载荷。
+
+    只覆盖这两个命令，其余（``session start`` 等）仍走父类的默认载荷，
+    这样"日志类测试"不需要重复造会话建立的桩。
+    """
+
+    def __init__(self, payloads: dict[str, Any]) -> None:
+        super().__init__()
+        self.payloads = dict(payloads)
+
+    async def run_or_raise(
+        self,
+        args: list[str],
+        *,
+        timeout: float | None = None,
+        expect_json: bool = True,
+    ) -> BskResult:
+        call = list(args)
+        command = self._command_of(call)
+        if command not in self.payloads:
+            return await super().run_or_raise(
+                args, timeout=timeout, expect_json=expect_json
+            )
+        self.calls.append(call)
+        self.timeouts.append(timeout)
+        return BskResult(
+            ok=True, exit_code=0, data=self.payloads[command], elapsed=0.0
+        )
+
+
+# 与实测形态一致的构造基元：network 会把图片内联进 url 字段。
+HUGE_DATA_URL = "data:image/png;base64," + "iVBORw0KGgoAAAANSUhEUg" * 200
+
+
+class TestConsoleLogParsing(unittest.TestCase):
+    """``ConsoleLog`` / ``ConsoleEntry`` 的宽松解析（外部输入必须容错）。"""
+
+    def test_missing_entries_field_becomes_empty_list(self) -> None:
+        """实测：没有日志时 ``entries`` 字段整个消失，不能因此报错。"""
+        from bsk.models import ConsoleLog
+
+        log = ConsoleLog.from_json(
+            {"tab_id": 7, "next_since": 0, "truncated": False}
+        )
+
+        self.assertEqual(log.entries, [])
+        self.assertEqual(log.tab_id, 7)
+
+    def test_entries_as_non_list_is_tolerated(self) -> None:
+        """``entries`` 出现但类型不对（不是数组）时也退回空列表。"""
+        from bsk.models import ConsoleLog
+
+        for junk in (None, {}, "oops", 3):
+            with self.subTest(junk=repr(junk)):
+                self.assertEqual(ConsoleLog.from_json({"entries": junk}).entries, [])
+
+    def test_non_dict_payload_is_tolerated(self) -> None:
+        from bsk.models import ConsoleLog
+
+        for junk in (None, [], "text", 5):
+            with self.subTest(junk=repr(junk)):
+                self.assertEqual(ConsoleLog.from_json(junk).entries, [])
+
+    def test_entry_keeps_network_fields(self) -> None:
+        """network 条目要解析出 method / status（渲染要用）。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry.from_json(
+            {
+                "sequence": 2,
+                "kind": "response",
+                "method": "GET",
+                "url": "https://example.com/",
+                "status": 200,
+            }
+        )
+
+        self.assertEqual(entry.method, "GET")
+        self.assertEqual(entry.status, 200)
+
+    def test_failure_entry_without_status_degrades_to_zero(self) -> None:
+        """实测：``failure`` 条目没有 status，只有 error_text。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry.from_json(
+            {
+                "sequence": 3,
+                "kind": "failure",
+                "method": "GET",
+                "url": "https://example.com/missing.js",
+                "error_text": "net::ERR_FAILED",
+            }
+        )
+
+        self.assertEqual(entry.status, 0)
+        self.assertEqual(entry.error_text, "net::ERR_FAILED")
+
+
+class TestRenderConsole(unittest.TestCase):
+    """``render_console`` 的渲染契约（纯函数，不需要 service）。"""
+
+    def _log(self, entries: list[Any], **extra: Any) -> Any:
+        from bsk.models import ConsoleLog
+
+        return ConsoleLog(entries=list(entries), **extra)
+
+    def test_empty_log_gets_explicit_text_not_blank(self) -> None:
+        """空日志必须给一句明确说明，不能是空字符串。"""
+        rendered = BskService.render_console(self._log([]))
+
+        self.assertTrue(rendered.strip(), "空日志渲染成了空串")
+        self.assertIn("没有捕获到", rendered)
+
+    def test_failure_entry_does_not_read_missing_status(self) -> None:
+        """failure 条目缺 status 时不能崩（根因是渲染去读了不存在的字段）。
+
+        构造一个只有 failure 条目该有的字段的条目：如果渲染逻辑去读
+        ``status``，这里就会是 ``AttributeError`` 而不是一句"失败"。
+        """
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry.from_json(
+            {
+                "sequence": 9,
+                "kind": "failure",
+                "method": "GET",
+                "url": "https://example.com/gone.js",
+                "error_text": "net::ERR_FAILED",
+            }
+        )
+
+        rendered = BskService.render_console(self._log([entry]))
+
+        self.assertIn("失败", rendered)
+        self.assertIn("gone.js", rendered)
+        # 失败原因是这一条唯一有用的信息，不能丢。
+        self.assertIn("net::ERR_FAILED", rendered)
+
+    def test_failure_entry_still_renders_without_error_text(self) -> None:
+        """连 error_text 都没有时也要能渲染（只是没有原因）。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry(sequence=1, kind="failure", method="GET", url="u")
+
+        rendered = BskService.render_console(self._log([entry]))
+
+        self.assertIn("[1]", rendered)
+        self.assertIn("失败", rendered)
+
+    def test_console_entry_renders_level_and_text(self) -> None:
+        """控制台条目渲染成 ``[序号] 级别: 正文``。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry(sequence=1, kind="log", level="error", text="boom")
+
+        rendered = BskService.render_console(self._log([entry]))
+
+        self.assertIn("[1]", rendered)
+        self.assertIn("error", rendered)
+        self.assertIn("boom", rendered)
+
+    def test_network_entry_renders_method_status_url(self) -> None:
+        """网络条目渲染成 ``[序号] 方法 状态码 网址``。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry(
+            sequence=4,
+            kind="response",
+            method="GET",
+            url="https://example.com/",
+            status=200,
+        )
+
+        rendered = BskService.render_console(self._log([entry]))
+
+        self.assertIn("GET", rendered)
+        self.assertIn("200", rendered)
+        self.assertIn("example.com", rendered)
+
+    def test_long_url_is_truncated_at_url_max(self) -> None:
+        """超长 URL（base64 内联）必须截断 —— 防撑爆模型上下文。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry(
+            sequence=1, kind="response", method="GET", url=HUGE_DATA_URL, status=200
+        )
+
+        rendered = BskService.render_console(self._log([entry]), url_max=200)
+
+        self.assertNotIn(HUGE_DATA_URL, rendered)
+        self.assertIn(HUGE_DATA_URL[:200], rendered)
+        self.assertNotIn(HUGE_DATA_URL[:201], rendered)
+
+    def test_truncation_happens_before_joining_so_output_stays_bounded(self) -> None:
+        """截断必须作用在每条上：多条超长 URL 也不会把输出撑大。"""
+        from bsk.models import ConsoleEntry
+
+        entries = [
+            ConsoleEntry(
+                sequence=i, kind="response", method="GET", url=HUGE_DATA_URL, status=200
+            )
+            for i in range(1, 61)
+        ]
+
+        rendered = BskService.render_console(self._log(entries), limit=50, url_max=200)
+
+        self.assertLess(len(rendered), 20000)
+        self.assertNotIn(HUGE_DATA_URL, rendered)
+
+    def test_limit_only_shows_the_head_and_reports_the_remainder(self) -> None:
+        """只展示前 ``limit`` 条，并明确告知还有多少条没显示。"""
+        from bsk.models import ConsoleEntry
+
+        entries = [
+            ConsoleEntry(sequence=i, kind="log", level="info", text=f"m{i}")
+            for i in range(1, 8)
+        ]
+
+        rendered = BskService.render_console(self._log(entries), limit=3)
+
+        self.assertIn("m1", rendered)
+        self.assertIn("m3", rendered)
+        self.assertNotIn("m4", rendered)
+        self.assertIn("还有 4 条未显示", rendered)
+
+    def test_truncated_flag_is_surfaced(self) -> None:
+        """bsk 报告"日志被截断"时必须转告模型（否则模型以为是全部）。"""
+        from bsk.models import ConsoleEntry
+
+        entry = ConsoleEntry(sequence=1, kind="log", level="info", text="x")
+
+        rendered = BskService.render_console(self._log([entry], truncated=True))
+
+        self.assertIn("截断", rendered)
+
+
+class TestReadConsoleAndNetwork(ServiceIntegrationCase):
+    """两条读取命令的命令构造与空结果行为（走真实 SessionManager）。"""
+
+    async def test_console_command_shape_and_since_passthrough(self) -> None:
+        """``since`` 必须被拼进 bsk 命令行（增量拉取靠它）。"""
+        runner = ConsolePayloadRunner({"console": {"next_since": 0}})
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        await service.read_console("umo-1", since=5)
+
+        argv = runner.calls_for("console")[0]
+        self.assertIn("--since", argv)
+        self.assertEqual(argv[argv.index("--since") + 1], "5")
+        self.assertIn("--session", argv)
+        self.assertIn("--json", argv)
+        # 只读：``--since`` 是开区间，游标必须原样透传，不能被改写。
+        self.assertNotIn("--limit", argv)
+
+    async def test_network_command_shape_and_since_passthrough(self) -> None:
+        runner = ConsolePayloadRunner({"network": {"next_since": 0}})
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        await service.read_network("umo-1", since=12)
+
+        argv = runner.calls_for("network")[0]
+        self.assertEqual(argv[0], "network")
+        self.assertEqual(argv[argv.index("--since") + 1], "12")
+
+    async def test_console_and_network_are_distinct_subcommands(self) -> None:
+        """两条路径不能串（写成同一个子命令就永远读不到网络日志）。"""
+        runner = ConsolePayloadRunner({"console": {}, "network": {}})
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        await service.read_console("umo-1")
+        await service.read_network("umo-1")
+
+        self.assertEqual(len(runner.calls_for("console")), 1)
+        self.assertEqual(len(runner.calls_for("network")), 1)
+
+    async def test_missing_entries_field_yields_empty_log_without_error(self) -> None:
+        """端到端：空结果（entries 字段消失）不报错，返回空列表。"""
+        runner = ConsolePayloadRunner(
+            {"console": {"tab_id": 7, "next_since": 0, "truncated": False}}
+        )
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        log = await service.read_console("umo-1")
+
+        self.assertEqual(log.entries, [])
+        self.assertEqual(log.tab_id, 7)
+
+    async def test_empty_log_renders_to_explicit_text(self) -> None:
+        """端到端：空结果渲染出来必须是明确说明，不是空串。"""
+        runner = ConsolePayloadRunner({"network": {"tab_id": 7, "next_since": 0}})
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        log = await service.read_network("umo-1")
+        rendered = BskService.render_console(log)
+
+        self.assertTrue(rendered.strip())
+        self.assertIn("没有捕获到", rendered)
+
+    async def test_network_payload_with_huge_url_renders_truncated(self) -> None:
+        """端到端：实测形态的 base64 内联 URL 被截断（回归保护）。"""
+        runner = ConsolePayloadRunner(
+            {
+                "network": {
+                    "tab_id": 7,
+                    "next_since": 1,
+                    "entries": [
+                        {
+                            "sequence": 1,
+                            "kind": "response",
+                            "method": "GET",
+                            "url": HUGE_DATA_URL,
+                            "status": 200,
+                        }
+                    ],
+                }
+            }
+        )
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        log = await service.read_network("umo-1")
+        rendered = BskService.render_console(log, url_max=200)
+
+        self.assertEqual(len(log.entries), 1)
+        self.assertNotIn(HUGE_DATA_URL, rendered)
+        self.assertLess(len(rendered), 2000)
+
+    async def test_failure_entry_from_network_payload_renders_without_crash(self) -> None:
+        """端到端：真实形态的 failure 条目（无 status）能渲染出失败原因。"""
+        runner = ConsolePayloadRunner(
+            {
+                "network": {
+                    "next_since": 1,
+                    "entries": [
+                        {
+                            "sequence": 1,
+                            "kind": "failure",
+                            "method": "GET",
+                            "url": "https://example.com/x",
+                            "error_text": "net::ERR_FAILED",
+                        }
+                    ],
+                }
+            }
+        )
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        log = await service.read_network("umo-1")
+        rendered = BskService.render_console(log)
+
+        self.assertIn("失败", rendered)
+        self.assertIn("net::ERR_FAILED", rendered)
+
+    async def test_console_works_while_session_is_uncertain(self) -> None:
+        """读日志是只读动作：会话处于不确定态时仍然读得到。
+
+        与 ``observe`` / 截图同一条理由（见 ``session.execute`` 的
+        ``allow_uncertain``）：读日志不改变页面状态，没有"重复点击/重复提交"
+        的风险，所以它不该被不确定态挡住 —— 否则用户在出问题时恰恰读不到日志。
+
+        做法：先用一次结果未知的 observe 把会话打成不确定态，再读日志。
+        若 ``read_console`` 漏传 ``allow_uncertain=True``，这里会抛
+        ``BskOutcomeUnknown``（code=session_uncertain）而不是正常返回。
+        """
+        from bsk.errors import BskOutcomeUnknown
+
+        class UncertainRunner(ConsolePayloadRunner):
+            """第一次 observe 返回"结果未知"，之后一切正常。"""
+
+            def __init__(self) -> None:
+                super().__init__({"console": {"next_since": 0}})
+                self._blew_up = False
+
+            async def run_or_raise(self, args, *, timeout=None, expect_json=True):
+                if self._command_of(list(args)) == "observe" and not self._blew_up:
+                    self._blew_up = True
+                    raise BskOutcomeUnknown(
+                        "结果未知",
+                        reason="extension_reconnected",
+                        exit_code=3,
+                    )
+                return await super().run_or_raise(
+                    args, timeout=timeout, expect_json=expect_json
+                )
+
+        runner = UncertainRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        with self.assertRaises(BskOutcomeUnknown):
+            await service.observe("umo-1")
+        # 前提成立：会话确实进入了不确定态。
+        entry = service.sessions._entries["umo-1"]  # noqa: SLF001 - 断言内部状态
+        self.assertTrue(entry.session.uncertain, "前置条件没成立，用例失效")
+
+        log = await service.read_console("umo-1")
+
+        self.assertEqual(log.entries, [])
+        self.assertEqual(len(runner.calls_for("console")), 1)
+
+    async def test_network_works_while_session_is_uncertain(self) -> None:
+        """同上，network 那条路径也必须声明只读。"""
+        from bsk.errors import BskOutcomeUnknown
+
+        class UncertainRunner(ConsolePayloadRunner):
+            def __init__(self) -> None:
+                super().__init__({"network": {"next_since": 0}})
+                self._blew_up = False
+
+            async def run_or_raise(self, args, *, timeout=None, expect_json=True):
+                if self._command_of(list(args)) == "observe" and not self._blew_up:
+                    self._blew_up = True
+                    raise BskOutcomeUnknown(
+                        "结果未知", reason="extension_reconnected", exit_code=3
+                    )
+                return await super().run_or_raise(
+                    args, timeout=timeout, expect_json=expect_json
+                )
+
+        runner = UncertainRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        with self.assertRaises(BskOutcomeUnknown):
+            await service.observe("umo-1")
+
+        log = await service.read_network("umo-1")
+
+        self.assertEqual(log.entries, [])
+        self.assertEqual(len(runner.calls_for("network")), 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,6 +1,6 @@
 """安装烟雾测试：模拟用户第一次装插件的完整流程。
 
-验证的是**别人拿到这个仓库后能不能用起来**，而不是我本机能不能跑：
+验证的是别人拿到这个仓库后能不能用起来，而不是我本机能不能跑：
 1. 从一个干净的副本安装（排除开发产物），确认没有"只在源目录才能跑"的隐含依赖；
 2. 目录结构符合 AstrBot 发现规则（main.py 在插件目录根）；
 3. 用 AstrBot 的加载方式 import，必需工具全部注册（并拒绝意料之外的工具名）；
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -183,7 +184,7 @@ print("__RESULT__" + json.dumps(out, ensure_ascii=False))
     else:
         c = payload["checks"]
         check("干净副本可加载", True, "")
-        # ★ 必须存在的工具（少一个就是回归）。
+        # 必须存在的工具（少一个就是回归）。
         required = {
             "bsk_open",
             "bsk_read",
@@ -192,24 +193,38 @@ print("__RESULT__" + json.dumps(out, ensure_ascii=False))
             "bsk_close",
             "bsk_status",
         }
-        # 允许存在的额外工具（新增功能会加工具，不该让这个断言失败）。
-        #
-        # 为什么不用 `set(tools) == required`：那样的精确相等断言会在**每次
-        # 新增工具**时失败，把正常的功能演进报成回归（本文件初版就是如此，
-        # 加了 bsk_evaluate 之后必然误报）。但也**不能**只写成子集判断 ——
-        # 那样工具名写错（例如 bsk_clsoe）就检测不到了。
-        # 所以两边都查：required 必须齐全，且不能出现意料之外的名字。
-        allowed = required | {"bsk_evaluate"}
         actual = set(c["tools"])
+
         check(
             "6 个必需工具全部注册",
             required.issubset(actual),
             f"缺少：{sorted(required - actual)}" if not required.issubset(actual) else f"实际：{sorted(actual)}",
         )
+
+        # 「不得出现意料之外的工具名」这条，改成**从源码自动推导**白名单。
+        #
+        # 为什么不再手写 allowed 集合：手写的话每加一个工具都要回来改一次，
+        # 忘了改就把正常的功能演进报成回归（bsk_evaluate、bsk_logs 各踩过一次）。
+        # 现在改为扫描 main.py 里所有 `@filter.llm_tool("名字")` 的字面量 ——
+        # 那才是"这个插件声明了哪些工具"的唯一事实来源。
+        #
+        # 这样仍然能抓到真正要防的问题：工具名写错（例如 bsk_clsoe）、
+        # 或某处凭空多出一个没有装饰器来源的工具。
+        declared = set(
+            re.findall(
+                r'@filter\.llm_tool\(\s*"([^"]+)"\s*\)',
+                (PROJECT / "main.py").read_text(encoding="utf-8"),
+            )
+        )
         check(
-            "无意料之外的工具名（改名/拼错会被抓到）",
-            actual.issubset(allowed),
-            f"多出：{sorted(actual - allowed)}" if not actual.issubset(allowed) else "",
+            "实际注册的工具与 main.py 声明的完全一致",
+            actual == declared,
+            (
+                f"多出：{sorted(actual - declared)}（注册了但 main.py 里没有对应装饰器）"
+                f" / 缺少：{sorted(declared - actual)}（声明了但没注册成功）"
+            )
+            if actual != declared
+            else f"共 {len(declared)} 个：{sorted(declared)}",
         )
         check("无 __del__（C3）", c["no_del"], "")
         check("有 terminate（C4）", c["has_terminate"], "")

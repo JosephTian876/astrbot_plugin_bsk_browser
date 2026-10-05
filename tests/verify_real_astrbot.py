@@ -1,12 +1,12 @@
 """在你自己的 AstrBot 上做最终实测（用户要求 #7：先装实测，确认没问题再发布）。
 
 ## 与前面所有测试的区别
-前面的测试都用**我在测试脚本里手搓的替身**（FakeContext / FakeEvent）。
-这个脚本不一样 —— 它验证的是**真实 AstrBot 环境里的真实加载路径**：
+前面的测试都用我在测试脚本里手搓的替身（FakeContext / FakeEvent）。
+这个脚本不一样 —— 它验证的是真实 AstrBot 环境里的真实加载路径：
 
 1. 插件从 `~/.astrbot/data/plugins/` 被加载（AstrBot 真正读的那个目录）
-2. 用 AstrBot **自己的发现函数**确认它能被找到
-3. 用 AstrBot **自己的执行器**调用每一个工具
+2. 用 AstrBot 自己的发现函数确认它能被找到
+3. 用 AstrBot 自己的执行器调用每一个工具
 4. 把结果落成一份可读的实测报告（写入仓库内 `test-reports/`），供用户审阅（要求 #9）
 
 覆盖 7 个工具，包含两个新增的高风险/新配置能力（bsk_evaluate、全页截图超时）。
@@ -15,7 +15,7 @@
 - 只访问 example.com（公开无害页面）
 - 不借用用户标签页；不用 session stop --all
 - bsk_act 只做只读动作（不做 click/fill/press 等会改页面的）
-- bsk_evaluate **保持默认关闭**，只验证"默认被拒绝"这条路径，
+- bsk_evaluate 保持默认关闭，只验证"默认被拒绝"这条路径，
   不真的执行 JS（要验证放行路径需要临时改配置，那留给用户自己决定）
 - 结束按精确 id 清理自己的会话
 
@@ -67,7 +67,7 @@ def record(name: str, ok: bool, detail: str = "", *, extra: dict | None = None) 
 
 
 async def _call_tool(handler, event, **kwargs):
-    """经 AstrBot **自己的**执行器调用工具（不是直接 await 函数）。
+    """经 AstrBot 自己的执行器调用工具（不是直接 await 函数）。
 
     走 `call_local_llm_tool` + `decorator_handler` 分派，
     与真实模型调用工具时的路径一致。
@@ -138,19 +138,37 @@ async def main() -> int:
             fn = raw.func if isinstance(raw, functools.partial) else raw
             bound[tool.name] = functools.partial(fn, plugin)
 
-        expected = {
+        # 必需工具（少一个就是回归），以及"实际注册的必须与 main.py 声明的一致"。
+        #
+        # 不再手写完整清单：那样每加一个工具都要回来改，忘了就误报
+        # （bsk_evaluate、bsk_logs 各踩过一次）。改为从 main.py 的
+        # `@filter.llm_tool("名字")` 自动推导 —— 那是唯一事实来源。
+        required = {
             "bsk_open",
             "bsk_read",
             "bsk_act",
             "bsk_screenshot",
             "bsk_close",
             "bsk_status",
-            "bsk_evaluate",
         }
+        declared = set(
+            re.findall(
+                r'@filter\.llm_tool\(\s*"([^"]+)"\s*\)',
+                (PROJECT / "main.py").read_text(encoding="utf-8"),
+            )
+        )
+        actual = set(bound)
         record(
-            "7 个工具全部注册",
-            expected == set(bound),
-            f"实际：{sorted(bound)}",
+            "必需工具全部注册",
+            required.issubset(actual),
+            f"缺少：{sorted(required - actual)}" if not required.issubset(actual) else "",
+        )
+        record(
+            "注册的工具与 main.py 声明一致",
+            actual == declared,
+            f"共 {len(declared)} 个：{sorted(declared)}"
+            if actual == declared
+            else f"不一致：实际 {sorted(actual)} / 声明 {sorted(declared)}",
         )
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -239,12 +257,12 @@ async def main() -> int:
     except Exception as exc:  # noqa: BLE001
         record("bsk_screenshot 全页截图（新超时配置项）", False, repr(exc))
 
-    # 3.6 bsk_evaluate（★ 默认关闭，验证的是"被正确拒绝"）
+    # 3.6 bsk_evaluate（默认关闭，验证的是"被正确拒绝"）
     #
     # ⚠️ 参数名必须与 main.py 的签名一致：是 `expression` 而不是 `script`。
     #    写成 `script` 会得到框架的英文报错
     #    "Tool handler parameter mismatch: Handler parameters: expression: str"
-    #    —— 那是**调用方传错参数名**，不是插件缺陷。
+    #    —— 那是调用方传错参数名，不是插件缺陷。
     #    tests/verify_tool_params.py 专门静态检查"签名 vs docstring"一致性。
     try:
         out = await _call_tool(
@@ -252,12 +270,12 @@ async def main() -> int:
         )
         text = " ".join(str(i) for i in out if i is not None)
         record(
-            "★ bsk_evaluate 默认关闭（管理员也被拒）",
+            "bsk_evaluate 默认关闭（管理员也被拒）",
             "默认关闭" in text or "未启用" in text,
             f"{text[:140]!r}",
         )
     except Exception as exc:  # noqa: BLE001
-        record("★ bsk_evaluate 默认关闭（管理员也被拒）", False, repr(exc))
+        record("bsk_evaluate 默认关闭（管理员也被拒）", False, repr(exc))
 
     # 非管理员对 evaluate 也应被拒
     try:

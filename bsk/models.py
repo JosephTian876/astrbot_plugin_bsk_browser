@@ -1,11 +1,11 @@
 """bsk 领域模型。
 
-这些类型是 ``bsk/`` 包内各模块之间的**接口契约**，也是单元测试的断言对象。
+这些类型是 ``bsk/`` 包内各模块之间的接口契约，也是单元测试的断言对象。
 设计原则：
 
 - 全部 ``dataclass``，纯数据，不含行为（行为放各模块的函数里）；
 - 字段名与 bsk 的 JSON 保持一致，避免来回映射出错；
-- **宽松解析**：bsk 的返回是外部输入，字段可能缺失（实测 ``entries`` 会整个消失），
+- 宽松解析：bsk 的返回是外部输入，字段可能缺失（实测 ``entries`` 会整个消失），
   所以所有 ``from_json`` 都必须容忍缺字段并给默认值。
 """
 
@@ -55,7 +55,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 class BskResult:
     """一次 bsk 命令的原始执行结果。
 
-    这是 ``runner.run()`` 的返回值，**不代表业务成功**。
+    这是 ``runner.run()`` 的返回值，不代表业务成功。
     调用方需自行检查 ``ok`` 或捕获 ``BskError``。
     """
 
@@ -84,7 +84,7 @@ class BrowserInstance:
     """一个已连接的浏览器（``bsk browsers --json`` 的元素）。
 
     Note:
-        ``label`` 经常是**空字符串**（实测），不能用它来指定浏览器，
+        ``label`` 经常是空字符串（实测），不能用它来指定浏览器，
         必须用 ``instance_id``。
     """
 
@@ -126,7 +126,7 @@ class InteractionSettings:
     """浏览器扩展的人机协作设置（``session start`` 返回值的一部分）。
 
     Note:
-        实测这两个字段是**字符串枚举**而不是布尔值，
+        实测这两个字段是字符串枚举而不是布尔值，
         且 bsk 源码允许它们缺失，所以不要假设一定存在。
     """
 
@@ -148,7 +148,7 @@ class InteractionSettings:
 class BskSession:
     """一个 bsk 浏览器会话。
 
-    ``session_id`` 实测是 **4 个小写字母**（如 ``mnaa``）。
+    ``session_id`` 实测是 4 个小写字母（如 ``mnaa``）。
     """
 
     session_id: str
@@ -198,8 +198,8 @@ class PageObservation:
     """一次 ``observe`` 的结果。
 
     Note:
-        ``observe`` 返回的是**带标记的缩进文本树**，不是结构化 JSON。
-        标题、元素等都要从 ``text`` 里解析出来 —— bsk **没有**独立的
+        ``observe`` 返回的是带标记的缩进文本树，不是结构化 JSON。
+        标题、元素等都要从 ``text`` 里解析出来 —— bsk 没有独立的
         ``title`` / ``url`` 字段。
     """
 
@@ -212,7 +212,7 @@ class PageObservation:
     viewport: tuple[int, int] | None = None
     """``@view`` 里的视口尺寸（CSS px）。
 
-    注意这**不是**截图的像素尺寸：高分屏下截图会大 DPR 倍
+    注意这不是截图的像素尺寸：高分屏下截图会大 DPR 倍
     （实测 observe 报 910x604，截图是 1850x1208，DPR≈2）。
     """
 
@@ -254,7 +254,7 @@ class NavigateResult:
 
     url: str = ""
     final_url: str = ""
-    """真实落点。**应读这个而不是 url**：实测会补上尾斜杠、可能跟随跳转。"""
+    """真实落点。应读这个而不是 url：实测会补上尾斜杠、可能跟随跳转。"""
 
     reached: str = ""
     tab_id: int = 0
@@ -277,7 +277,7 @@ class Screenshot:
     """``screenshot`` 的结果。
 
     Note:
-        bsk **只给文件路径**，不给 base64。所以插件必须自己管好文件。
+        bsk 只给文件路径，不给 base64。所以插件必须自己管好文件。
     """
 
     path: str = ""
@@ -306,9 +306,9 @@ class Screenshot:
 class EvaluateError:
     """``evaluate`` 里 JavaScript 抛出的错误。
 
-    ★ **关键事实（实测确认）**：JS 抛异常时 ``bsk`` 进程的**退出码仍然是 0**，
-    错误只体现在返回 JSON 的 ``ok: false`` 与这个对象里。所以判成败**绝不能
-    只看退出码**，必须检查 ``ok``。实测原文：
+    关键事实（实测确认）：JS 抛异常时 ``bsk`` 进程的退出码仍然是 0，
+    错误只体现在返回 JSON 的 ``ok: false`` 与这个对象里。所以判成败绝不能
+    只看退出码，必须检查 ``ok``。实测原文：
 
     .. code-block:: text
 
@@ -330,7 +330,7 @@ class EvaluateError:
 
     line: int = 0
     column: int = 0
-    """出错位置。**实测常见 0**：``column`` 经常是 0，``line`` 对多行表达式才有意义，
+    """出错位置。实测常见 0：``column`` 经常是 0，``line`` 对多行表达式才有意义，
     所以文案里要能容忍它们没有信息量（不要写"第 0 行第 0 列"这种废话）。"""
 
     @classmethod
@@ -359,9 +359,9 @@ class EvaluateError:
 
 @dataclass(slots=True)
 class EvaluateDialog:
-    """``evaluate`` 期间被**自动处理掉**的浏览器弹窗。
+    """``evaluate`` 期间被自动处理掉的浏览器弹窗。
 
-    ★ 实测风险（确认存在）：``bsk evaluate`` 会自动**确认**页面的 ``confirm``
+    实测风险（确认存在）：``bsk evaluate`` 会自动确认页面的 ``confirm``
     弹窗，也就是说 ``confirm()`` 直接返回 ``true``，用户根本看不到那个弹窗。
     实测原文：
 
@@ -380,7 +380,7 @@ class EvaluateDialog:
     （渲染时会明确写出来），不能让模型以为用户已经点过"确定"了。
 
     Note:
-        ``dialogs`` 字段在**没有弹窗时整个不存在**（实测成功样例里就没有），
+        ``dialogs`` 字段在没有弹窗时整个不存在（实测成功样例里就没有），
         所以解析必须用 ``raw.get("dialogs", [])``。
     """
 
@@ -410,29 +410,29 @@ class EvaluateDialog:
 
 @dataclass(slots=True)
 class EvaluateResult:
-    """``evaluate`` 的结果 —— **成败的唯一依据是 ``ok``**。
+    """``evaluate`` 的结果 —— 成败的唯一依据是 ``ok``。
 
-    ★ 为什么需要这个类型而不是直接看退出码：实测 JS 抛异常时 bsk 的退出码
-    依然是 **0**，只看退出码会把失败当成功，把 ``error`` 结构当返回值塞给模型。
+    为什么需要这个类型而不是直接看退出码：实测 JS 抛异常时 bsk 的退出码
+    依然是 0，只看退出码会把失败当成功，把 ``error`` 结构当返回值塞给模型。
 
     三种实测形态：
 
-    1. **成功且有值**：``{"ok": true, "tab_id": N, "value": <任意 JSON>}``
-    2. **成功但无值**：``{"ok": true, "tab_id": N}`` —— 表达式求值成
-       ``undefined`` / ``null`` 时 **``value`` 字段整个消失**（实测
+    1. 成功且有值：``{"ok": true, "tab_id": N, "value": <任意 JSON>}``
+    2. 成功但无值：``{"ok": true, "tab_id": N}`` —— 表达式求值成
+       ``undefined`` / ``null`` 时 ``value`` 字段整个消失（实测
        ``evaluate "undefined"`` 与 ``evaluate "null"`` 都是这个形态）。
        所以 ``value`` 必须区分"没有值"与"值是 null"。
-    3. **JS 抛异常**：``{"ok": false, "tab_id": N, "error": {...}}``
+    3. JS 抛异常：``{"ok": false, "tab_id": N, "error": {...}}``
 
     Note:
-        ``value`` 可能是**任意大的 JSON**：实测
+        ``value`` 可能是任意大的 JSON：实测
         ``Array.from({length:2000},(_,i)=>'item-'+i)`` 的命令输出有
-        **32947 个字符**。直接塞进模型上下文会撑爆，所以渲染时必须截断
+        32947 个字符。直接塞进模型上下文会撑爆，所以渲染时必须截断
         （见 ``service.BskService.render_evaluate``）。
     """
 
     ok: bool = False
-    """★ JavaScript 是否执行成功。**这是唯一的成败依据**，不是退出码。"""
+    """JavaScript 是否执行成功。这是唯一的成败依据，不是退出码。"""
 
     value: Any = None
     """JS 的返回值（任意 JSON 类型）。``has_value`` 为 False 时无意义。"""
@@ -440,7 +440,7 @@ class EvaluateResult:
     has_value: bool = False
     """返回 JSON 里是否存在 ``value`` 字段。
 
-    单独一个标志位是必要的：``null`` / ``undefined`` 会让 bsk **整个省掉**
+    单独一个标志位是必要的：``null`` / ``undefined`` 会让 bsk 整个省掉
     ``value`` 字段（实测），而 ``null`` 与"没有这个字段"在语义上不同 ——
     前者是"表达式就是 null"，后者是"求值成了 undefined"。
     """
@@ -454,7 +454,7 @@ class EvaluateResult:
         """从 ``evaluate --json`` 的输出构造。
 
         Note:
-            **宽容策略**：拿不到 ``ok`` 字段时（输出被截断、结构不认识）按
+            宽容策略：拿不到 ``ok`` 字段时（输出被截断、结构不认识）按
             ``False`` 处理。宁可把一次成功误判成失败（模型会重试或报错给用户），
             也不要把一次失败当成成功（模型会拿着 ``None`` 编答案）。
         """
@@ -492,6 +492,15 @@ class ConsoleEntry:
     timestamp: float = 0.0
     truncated: bool = False
 
+    method: str = ""
+    """HTTP 方法，只有 ``network`` 的条目才有（``console`` 的条目没有这个字段）。"""
+
+    status: int = 0
+    """HTTP 状态码。``kind == "failure"`` 的条目没有这个字段（实测），此时为 0。"""
+
+    error_text: str = ""
+    """失败原因，只有 ``kind == "failure"`` 的条目才有（例如 ``net::ERR_FAILED``）。"""
+
     @classmethod
     def from_json(cls, raw: Any) -> ConsoleEntry:
         """从 bsk 的 JSON 构造。容忍缺失。"""
@@ -506,6 +515,9 @@ class ConsoleEntry:
             url=_as_str(raw.get("url")),
             timestamp=float(ts) if isinstance(ts, (int, float)) else 0.0,
             truncated=_as_bool(raw.get("truncated")),
+            method=_as_str(raw.get("method")),
+            status=_as_int(raw.get("status")),
+            error_text=_as_str(raw.get("error_text")),
         )
 
 
@@ -514,13 +526,13 @@ class ConsoleLog:
     """``console`` / ``network`` 的结果。
 
     Note:
-        **``entries`` 字段在空结果时会整个消失**（实测），所以这里给默认空列表，
+        ``entries`` 字段在空结果时会整个消失（实测），所以这里给默认空列表，
         并且解析时必须用 ``raw.get("entries", [])``。
     """
 
     entries: list[ConsoleEntry] = field(default_factory=list)
     next_since: int = 0
-    """游标。``--since N`` 是**开区间**（只返回 sequence > N），原样回传即可增量拉取。"""
+    """游标。``--since N`` 是开区间（只返回 sequence > N），原样回传即可增量拉取。"""
 
     tab_id: int = 0
     truncated: bool = False

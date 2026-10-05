@@ -20,6 +20,13 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   与用户白名单）。独立成工具而非 `bsk_act` 的一个动作，因此可以被单独禁用、
   也能被 AstrBot 原生的 `tool_permissions` 单独控制。实测确认：JS 抛异常时
   bsk 退出码仍为 0，故成败以返回 JSON 的 `ok` 字段为准
+- **`bsk_logs`（读取控制台消息与网络请求）**：第 8 个工具。`bsk/service.py`
+  里的 `read_console` / `read_network` / `render_console` 此前已实现但没有
+  调用点，模型拿不到这两个能力。参数 `kind`（`console` / `network`，默认
+  `console`）与 `since`（增量游标，`--since N` 是开区间，返回里给出下次该传
+  的值）。只读，走 `_denied` 权限门。空结果返回明确中文说明而不是空串；
+  复用 `render_console` 的 URL 截断，防止 `network` 把内联的
+  `data:image/png;base64,...` 塞进模型上下文
 - **15 项可配置项**，默认**仅 AstrBot 管理员可用**（`admin_only`），
   支持用户白名单与「一个群一条 / 每人一条」两种会话隔离粒度。
   其中 `fullpage_timeout_sec` 专门控制整页截图的等待上限（默认 120 秒，
