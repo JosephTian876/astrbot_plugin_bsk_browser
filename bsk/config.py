@@ -34,7 +34,6 @@ __all__ = [
     "COMMAND_TIMEOUT_MAX_SEC",
     "COMMAND_TIMEOUT_MIN_SEC",
     "DEFAULT_ADMIN_ONLY",
-    "DEFAULT_ALLOWED_USERS",
     "DEFAULT_BROWSER_INSTANCE_ID",
     "DEFAULT_BSK_PATH",
     "DEFAULT_COMMAND_TIMEOUT_SEC",
@@ -102,9 +101,6 @@ DEFAULT_MAX_SESSIONS = 3
 
 DEFAULT_ADMIN_ONLY = True
 """只允许 AstrBot 管理员调用。默认开启是安全要求，不是可选项。"""
-
-DEFAULT_ALLOWED_USERS: tuple[str, ...] = ()
-"""额外允许的用户 ID 白名单。空元组 = 不额外放行任何人。"""
 
 DEFAULT_SESSION_SCOPE = "umo"
 """会话隔离粒度：每个聊天会话一条浏览器会话。"""

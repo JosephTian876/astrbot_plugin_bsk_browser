@@ -69,15 +69,6 @@ class BskResult:
     elapsed: float = 0.0
     """耗时（秒），用于性能观测与超时调优。"""
 
-    def as_dict(self) -> dict[str, Any]:
-        """转成可 JSON 序列化的字典（调试用，不含大字段原文）。"""
-        return {
-            "ok": self.ok,
-            "exit_code": self.exit_code,
-            "elapsed": round(self.elapsed, 3),
-            "has_data": self.data is not None,
-        }
-
 
 @dataclass(slots=True)
 class BrowserInstance:
@@ -227,25 +218,6 @@ class PageObservation:
             tab_id=_as_int(raw.get("tab_id")),
             truncated=_as_bool(raw.get("truncated")),
         )
-
-    def summary(self, max_refs: int = 40) -> str:
-        """给模型看的紧凑摘要（避免把整棵 VOM 树塞进上下文）。"""
-        lines: list[str] = []
-        if self.title:
-            lines.append(f"标题：{self.title}")
-        if self.refs:
-            shown = self.refs[:max_refs]
-            lines.append(f"可交互元素（共 {self.ref_count} 个）：")
-            for r in shown:
-                extra = f" {r.target}" if r.target else ""
-                lines.append(f"  @{r.ref} {r.role} \"{r.name}\"{extra}")
-            if len(self.refs) > max_refs:
-                lines.append(f"  ……还有 {len(self.refs) - max_refs} 个未列出")
-        else:
-            lines.append("这个页面上没有发现可点击/可输入的元素。")
-        if self.truncated:
-            lines.append("（页面内容过长，已被截断）")
-        return "\n".join(lines)
 
 
 @dataclass(slots=True)

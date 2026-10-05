@@ -21,7 +21,7 @@ import asyncio
 import sys
 import types
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1674,7 +1674,7 @@ class TestRecoverOrphans(TestJournalIntegration):
 # 避免每个用例真的 sleep 半秒而拖慢整个测试套件。
 import time  # noqa: E402
 
-from bsk.errors import BskNotInstalled, BskProtocolError, BskTimeout, BskVersionError  # noqa: E402
+from bsk.errors import BskNotInstalled, BskProtocolError  # noqa: E402
 from bsk.session import (  # noqa: E402
     STOP_MAX_ATTEMPTS,
     STOP_RETRY_DELAY_SEC,

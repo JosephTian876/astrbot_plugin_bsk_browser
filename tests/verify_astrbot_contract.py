@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import traceback
+from pathlib import Path
 
 FAILURES: list[str] = []
 CHECKS: list[tuple[str, bool, str]] = []
@@ -60,6 +62,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     CHECKS.append((name, ok, detail))
     if not ok:
         FAILURES.append(f"{name}: {detail}")
+
+
+def _main_py_path() -> Path:
+    """插件入口 ``main.py`` 的路径（本文件在 ``<项目>/tests/`` 下）。"""
+    here = Path(__file__).resolve().parent
+    return here.parent / "main.py"
 
 
 def main() -> int:
@@ -133,18 +141,22 @@ def main() -> int:
         from astrbot.core.provider.register import llm_tools
 
         names = {t.name for t in llm_tools.func_list}
-        expected = {
-            "bsk_open",
-            "bsk_read",
-            "bsk_act",
-            "bsk_screenshot",
-            "bsk_close",
-            "bsk_status",
-        }
+
+        # 不手写工具清单：那样每加一个工具都要回来改，忘了就漏检 ——
+        # bsk_evaluate、bsk_logs 就是这么从这份清单里漏掉的（清单停在 6 个，
+        # 而 main.py 已有 8 个，检查名却还写着"6 个工具全部注册"）。
+        # 改为从 main.py 的 `@filter.llm_tool("名字")` 自动推导 —— 唯一事实来源。
+        # 同 verify_real_astrbot.py 的做法。
+        expected = set(
+            re.findall(
+                r'@filter\.llm_tool\(\s*"([^"]+)"\s*\)',
+                _main_py_path().read_text(encoding="utf-8"),
+            )
+        )
         missing = expected - names
         found = expected & names
 
-        check("6 个工具全部注册", not missing, f"缺少: {sorted(missing)}")
+        check(f"{len(expected)} 个工具全部注册", not missing, f"缺少: {sorted(missing)}")
         print(f"[ok]   已注册工具: {sorted(found)}")
         if missing:
             print(f"[FAIL] 缺少工具: {sorted(missing)}")

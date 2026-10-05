@@ -148,7 +148,6 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n--- 4. 配置 schema 被 AstrBot 接受 ---")
     try:
-        import json
         import tempfile
 
         from astrbot.core.config.astrbot_config import AstrBotConfig

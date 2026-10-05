@@ -61,6 +61,7 @@
 │  · session.py   会话生命周期：umo→session 映射、锁、显式 stop│
 │  · pages.py     VOM 语义解析：标题提取、ref 提取、截断       │
 │  · shots.py     截图：唯一路径、魔数校验、清理              │
+│  · journal.py   会话所有权 journal：原子写、损坏即忽略      │
 │  · service.py   业务编排（tools 的纯逻辑实现，不含装饰器）   │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -402,10 +403,10 @@ if not evaluation.ok:           # ← 不能省
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制 | ❌ | ❌ | `tests/test_*.py`（580 个用例） |
-| L2 契约测试 | `main.py` 能被真实 AstrBot import、6 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制 | ❌ | ❌ | `tests/test_*.py`（658 个用例） |
+| L2 契约测试 | `main.py` 能被真实 AstrBot import、8 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
 | L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与会话过期自动重建 | ✅ | ✅ | `verify_integration.py` |
-| L4 工具层端到端 | 直接 await `main.py` 里的 6 个工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
+| L4 工具层端到端 | 直接 await `main.py` 里的 8 个工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py` |
 
 **为什么必须有 L4**：L2 只证明工具"注册成功"，L3 只走到服务层。工具函数内部那层
 （URL 校验、权限判定、`bsk_screenshot` 的 async generator、异常是否被吞掉）
@@ -428,7 +429,7 @@ if not evaluation.ok:           # ← 不能省
 | `verify_failure_ux.py` | 环境未就绪时的提示质量（不能是 Python 堆栈） | ❌ |
 | `verify_stop_timing_real.py` | `session stop` 真实耗时（为超时预算提供数据依据） | ✅ |
 | `verify_wait_navigation_real.py` | 新增暴露的 `wait_for_navigation` 动作真实可用且只读 | ✅ |
-| `verify_release_ready.py` | 发布前自检（34 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
+| `verify_release_ready.py` | 发布前自检（37 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
 
 logger 注入与数据落盘位置这两条改动另有专门的单元测试，见 §6.3。
 
@@ -437,7 +438,7 @@ logger 注入与数据落盘位置这两条改动另有专门的单元测试，�
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd <插件目录>                                 # 即本仓库根目录
-& $py -m unittest discover -s tests        # L1（580 个）
+& $py -m unittest discover -s tests        # L1（658 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）
@@ -553,6 +554,7 @@ astrbot_plugin_bsk_browser/
 │   ├── session.py
 │   ├── pages.py
 │   ├── shots.py
+│   ├── journal.py            #   会话所有权 journal（原子写 + 损坏容错）
 │   └── service.py
 ├── tests/                   # L1 单元测试
 ├── metadata.yaml

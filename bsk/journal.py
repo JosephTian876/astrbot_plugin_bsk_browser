@@ -43,13 +43,14 @@ from pathlib import Path
 from typing import Any
 
 from .logger import NULL_LOGGER, LoggerLike
-from .paths import JOURNAL_FILE_NAME, default_journal_path
+from .paths import default_journal_path
 
 __all__ = [
     "JOURNAL_VERSION",
     "JournalEntry",
     "SessionJournal",
     "default_journal_path",
+    "now_seconds",
 ]
 
 JOURNAL_VERSION = 1

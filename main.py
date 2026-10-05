@@ -32,7 +32,7 @@ from typing import Any
 
 from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 
 from .bsk.config import (
     Settings,
@@ -43,7 +43,6 @@ from .bsk.config import (
 from .bsk.errors import BskError
 from .bsk.models import ConsoleLog
 from .bsk.service import BskService
-from .bsk.session import SessionManager
 
 __all__ = ["BskBrowserPlugin"]
 
@@ -111,12 +110,18 @@ def _next_since(cursor: int, log: ConsoleLog) -> int:
     return cursor_next
 
 
-@register(
-    "astrbot_plugin_bsk_browser",
-    "yourname",
-    "用 bsk（BrowserSkill）操作你自己已登录的浏览器：打开网页、读取内容、点击输入、截图。",
-    "0.1.0",
-)
+# 这里刻意不加 ``@register(...)`` 装饰器。
+#
+# AstrBot 的 ``register_star`` 自 v3.5.19 起已废弃（框架源码里标着 [DEPRECATED]），
+# 它注册的那 4 个位置参数（name/author/desc/version）在运行时**全部不生效**：
+# ``Star.__init_subclass__`` 会自动把继承 Star 的子类登记进 star_map，而加载时
+# ``star_manager`` 会用 metadata.yaml 的值逐字段覆盖（源码注释原文「yaml 文件的
+# 元数据优先」），再用 ``plugin_id.split("/")`` 按市场身份覆盖 author/name。
+#
+# 所以唯一事实来源是 ``metadata.yaml``，写在这里的任何副本都只会随时间腐化
+# （曾出现作者仍是占位符 "yourname"、版本停在 0.1.0、描述漏掉 4 个工具）。
+# 本插件声明 ``astrbot_version: ">=4.16"``，远高于该装饰器废弃的 v3.5.19，
+# 删除它不影响任何受支持的 AstrBot 版本。
 class BskBrowserPlugin(Star):
     """把本机 bsk CLI 包装成 LLM 可调用的浏览器操作能力。
 
@@ -600,10 +605,13 @@ class BskBrowserPlugin(Star):
                 delta_x=int(delta_x or 0),
             )
             note = f"（{result.note}）" if result.note else ""
-            return (
-                f"已执行 {action_norm}{note}。"
-                "建议接着用 bsk_read 确认页面变化。"
-            )
+            # bsk 的回执里带了 url / changed 时才算得出"页面变了没有"；
+            # 说不准就不说 —— 不要用一个猜出来的结论误导模型。
+            if result.page_changed:
+                hint = "页面已变化，建议接着用 bsk_read 确认新内容。"
+            else:
+                hint = "建议接着用 bsk_read 确认页面变化。"
+            return f"已执行 {action_norm}{note}。{hint}"
         except BskError as exc:
             return self._fail(f"操作失败：{exc.friendly}")
         except ValueError as exc:
@@ -754,6 +762,24 @@ class BskBrowserPlugin(Star):
                 f"当前会话数：{sessions.get('active', sessions.get('sessions', '?'))}"
                 f"（累计创建 {counters.get('started', 0)}、重建 {counters.get('rebuilt', 0)}）"
             )
+
+        # 当前这个聊天自己那一条 —— 全局计数回答不了"我这边还能用吗"。
+        if info.get("current_session_active"):
+            cur = info.get("current_session") or {}
+            session_id = cur.get("session_id") or "(未建立)"
+            idle = cur.get("idle_sec")
+            idle_text = f"，空闲 {idle} 秒" if isinstance(idle, (int, float)) else ""
+            flags = []
+            if cur.get("busy"):
+                flags.append("正在执行命令")
+            if cur.get("uncertain"):
+                flags.append("上一步结果不确定")
+            flag_text = f"（{', '.join(flags)}）" if flags else ""
+            lines.append(
+                f"本对话的浏览器会话：{session_id}{idle_text}{flag_text}"
+            )
+        else:
+            lines.append("本对话的浏览器会话：尚无（下次操作时自动创建）")
 
         if info.get("error"):
             lines.append(f"错误：{info['error']}")

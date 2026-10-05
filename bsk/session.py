@@ -72,7 +72,7 @@ from .errors import (
     BskTimeout,
     BskVersionError,
 )
-from .journal import JournalEntry, SessionJournal
+from .journal import JournalEntry, SessionJournal, now_seconds
 from .logger import NULL_LOGGER, LoggerLike
 from .models import BrowserInstance, BskResult, BskSession
 from .runner import DEFAULT_CANCEL_GRACE_SEC, DRAIN_TIMEOUT_SEC, BskRunner
@@ -1528,7 +1528,7 @@ class SessionManager:
                     browser_instance_id=session.browser_instance_id,
                     agent_window_id=session.agent_window_id,
                     # 墙钟，不是 monotonic：这条记录要跨进程读。
-                    created_at=time.time(),
+                    created_at=now_seconds(),
                     pid=os.getpid(),
                 )
             )

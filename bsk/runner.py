@@ -29,7 +29,7 @@ import time
 from typing import Any
 
 from . import errors
-from .errors import BskError, BskNotInstalled, BskProtocolError
+from .errors import BskError, BskNotInstalled
 from .models import BskResult
 
 # 超时后给 bsk 的优雅取消宽限期（秒）。
@@ -269,10 +269,6 @@ class BskRunner:
         if self._resolved is None:
             self._resolved = resolve_bsk_path(self._configured_path)
         return self._resolved
-
-    def invalidate_cache(self) -> None:
-        """清掉路径缓存（用户改了配置或刚装好 bsk 后调用）。"""
-        self._resolved = None
 
     async def run(
         self,

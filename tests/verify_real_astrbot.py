@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import io
-import json
 import os
 import re
 import sys

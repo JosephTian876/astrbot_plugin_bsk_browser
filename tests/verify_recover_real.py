@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import types
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent

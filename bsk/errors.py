@@ -44,15 +44,6 @@ EXIT_TIMEOUT = 4
 EXIT_VERSION = 5
 """版本不匹配（CLI 与扩展协议版本对不上）。"""
 
-EXIT_CODE_NAMES: dict[int, str] = {
-    EXIT_OK: "成功",
-    EXIT_USER_ERROR: "参数或实体错误",
-    EXIT_PROTOCOL: "通信错误",
-    EXIT_BROWSER: "浏览器错误",
-    EXIT_TIMEOUT: "超时",
-    EXIT_VERSION: "版本不匹配",
-}
-
 # --- bsk 返回的 error code 字符串 ---
 
 CODE_NOT_FOUND = "not_found"

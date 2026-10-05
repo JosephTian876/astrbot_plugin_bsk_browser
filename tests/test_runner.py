@@ -206,12 +206,13 @@ class TestPathResolution(unittest.TestCase):
         with self.assertRaises(BskNotInstalled):
             runner.resolve()
 
-    def test_invalidate_cache(self) -> None:
+    def test_resolve_is_stable_and_cached(self) -> None:
+        """``resolve()`` 重复调用结果一致，且只解析一次。"""
         runner = BskRunner(sys.executable)
         first = runner.resolve()
-        runner.invalidate_cache()
-        self.assertIsNone(runner._resolved)
+        self.assertIsNotNone(runner._resolved)
         self.assertEqual(first, runner.resolve())
+        self.assertEqual(first, runner._resolved)
 
 
 class TestJsonParsing(unittest.TestCase):

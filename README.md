@@ -383,7 +383,7 @@ bsk --version
 
    > **注意**：`fullpage_timeout_sec` 管的是「调用浏览器这一段最多等多久」，与模型生成回复的快慢无关。AstrBot 的 `tool_call_timeout` 限制的同样是工具执行耗时，不包含模型出 token 的时间。所以"模型很慢"不是调大这个值的理由 —— 只有页面特别慢、网络特别差才需要。
    >
-   > 另外，视口截图（默认那一种）不受这一项影响，它固定用 30 秒：实测只要 0.12 秒，没有必要跟着变。
+   > 另外，视口截图（默认那一种）**不受 `fullpage_timeout_sec` 影响**，但它并不是固定在 30 秒：它和其余命令一样走「单条命令超时」那一项（`command_timeout_sec`），只是有一个 30 秒的下限保护 —— 默认配置下实际是 60 秒。实测视口截图只要 0.12 秒，所以通常无需为它调整任何东西。
 2. 执行任意 JavaScript 的能力默认关闭，且需要你主动承担风险。 `bsk` 有执行 JS 的能力，本插件把它做成了独立工具 `bsk_evaluate`，但默认不注册给模型（`enable_evaluate=false`），并且默认强制仅管理员（`evaluate_require_admin=true`，优先于 `admin_only` 与白名单）。只有你在配置里显式打开后才可用。打开它等于取消了"你能看见的操作"这条边界 —— 请先读完第 5 节的说明再决定。
 3. 需要你手动安装浏览器扩展，插件无法代劳。 `bsk` 和浏览器扩展都必须由你自行安装（插件既不包含也不分发它们），而且扩展必须由你在浏览器里手动确认「已连接」。
 4. 浏览器 Agent Window 共享你的登录态，它不是安全沙箱。 机器人能看到的东西，就是你在那个浏览器里登录着的东西。请只给你信任的人使用（见第 10 节）。
@@ -446,7 +446,7 @@ bsk --version
 ```
 astrbot_plugin_bsk_browser/
 ├── main.py              # 唯一的框架适配层：插件类、配置读取、生命周期钩子、
-│                        #   7 个 @filter.llm_tool 工具函数（薄适配：取参数 → 调 service → 包结果）
+│                        #   8 个 @filter.llm_tool 工具函数（薄适配：取参数 → 调 service → 包结果）
 ├── bsk/                 # 纯逻辑包（零 astrbot 依赖，也不 import 内置 logging，可脱离框架单测）
 │   ├── logger.py        #   日志接口 LoggerLike + 空实现 NullLogger（由 main.py 注入真 logger）
 │   ├── paths.py         #   插件数据目录解析与降级（journal 与截图共用）
@@ -457,6 +457,7 @@ astrbot_plugin_bsk_browser/
 │   ├── session.py       #   会话生命周期：umo→session 映射、锁、显式 stop
 │   ├── pages.py         #   页面文本解析：标题、元素编号（@eN）、截断
 │   ├── shots.py         #   截图：唯一路径、魔数校验、自动清理
+│   ├── journal.py       #   会话所有权记录：原子写、读坏了当没有
 │   └── service.py       #   业务编排（工具函数的纯逻辑实现）
 ├── tests/               # 单元测试与契约测试
 ├── metadata.yaml        # AstrBot 插件元信息
@@ -473,7 +474,7 @@ D:\AstrBot\backend\python\python.exe tests\verify_astrbot_contract.py
 ```
 
 - 第一条：跑 `tests/` 下的单元测试（配置解析、错误映射、页面解析、截图校验、会话状态机等）。不需要 AstrBot 运行中，也不需要浏览器。
-- 第二条：契约测试 —— 用真实的 AstrBot 环境 import `main.py`，验证插件能被加载、6 个工具能成功注册、参数定义正确。
+- 第二条：契约测试 —— 用真实的 AstrBot 环境 import `main.py`，验证插件能被加载、8 个工具能成功注册、参数定义正确。
 
 另有一个真实浏览器集成测试（需要你已装好 `bsk` 和扩展，且只访问 `example.com`）：
 

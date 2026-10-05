@@ -46,7 +46,6 @@ from .runner import BskRunner
 from .session import SessionManager
 from .shots import (
     cleanup_shots,
-    encode_for_llm,
     make_shot_path,
     verify_shot,
 )
@@ -306,7 +305,8 @@ class BskService:
 
         这是用户可调的那一项（WebUI → 插件配置 → 整页截图超时，默认 120，
         可填 30–600）。它只作用于 ``screenshot --full-page`` 那一条命令；
-        视口截图不读它（固定 :data:`TIMEOUT_SCREENSHOT`）。
+        视口截图不读它，而是走 :meth:`_timeout` 的常规规则（内置下限
+        :data:`TIMEOUT_SCREENSHOT` 与 ``command_timeout_sec`` 取较大者）。
 
         Returns:
             用户配置的秒数；配置对象缺这个字段、或取值非法（None / 字符串 /
@@ -547,15 +547,6 @@ class BskService:
             # 只标注、不排除：它确实"连着"，用户需要知道该避开哪一个。
             name += "（此实例当前无响应，不建议选它）"
         return name
-
-    def doctor_hint(self) -> str:
-        """环境自检提示，用于错误信息里给用户可操作的下一步。"""
-        return (
-            "可以按顺序排查：\n"
-            "  1. 终端执行 `bsk --version`，确认 bsk 已安装；\n"
-            "  2. 终端执行 `bsk browsers --json`，确认浏览器扩展显示已连接；\n"
-            "  3. 终端执行 `bsk doctor`，按它的提示修复。"
-        )
 
     # ------------------------------------------------------------------
     # 用例 1：打开网页
@@ -925,6 +916,13 @@ class BskService:
                 "函数、或者取属性的对象是 null/undefined），改好后再试。"
             )
             message = f"evaluate 里 JS 抛异常：{detail}{location}"
+            # 回显失败的那段脚本，便于用户定位是哪一个表达式出的问题。
+            # 表达式可能很长（甚至多行），所以截断后再拼。
+            shown = expression.strip()
+            if shown:
+                if len(shown) > 200:
+                    shown = shown[:200] + "…"
+                message += f"\n表达式：{shown}"
         else:
             # ok=false 但没有 error 结构：bsk 的失败形态不止一种，别让模型
             # 看到一句空话。
@@ -1071,10 +1069,13 @@ class BskService:
 
             - 全页截图（``--full-page``）用用户配置的 ``fullpage_timeout_sec``
               （默认 :data:`TIMEOUT_FULLPAGE`，可调到 600 秒）；
-            - 视口截图固定用 :data:`TIMEOUT_SCREENSHOT`（30 秒）。
+            - 视口截图走常规规则 :meth:`_timeout`：内置下限
+              :data:`TIMEOUT_SCREENSHOT`（30 秒）与 ``command_timeout_sec``
+              取较大者，默认配置下实际是 60 秒。
 
-            视口截图不需要用户配置：实测只要 0.12 秒，30 秒已有 250 倍余量，
-            跟着全页截图一起变成 120 秒只会让人误以为"截图都变慢了"。
+            视口截图不需要用户单独配置：实测只要 0.12 秒，30 秒下限已有
+            250 倍余量；它跟着 ``command_timeout_sec`` 走是刻意的 ——
+            那条本来就表达"你愿意为一条命令最多等多久"，截图没有理由例外。
         """
         directory = self.settings.screenshot_dir or self._default_shot_dir()
         out_path = make_shot_path(directory, key)
@@ -1146,18 +1147,6 @@ class BskService:
         data_dir = getattr(self.settings, "data_dir", "") or ""
         return str(default_shot_dir(data_dir, self._logger))
 
-    def shot_for_llm(self, payload: ShotPayload) -> str | None:
-        """可选的降采样版本（data URL）。PIL 不可用时返回 None。
-
-        给模型"看图"用的备选路径。默认不给 —— 图片很贵，
-        而且 AstrBot 会把图片直接发给用户，模型通常不需要再看一遍。
-        """
-        try:
-            return encode_for_llm(payload.path)
-        except Exception as exc:  # noqa: BLE001
-            self._logger.debug("降采样失败（忽略）：%r", exc)
-            return None
-
     # ------------------------------------------------------------------
     # 用例 5：诊断与关闭
     # ------------------------------------------------------------------
@@ -1207,7 +1196,19 @@ class BskService:
         except BskError as exc:
             info["error"] = exc.friendly
 
-        info["sessions"] = self.sessions.stats()
+        stats = self.sessions.stats()
+        info["sessions"] = stats
+        # 当前这个聊天会话自己有没有活跃的浏览器会话。
+        # stats() 给的是全局计数；用户问"我这边还能用吗"时，真正相关的是
+        # 自己这一条。key 就是本插件的会话键（见 main.py 的 _key）。
+        current = next(
+            (d for d in stats.get("details", []) if d.get("key") == key),
+            None,
+        )
+        info["current_key"] = key
+        info["current_session_active"] = current is not None
+        if current is not None:
+            info["current_session"] = current
         return info
 
     async def close_session(self, key: str) -> bool:
@@ -1281,31 +1282,30 @@ class BskService:
         lines: list[str] = []
         for entry in log.entries[:limit]:
             url = (entry.url or "")[:url_max]
+            # 有 timestamp 就带上时刻 —— 排查时序问题（"报错发生在跳转前还是后"）
+            # 时这是唯一的时间锚点。bsk 没给就整段省略，不显示 0。
+            when = ""
+            if entry.timestamp > 0:
+                when = f"{time.strftime('%H:%M:%S', time.localtime(entry.timestamp))} "
             if entry.kind == "failure":
                 # failure 条目没有 status 字段，只有 error_text。
                 # 失败原因是这一条唯一有用的信息（如 net::ERR_FAILED），
                 # 不打印它就只剩下"失败了"三个字。
                 reason = (entry.error_text or "").strip()
                 suffix = f" —— {reason}" if reason else ""
-                lines.append(f"[{entry.sequence}] 失败 {entry.method} {url}{suffix}")
+                lines.append(
+                    f"[{entry.sequence}] {when}失败 {entry.method} {url}{suffix}"
+                )
             elif entry.level:
-                lines.append(f"[{entry.sequence}] {entry.level}: {entry.text[:300]}")
+                lines.append(
+                    f"[{entry.sequence}] {when}{entry.level}: {entry.text[:300]}"
+                )
             else:
                 lines.append(
-                    f"[{entry.sequence}] {entry.method} {entry.status} {url}"
+                    f"[{entry.sequence}] {when}{entry.method} {entry.status} {url}"
                 )
         if len(log.entries) > limit:
             lines.append(f"……还有 {len(log.entries) - limit} 条未显示")
         if log.truncated:
             lines.append("（bsk 报告日志被截断）")
         return "\n".join(lines)
-
-    async def sleep_ms(self, ms: int) -> None:
-        """等待。用于页面异步加载后重试读取。"""
-        import asyncio
-
-        await asyncio.sleep(max(0, ms) / 1000.0)
-
-    def now(self) -> float:
-        """单调时钟（测试可替换）。"""
-        return time.monotonic()
