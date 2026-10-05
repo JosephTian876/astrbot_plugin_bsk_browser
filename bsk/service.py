@@ -1135,7 +1135,13 @@ class BskService:
         return text
 
     def _default_shot_dir(self) -> str:
-        """未配置截图目录时的默认位置：插件数据目录下的 ``shots``。
+        """未配置截图目录时的默认位置：插件数据目录的父目录。
+
+        返回的是 ``shots`` 子目录的**父目录**，不是 ``shots`` 本身 ——
+        ``make_shot_path`` 会自己拼 ``<本目录>/shots/<session_id>/<文件名>``。
+        实际落点是 ``<插件数据目录>/shots/<session_id>/xxx.png``。
+
+        用户显式配的 ``screenshot_dir`` 走同一个契约（也是父目录）。
 
         数据目录（``settings.data_dir``，由 ``main.py`` 注入）拿不到时由
         ``bsk/paths.py`` 降级到系统临时目录 —— 这里不重复实现那套判断，

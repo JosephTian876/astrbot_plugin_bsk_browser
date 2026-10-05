@@ -44,7 +44,12 @@ JOURNAL_FILE_NAME = "sessions.json"
 """journal 文件名。用 JSON 而不是二进制，是为了出问题时能直接用记事本打开看。"""
 
 SHOT_DIR_NAME = "shots"
-"""截图子目录名（数据目录下）。刻意与 journal 分开，便于人工排查。"""
+"""截图子目录名（数据目录下）。刻意与 journal 分开，便于人工排查。
+
+注意：这个常量的**使用者是 ``bsk/shots.py``**，不是本模块 ——
+``make_shot_path`` 与 ``cleanup_shots`` 自己拼这个名字。
+:func:`default_shot_dir` 返回的是它的**父目录**（见该函数说明）。
+"""
 
 
 def _as_path(data_dir: Any) -> Path | None:
@@ -168,21 +173,26 @@ def default_journal_path(data_dir: Any = "", logger: Any = None) -> Path:
 
 
 def default_shot_dir(data_dir: Any = "", logger: Any = None) -> Path:
-    """截图的默认根目录：``<数据目录>/shots``。
+    """截图的默认根目录：``<数据目录>`` 本身。
 
-    数据目录不可用时降级到 ``<系统临时目录>/astrbot_bsk_browser/shots``。
+    数据目录不可用时降级到 ``<系统临时目录>/astrbot_bsk_browser``。
 
     Note:
-        这里返回的是"截图根目录"，真正的文件还会再往下两层
-        （``<本目录>/shots/<session_id>/<文件名>``，见
-        ``bsk.shots.make_shot_path``）—— 与迁移之前的结构逐字相同，改的只是
-        根目录落在哪里。
+        返回的是 ``shots`` 子目录的**父目录**，不是 ``shots`` 本身 ——
+        这是 :func:`bsk.shots.make_shot_path` 的契约：它接收"根目录"，
+        然后自己拼 ``<根目录>/shots/<session_id>/<文件名>``。
+
+        早先这里返回的是 ``<数据目录>/shots``，而 ``make_shot_path`` 又拼了
+        一层 ``"shots"``，于是实际落点是 ``<数据目录>/shots/shots/...``
+        （``shots`` 出现两次）。现改为返回父目录，实际落点变成
+        ``<数据目录>/shots/<session_id>/<文件名>``，与 ``cleanup_shots``
+        的扫描约定也一致。
 
     Args:
         data_dir: 插件数据目录（见 :func:`resolve_data_dir`）。
         logger: 可选，仅用于降级告警。
 
     Returns:
-        截图根目录的绝对路径（不保证目录存在）。
+        截图根目录（即 ``shots`` 的父目录）的绝对路径（不保证目录存在）。
     """
-    return resolve_data_dir(data_dir, logger) / SHOT_DIR_NAME
+    return resolve_data_dir(data_dir, logger)

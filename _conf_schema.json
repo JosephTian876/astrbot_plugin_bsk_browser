@@ -90,7 +90,7 @@
     "description": "截图保存目录",
     "type": "string",
     "default": "",
-    "hint": "留空即可，截图会存到插件数据目录下的 `shots` 子目录里（即 `data/plugin_data/astrbot_plugin_bsk_browser/shots`），插件会定期清理。只有想把截图固定放到某个位置（比如方便自己去看）时才填，要填完整路径，例如 `D:\\screenshots`。目录不存在时插件会自动创建（父级目录也会一起建），只要上级路径可写就行。"
+    "hint": "留空即可，截图会存到插件数据目录下的 `shots` 子目录里（即 `data/plugin_data/astrbot_plugin_bsk_browser/shots`），插件会定期清理。只有想把截图固定放到某个位置（比如方便自己去看）时才填，要填完整路径，例如 `D:\\screenshots`。填了之后截图会落在 `<你填的路径>\\shots\\<会话id>\\图片.png`（即这一项是 `shots` 的父目录，不是最终的图片目录）。目录不存在时插件会自动创建（父级目录也会一起建），只要上级路径可写就行。"
   },
   "journal_path": {
     "description": "会话记录文件位置",
