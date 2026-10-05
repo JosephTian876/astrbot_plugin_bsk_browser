@@ -43,6 +43,7 @@ __all__ = [
     "DEFAULT_FULLPAGE_TIMEOUT_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
     "DEFAULT_JOURNAL_PATH",
+    "DEFAULT_LEGACY_TOOLS",
     "DEFAULT_MAX_PAGE_CHARS",
     "DEFAULT_MAX_SESSIONS",
     "DEFAULT_SCREENSHOT_DIR",
@@ -80,6 +81,18 @@ __all__ = [
 
 DEFAULT_ENABLED = True
 """插件总开关。"""
+
+DEFAULT_LEGACY_TOOLS = True
+"""是否同时注册旧版工具（0.1.x 的 8 个单动作工具）。
+
+默认开启，因为它是**向后兼容开关**：老用户可能已在 prompt、
+工作流或习惯里用着 ``bsk_open``/``bsk_read``/``bsk_act`` 这些名字，
+默认关掉等于静默删掉 8 个工具。想要更省上下文的用户可以显式关掉
+（关掉后只剩 6 个多动作工具，可省约 2000 字符的 prompt）。
+
+注意：``bsk_evaluate`` 不受本开关影响 —— 它有独立的
+``enable_evaluate``，是高风险工具，语义不同。
+"""
 
 DEFAULT_BSK_PATH = "bsk"
 """bsk 可执行文件路径。填裸名字表示从 PATH 查找。"""
@@ -570,6 +583,15 @@ class Settings:
     enabled: bool
     """插件总开关。关闭后所有工具直接拒绝调用。"""
 
+    legacy_tools: bool
+    """是否同时注册旧版工具（0.1.x 的 8 个单动作工具）。
+
+    默认 ``True``（向后兼容）。关掉后只注册 6 个多动作工具，
+    可省下约 2000 字符的 prompt —— 代价是模型不能再调用旧工具名。
+
+    不受本项影响：``bsk_evaluate``（有独立的 ``enable_evaluate``）。
+    """
+
     bsk_path: str
     """bsk 可执行文件路径。裸名字（如 ``bsk``）表示从 PATH 查找，否则视为绝对/相对路径。"""
 
@@ -677,6 +699,7 @@ def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
     journal_path = raw.get("journal_path")
     return Settings(
         enabled=_as_bool(raw.get("enabled"), DEFAULT_ENABLED),
+        legacy_tools=_as_bool(raw.get("legacy_tools"), DEFAULT_LEGACY_TOOLS),
         bsk_path=_as_str(raw.get("bsk_path"), DEFAULT_BSK_PATH),
         browser_instance_id=_as_str(
             raw.get("browser_instance_id"), DEFAULT_BROWSER_INSTANCE_ID

@@ -109,6 +109,12 @@
     },
     "hint": "读网页时最多把多少个字符交给模型。网页正文动辄几万字，全塞进去会占满模型的上下文、变慢也变贵，所以默认只给 3000 字。需要让机器人读长文章时可以调大，最大 20000。调太小（低于 200）会什么都读不到，插件会按 200 处理。"
   },
+  "legacy_tools": {
+    "description": "同时注册旧版工具",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启。开启时一共注册 14 个工具：6 个新的（bsk_session / bsk_page / bsk_inspect / bsk_interact / bsk_tabs / bsk_assist）加 8 个旧的（bsk_open / bsk_read / bsk_act / bsk_screenshot / bsk_close / bsk_status / bsk_logs / bsk_evaluate）。旧工具的行为一个字都没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」，老用户升级后一切照旧。关掉它可以少注册 8 个旧工具，每轮对话大约省下 2000 字符的工具描述（模型每次请求都要带上全部工具说明，关掉就能省这份固定开销），代价是旧写法不再可用——请确认你自己和你的提示词都改成新工具之后再关。注意 bsk_evaluate 不受这一项影响，它有自己的开关（enable_evaluate）。另外两个已知限制：①这一项只在**插件重新加载时**生效，改完配置请重新加载插件；②如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，那个关闭状态会优先于这一项。"
+  },
   "enable_evaluate": {
     "description": "允许执行 JavaScript（高风险，默认关闭）",
     "type": "bool",

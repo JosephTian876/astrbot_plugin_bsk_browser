@@ -34,6 +34,7 @@ from astrbot.api import logger as astrbot_logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
+from .bsk import tools as tools_mod
 from .bsk.config import (
     Settings,
     parse_settings,
@@ -43,6 +44,7 @@ from .bsk.config import (
 from .bsk.errors import BskError
 from .bsk.models import ConsoleLog
 from .bsk.service import BskService
+from .bsk.tools import BskToolError
 
 __all__ = ["BskBrowserPlugin"]
 
@@ -65,6 +67,171 @@ LOGS_LABELS: dict[str, str] = {
     "console": "控制台消息",
     "network": "网络请求",
 }
+
+# 8 个旧工具的名字。``legacy_tools=false`` 时它们会被停用（见
+# ``_deactivate_legacy_tools``），顺序与 main.py 里定义的先后一致。
+#
+# ``bsk_evaluate`` 在名单里，但停用时会被跳过：它是**独立的高危开关**
+# （``enable_evaluate``），把它绑到 ``legacy_tools`` 上会让用户误以为
+# "关掉旧工具"就等于"关掉执行脚本"，而实际上它是被另一项控制的。
+LEGACY_TOOL_NAMES: tuple[str, ...] = (
+    "bsk_open",
+    "bsk_read",
+    "bsk_act",
+    "bsk_screenshot",
+    "bsk_close",
+    "bsk_status",
+    "bsk_evaluate",
+    "bsk_logs",
+)
+
+# 6 个新工具的名字（schema 来自 ``bsk/tools.py`` 的 ``TOOL_SCHEMAS``）。
+NEW_TOOL_NAMES: tuple[str, ...] = (
+    "bsk_session",
+    "bsk_page",
+    "bsk_inspect",
+    "bsk_interact",
+    "bsk_tabs",
+    "bsk_assist",
+)
+
+# 失败回执的中文主语：{工具名: 动词短语}。用于 ``_dispatch`` 拼
+# "{X}失败：{原因}"。刻意不写工具名本身（"bsk_page 失败"对模型没有信息量，
+# 它已经知道自己调了哪个工具），而是写这个工具**在做的事**。
+_ACTION_LABEL: dict[str, str] = {
+    "bsk_session": "管理浏览器会话",
+    "bsk_page": "页面导航",
+    "bsk_inspect": "读取页面",
+    "bsk_interact": "页面交互",
+    "bsk_tabs": "管理标签页",
+    "bsk_assist": "窗口与设备设置",
+}
+
+# JSON Schema 属性允许的 ``type`` 取值 —— 与 AstrBot 的
+# ``func_tool_manager.SUPPORTED_TYPES`` 一字不差。``integer`` **刻意不在**
+# 这个集合里（AstrBot 不认它，本插件的整数语义参数一律声明成 ``number``）。
+#
+# 注意：写 ``integer`` 并不会让 ``FunctionTool(...)`` 抛异常（实测：
+# jsonschema 的 meta-schema 允许它，只是 provider 侧未必认）—— 它是
+# **本插件自己的**约定，属于"宁可在这里拦下"的那一类。
+_SANE_TYPES: frozenset[str] = frozenset(
+    {"string", "number", "object", "array", "boolean"}
+)
+
+
+def _schema_is_sane(schema: Any) -> bool:
+    """跑一遍轻量的 JSON Schema 合法性预检。
+
+    为什么必须有这道检查（第二轮审阅实测的坑）：``tool.parameters = {...}``
+    这个赋值**不触发** pydantic 校验（校验器是 ``model_validator(mode="after")``，
+    只在构造 ``FunctionTool(...)`` 时跑）。非法 schema 要到**下一次**
+    ``get_full_tool_set()`` 里 ``FunctionTool(...)`` 才炸，而那条路径被
+    ``internal.py`` 兜住并往聊天里发一句 "Error occurred while processing
+    agent request: ..." —— 也就是说**一条 schema 笔误会让机器人对每条普通
+    消息都报错**，远不止影响浏览器工具。
+
+    所以覆写前先在这里拦一道：不合法就跳过覆写、保留 ``@filter.llm_tool``
+    由 docstring 推出的基础 schema（那个永远是合法的），再打一条 warning。
+    代价是那个工具的 ``action`` 枚举没写进去（模型只能靠描述文字理解），
+    但这远比整个机器人每条消息都报错轻。
+
+    检查项是**实测出来的**（逐个用 ``FunctionTool(...)`` 构造验证过），
+    不是照着 spec 猜的 —— 见下面的 Note。刻意**不引入 jsonschema 依赖**：
+    它是第三方库，本插件要求纯标准库。
+
+    Args:
+        schema: 待检查的 schema（``bsk/tools.py`` 的 ``TOOL_SCHEMAS`` 值）。
+
+    Returns:
+        ``True`` 表示可以安全覆写；``False`` 表示应跳过并告警。
+
+    Note:
+        实测（AstrBot 4.28.1）**会**让 ``FunctionTool(...)`` 抛
+        ``ValidationError`` 的：``properties`` 不是对象、``properties`` 的值
+        不是对象、``required`` 不是数组、``required`` 的元素不是字符串、
+        ``enum`` 不是数组、``description`` 不是字符串、``items`` 不是对象、
+        以及**嵌套**结构里的同类错误、``type`` 写了不认识的值（如 ``strng``）。
+
+        实测**不会**抛的（所以不要为它们拒绝整条 schema）：``integer``、
+        顶层 ``type`` 不是 object、``properties`` 为空、``required`` 引用了
+        不存在的键、``enum`` 是空数组、属性写成 ``true``。
+
+        也就是说本函数比"能拦住崩溃"更严一点：它额外拒绝 ``integer``
+        与空的 ``properties``（前者是本插件的硬约束 H1，后者会让模型收到
+        一个没有参数的工具）。**严一点是有意的** —— 误拒的代价只是那个工具
+        退回基础 schema，漏放的代价是机器人对每条消息报错。
+    """
+    if not isinstance(schema, dict):
+        return False
+    if schema.get("type") != "object":
+        return False
+    if not _properties_are_sane(schema.get("properties"), require_non_empty=True):
+        return False
+
+    required = schema.get("required")
+    if required is not None:
+        if not isinstance(required, list):
+            return False
+        if any(not isinstance(item, str) for item in required):
+            return False
+        if any(item not in schema["properties"] for item in required):
+            return False
+    return True
+
+
+def _properties_are_sane(properties: Any, *, require_non_empty: bool) -> bool:
+    """递归检查一层 ``properties`` 及其子结构。
+
+    递归是必要的：``completion_criteria`` 的 ``any``/``all`` 里还嵌着一层
+    ``properties``，而嵌套层的错误同样会让 ``FunctionTool(...)`` 构造失败
+    （实测确认），只查顶层等于漏掉一半。
+    """
+    if not isinstance(properties, dict):
+        return False
+    if require_non_empty and not properties:
+        return False
+
+    for name, prop in properties.items():
+        if not isinstance(name, str) or not name:
+            return False
+        if not _property_is_sane(prop):
+            return False
+    return True
+
+
+def _property_is_sane(prop: Any) -> bool:
+    """检查单个属性定义（含它的 ``items`` / 嵌套 ``properties``）。"""
+    if not isinstance(prop, dict):
+        return False
+    if prop.get("type") not in _SANE_TYPES:
+        return False
+
+    description = prop.get("description")
+    if description is not None and not isinstance(description, str):
+        return False
+
+    enum = prop.get("enum")
+    if enum is not None and not isinstance(enum, list):
+        return False
+
+    items = prop.get("items")
+    if items is not None:
+        if not isinstance(items, dict):
+            return False
+        items_type = items.get("type")
+        if items_type is not None and items_type not in _SANE_TYPES:
+            return False
+        # items 里也可以再嵌 properties（数组套对象）。
+        if "properties" in items and not _properties_are_sane(
+            items.get("properties"), require_non_empty=False
+        ):
+            return False
+
+    if "properties" in prop and not _properties_are_sane(
+        prop.get("properties"), require_non_empty=False
+    ):
+        return False
+    return True
 
 
 def _coerce_since(value: Any) -> int:
@@ -274,12 +441,119 @@ class BskBrowserPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - 恢复失败不能让插件加载失败
             astrbot_logger.warning("[bsk_browser] 清理遗留会话时出错（已忽略）：%r", exc)
 
+        # 6 个新工具的完整 schema 由 bsk/tools.py 提供。@filter.llm_tool 在
+        # import 期只给出由 docstring 推出的基础 schema（**表达不了 action 的
+        # enum**），所以这里覆写成完整版。
+        #
+        # 为什么必须写在 initialize() 里（而不是 import 期做一次）：插件重载会
+        # 把 FuncTool 整个重建（star_manager 先 remove_func 再走 spec_to_func），
+        # import 期写的补丁会随旧对象一起丢掉。initialize() 是**每次加载都会
+        # 执行**的那个点。覆写本身是幂等的：每次都是整体替换，不会累积。
+        # 这也必须早于任何一次 get_full_tool_set() —— _PermissionGuardedTool
+        # 在构造时对 parameters 做的是**快照**，不是实时视图。
+        self._apply_tool_schemas()
+
+        # 按配置决定那 8 个旧工具是否还注册。默认 true：老用户升级无感
+        # —— 若默认 false，等于**静默删掉** 8 个工具，正在用旧写法的用户
+        # 会在毫无预兆的情况下发现工具"没了"。
+        if not self.settings.legacy_tools:
+            self._deactivate_legacy_tools()
+
         astrbot_logger.info(
             "[bsk_browser] 已加载。bsk 路径=%s，最大会话=%d，仅管理员=%s",
             self.settings.bsk_path,
             self.settings.max_sessions,
             self.settings.admin_only,
         )
+
+    # ------------------------------------------------------------------
+    # 工具注册后的接线（schema 覆写 + 旧工具开关）
+    # ------------------------------------------------------------------
+
+    def _apply_tool_schemas(self) -> None:
+        """把 ``bsk/tools.py`` 的完整 schema 覆写到已注册的 6 个新工具上。
+
+        覆写而不是重新注册：``@filter.llm_tool`` 已经完成了 handler 注册与
+        插件实例绑定（框架用 ``handler.__module__ == metadata.module_path``
+        决定要不要绑 ``self``），重新注册会丢掉这层绑定。直接改
+        ``tool.parameters`` 不影响绑定（已实测）。
+
+        每个工具在覆写前都要过 :func:`_schema_is_sane`：非法 schema 不会在
+        赋值时被发现，而是在下一次 ``get_full_tool_set()`` 构造
+        ``FunctionTool`` 时才抛，那条路径会让机器人**对每条普通消息**都报错。
+        不合法就跳过这个工具（保留 docstring 推出的基础 schema）并告警。
+        """
+        import copy
+
+        from astrbot.core.provider.register import llm_tools
+
+        for name, schema in tools_mod.TOOL_SCHEMAS.items():
+            if not _schema_is_sane(schema):
+                astrbot_logger.warning(
+                    "[bsk_browser] 工具 %s 的 schema 未通过合法性预检，"
+                    "已跳过覆写并保留由 docstring 推出的基础 schema。"
+                    "这几乎肯定是 bsk/tools.py 里的笔误 —— 请检查它的 "
+                    "type / properties / required / enum / description / items"
+                    "（嵌套层同样检查）。",
+                    name,
+                )
+                continue
+
+            tool = llm_tools.get_func(name)
+            if tool is None:
+                astrbot_logger.warning(
+                    "[bsk_browser] 工具 %s 未注册，schema 覆写跳过。", name
+                )
+                continue
+
+            tool.parameters = copy.deepcopy(schema)
+
+            # 运行时探针：覆写后回读一次，确认 enum 真的写进去了。
+            # 这是防"框架换了实现、赋值变成只读或被重建"这类静默失效 ——
+            # 那种情况下工具仍然可用（描述文字里有 action 列表），
+            # 但模型少了枚举约束，值得留一条日志。
+            got = (
+                (tool.parameters or {})
+                .get("properties", {})
+                .get("action", {})
+                .get("enum")
+            )
+            if not got:
+                astrbot_logger.warning(
+                    "[bsk_browser] 工具 %s 的 action 枚举未能写入 schema"
+                    "（AstrBot 版本可能已变更），模型仍可通过描述文字使用该工具。",
+                    name,
+                )
+
+    def _deactivate_legacy_tools(self) -> None:
+        """按配置停用 8 个旧工具（``bsk_evaluate`` 除外，它有自己的开关）。
+
+        为什么直接设 ``tool.active = False`` 而不是调框架的
+        ``deactivate_llm_tool_async``：后者会把这个名字写进**持久化**的
+        ``inactivated_llm_tools``（全局 SharedPreferences）。用户只是临时关掉
+        ``legacy_tools`` 试试，却会在全局配置里留下永久痕迹，卸载插件也带不走
+        ——下次装回来那 8 个工具还是关着的。直接设 ``active`` 只影响本次进程，
+        随插件重载自然恢复。
+
+        Note:
+            两个已知的边界，都已在 ``_conf_schema.json`` 的 hint 里如实写明：
+
+            1. 用户若在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，
+               ``star_manager`` 每次加载都会重算
+               ``ft.active = not plugin_disabled and ft.name not in inactivated_llm_tools``
+               —— 那是在本方法**之后**跑的，所以那一项始终优先；
+            2. 本方法只在插件加载时执行一次，改配置需要重新加载插件。
+        """
+        from astrbot.core.provider.register import llm_tools
+
+        for name in LEGACY_TOOL_NAMES:
+            if name == "bsk_evaluate":
+                # 它有自己的开关（enable_evaluate）且是独立的高危工具，
+                # 不该跟着"旧工具"一起被关掉，见 LEGACY_TOOL_NAMES 的注释。
+                continue
+            tool = llm_tools.get_func(name)
+            if tool is not None:
+                tool.active = False
 
     async def terminate(self) -> None:
         """插件卸载/停用时调用：关闭所有浏览器会话。
@@ -485,6 +759,853 @@ class BskBrowserPlugin(Star):
         return message
 
     # ------------------------------------------------------------------
+    # 六个新工具：统一入口 _dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch(self, tool: str, event: AstrMessageEvent, raw: dict) -> str:
+        """6 个新工具的统一入口：权限门 → 参数校验 → 分派 → 包装结果。
+
+        这 6 个工具的全部 handler 都只是 ``return await self._dispatch(...)``
+        —— 逻辑只有这一份。它们与旧工具共用同一套权限门（:meth:`_denied`，
+        含 ``enabled`` / 白名单 / ``admin_only`` 三态）与同一个 ``service``。
+
+        Args:
+            tool: 6 个工具名之一（``bsk_session`` … ``bsk_assist``）。
+            event: 消息事件，用于权限判定。
+            raw: 框架按形参名注入的原始 kwargs（**未经任何处理**）。
+
+        Returns:
+            给模型看的字符串。所有异常都在这里被收敛成中文文案，
+            绝不把异常抛进框架 —— 框架那层会把它渲染成
+            "Tool execution error: ..." 这种对模型毫无用处的英文堆栈，
+            还会把 ``event.send`` 里的错误提示发给用户。
+        """
+        # --- 第 1 步：权限门 ---
+        # bsk_session 的 list 是纯本地只读（只列本插件自己建的会话），
+        # 与 bsk_status 同一性质：它是用户"我这边还能用吗"的自助排查手段，
+        # 拒掉它只会让人更没法自查。所以和 bsk_status 一样允许非管理员。
+        # 注意先做一次**归一化**再判断 action：模型可能写 "List"、拼错大小写，
+        # 也可能带上连字符写法，归一化后才是可以比较的形式。
+        peek = tools_mod.normalize_args(raw)
+        self_serve = tool == "bsk_session" and peek.get("action") == "list"
+        if not self_serve:
+            denied = self._denied(event)
+            if denied:
+                return self._fail(denied)
+        elif not self.settings.enabled:
+            # list 放行的是 admin_only / 白名单，不是总开关。
+            return self._fail("浏览器操作已在插件配置中停用。")
+
+        # --- 第 2 步：参数校验 ---
+        # BskToolError 的 message 本身就是写好的中文提示（"哪里错了、
+        # 应该怎么改"），直接回给模型，它照着改就能重试成功。
+        try:
+            args = tools_mod.validate(tool, peek)
+        except BskToolError as exc:
+            return self._fail(str(exc))
+
+        # --- 第 3 步：分派 ---
+        try:
+            return await self._run_tool(tool, event, args)
+        except BskError as exc:
+            return self._fail(
+                f"{_ACTION_LABEL.get(tool, tool)}失败：{exc.friendly}"
+            )
+        except Exception:  # noqa: BLE001 - 兜底，绝不让异常穿到框架
+            astrbot_logger.exception("[bsk_browser] %s 未预期错误", tool)
+            return self._fail(
+                f"{_ACTION_LABEL.get(tool, tool)}时出现未预期的错误。"
+                "这是插件内部的故障，请把这次调用的参数告诉用户，"
+                "并建议他查看 AstrBot 日志。"
+            )
+
+    async def _run_tool(self, tool: str, event: AstrMessageEvent, args: dict) -> str:
+        """把校验过的参数按工具名路由到 ``service`` 的对应方法并渲染结果。
+
+        Args:
+            tool: 6 个工具名之一。
+            event: 用于算会话键。
+            args: :func:`bsk.tools.validate` 的输出（已含规范化的 ``action``）。
+
+        Returns:
+            给模型看的中文回执。
+
+        Note:
+            这里**只做 action 分派 + 结果渲染**，一行 bsk 细节都不写 ——
+            参数怎么变成 argv、超时怎么算、只读还是写操作，全在 ``bsk/service.py``
+            里，那边是唯一实现（TOOL-SPEC H4：新工具必须复用既有实现）。
+        """
+        action = args["action"]
+        key = self._key(event)
+
+        if tool == "bsk_session":
+            return await self._run_session(key, action, args)
+        if tool == "bsk_page":
+            return await self._run_page(key, action, args)
+        if tool == "bsk_inspect":
+            return await self._run_inspect(key, action, args)
+        if tool == "bsk_interact":
+            return await self._run_interact(key, action, args)
+        if tool == "bsk_tabs":
+            return await self._run_tabs(key, action, args)
+        return await self._run_assist(key, action, args)
+
+    # --- bsk_session ---------------------------------------------------
+
+    async def _run_session(self, key: str, action: str, args: dict) -> str:
+        """bsk_session 的 start / stop / list 三个分支。"""
+        if action == "start":
+            info = await self.service.start_session(
+                url=args.get("url", ""),
+                width=args.get("width"),
+                height=args.get("height"),
+                no_focus=args.get("no_focus", False),
+                browser=args.get("browser", ""),
+                device=args.get("device", ""),
+                key=key,
+            )
+            lines = [f"已启动浏览器会话：{info.get('session_id') or '(未返回 ID)'}"]
+            if info.get("url"):
+                lines.append(f"已打开：{info['url']}")
+            if info.get("browser_instance_id"):
+                lines.append(f"浏览器实例：{info['browser_instance_id']}")
+            if info.get("device"):
+                lines.append(f"设备模拟：{info['device']}")
+            # 如实说明 no_focus 当前无效果 —— 裁决 6：本插件**始终**在后台
+            # 打开会话，模型传 false 不会生效。不说明的话它会以为自己控制住了，
+            # 于是下次遇到"窗口抢焦点"的问题还会继续传这个参数。
+            lines.append(
+                "浏览器窗口是在后台打开的（本插件始终不抢焦点，"
+                "no_focus 这一项目前无效果）。"
+            )
+            lines.append("接下来可以直接用 bsk_page / bsk_inspect 等工具操作这一页。")
+            return "\n".join(lines)
+
+        if action == "stop":
+            info = await self.service.stop_session(args.get("session", ""))
+            if info.get("stopped"):
+                return (
+                    f"已停止浏览器会话 {info.get('session_id') or ''}。".rstrip()
+                    + "（借用的标签页会一并归还。）"
+                )
+            return "这条会话此前已经不在运行了，没有需要停止的东西。"
+
+        # list
+        return self._render_sessions(self.service.list_sessions())
+
+    @staticmethod
+    def _render_sessions(info: dict) -> str:
+        """把 ``service.list_sessions()`` 渲染成给模型看的中文。
+
+        ``list`` 走的是**本地注册表**（不访问 daemon），所以它列出的是本插件
+        自己建的会话，字段与 ``bsk_status`` 的诊断信息不是一回事。
+        """
+        sessions = info.get("sessions") or []
+        if not sessions:
+            return (
+                "本插件当前没有任何浏览器会话。\n"
+                "第一次操作浏览器前，请先用 bsk_session(action=\"start\") 建一个。"
+            )
+
+        state_labels = {
+            "active": "可用",
+            "stopped": "已停止",
+            "pending_cleanup": "待清理（上个进程遗留，不要再操作它）",
+        }
+        lines = [f"本插件创建的浏览器会话（{len(sessions)} 个）："]
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            state = str(item.get("state") or "")
+            marks = []
+            if item.get("current"):
+                marks.append("当前")
+            suffix = f"［{', '.join(marks)}］" if marks else ""
+            lines.append(
+                f"  - session={item.get('session_id') or '(无 ID)'}"
+                f"，key={item.get('key') or '(无)'}"
+                f"，状态：{state_labels.get(state, state or '未知')}{suffix}"
+            )
+        pending = info.get("pending_cleanup") or 0
+        if pending:
+            lines.append(
+                f"另有 {pending} 个上个进程遗留、尚未清理的会话"
+                "（插件下次启动时会自动清掉）。"
+            )
+        lines.append(
+            "要用某个会话，把它的 session 值传给对应工具的 session 参数；"
+            "省略就用当前那一个。"
+        )
+        return "\n".join(lines)
+
+    # --- bsk_page ------------------------------------------------------
+
+    async def _run_page(self, key: str, action: str, args: dict) -> str:
+        """bsk_page 的 navigate / back / forward / reload / wait 五个分支。"""
+        if action == "navigate":
+            nav = await self.service.navigate(
+                key,
+                args["url"],
+                wait_until=args.get("wait_until", "load"),
+                timeout_ms=args.get("timeout_ms"),
+                tab_id=args.get("tab_id"),
+            )
+            return self._render_nav("已导航", nav)
+
+        if action in ("back", "forward"):
+            nav = await self.service.history(
+                key,
+                action,
+                wait_until=args.get("wait_until", "load"),
+                timeout_ms=args.get("timeout_ms"),
+                tab_id=args.get("tab_id"),
+            )
+            return self._render_nav("已后退" if action == "back" else "已前进", nav)
+
+        if action == "reload":
+            nav = await self.service.reload_page(
+                key,
+                hard=args.get("hard", False),
+                wait_until=args.get("wait_until", "load"),
+                timeout_ms=args.get("timeout_ms"),
+                tab_id=args.get("tab_id"),
+            )
+            return self._render_nav(
+                "已强制刷新（绕过缓存）" if args.get("hard") else "已刷新", nav
+            )
+
+        # wait
+        nav = await self.service.wait_for(
+            key,
+            wait_until=args.get("wait_until", "load"),
+            timeout_ms=args.get("timeout_ms") or 30000,
+            tab_id=args.get("tab_id"),
+        )
+        return self._render_nav("已等待页面加载完成", nav)
+
+    @staticmethod
+    def _render_nav(verb: str, nav: dict) -> str:
+        """渲染导航/等待的结果。
+
+        ``reached`` 可以是 ``"timeout"`` —— 那是**结果不是错误**
+        （TOOL-SPEC §1.2 明说），所以这里必须如实转达，并且**不能**写成
+        失败语气：模型看到"失败"会去重试，而重试往往只是再等一次同样的时间。
+        """
+        reached = str(nav.get("reached") or "")
+        url = nav.get("final_url") or nav.get("url") or ""
+        session = nav.get("session") or ""
+
+        if reached == "timeout":
+            head = (
+                f"{verb}，但页面在超时时间内没有到达指定的加载阶段"
+                "（这是等待结果，不是命令失败：页面很可能还在加载）。"
+            )
+        elif reached:
+            head = f"{verb}（页面已到达 {reached} 阶段）。"
+        else:
+            head = f"{verb}。"
+
+        lines = [head]
+        if url:
+            lines.append(f"当前地址：{url}")
+        if session:
+            lines.append(f"会话：{session}")
+        lines.append(
+            "页面内容可能已经变化，元素编号也会变；"
+            "接着请用 bsk_inspect(action=\"observe\") 重新读一次页面。"
+        )
+        return "\n".join(lines)
+
+    # --- bsk_inspect ---------------------------------------------------
+
+    async def _run_inspect(self, key: str, action: str, args: dict) -> str:
+        """bsk_inspect 的 7 个分支（observe / snapshot / html / screenshot /
+        console / network / debug）。"""
+        if action == "observe":
+            return await self._run_observe(key, args)
+
+        if action == "snapshot":
+            snap = await self.service.snapshot(
+                key,
+                max_depth=args.get("max_depth"),
+                max_tokens=args.get("max_tokens"),
+                tab_id=args.get("tab_id"),
+            )
+            lines = []
+            if snap.get("truncated"):
+                lines.append("（快照被截断，只显示了部分内容。）")
+            lines.append(str(snap.get("text") or "（页面没有可读内容。）"))
+            lines.append(
+                f"（会话：{snap.get('session') or '?'}，"
+                f"元素引用 {snap.get('ref_count') or 0} 个，"
+                f"所在标签页 id={snap.get('tab_id') or 0}。）"
+            )
+            return "\n".join(lines)
+
+        if action == "html":
+            html = await self.service.get_html(
+                key,
+                ref=args.get("ref", ""),
+                max_bytes=args.get("max_bytes") or 524288,
+                tab_id=args.get("tab_id"),
+            )
+            head = f"HTML 共 {html.get('byte_size') or 0} 字节"
+            if html.get("ref"):
+                head += f"（已限定到元素 {html['ref']}）"
+            return f"{head}：\n{html.get('html') or '（空）'}"
+
+        if action == "screenshot":
+            return await self._run_screenshot(key, args)
+
+        if action == "console":
+            return await self._run_logs(
+                key,
+                "console",
+                args,
+                include_stack=args.get("include_stack", False),
+            )
+
+        if action == "network":
+            return await self._run_logs(key, "network", args, include_stack=False)
+
+        # debug：bsk 的原始 JSON 直通（TOOL-SPEC §2 的硬要求：不重映射字段）。
+        # 这里只做一件事 —— 把非 JSON 的返回值也变成字符串。
+        result = await self.service.debug(
+            key, args["debug_action"], **self._debug_opts(args)
+        )
+        return self._render_debug(args["debug_action"], result)
+
+    @staticmethod
+    def _debug_opts(args: dict) -> dict:
+        """摘出要传给 ``service.debug`` 的调试参数。
+
+        这里有两处**必须**处理的形参冲突，都属于"Python 形参绑定"的硬约束
+        （不是设计选择），弄错就是 ``TypeError`` 或静默丢参：
+
+        1. ``action`` 要去掉 —— 它是 ``bsk_inspect`` 的工具级 action，
+           对 ``service.debug`` 没有意义。
+        2. ``debug_action`` 要去掉 —— ``service.debug`` 的签名是
+           ``debug(self, key, debug_action, **opts)``，``debug_action`` 已经是
+           **位置参数**；如果它还留在 ``opts`` 里，调用就变成
+
+               TypeError: debug() got multiple values for argument 'debug_action'
+
+           （与裁决 1 的 ``press``/``key`` 是同一类冲突，实测确认。）
+
+        ``tab_id`` 则**必须留着**：``service.debug`` 内部是
+        ``opts.pop("tab_id", None)`` 取它的，也就是说 ``tab_id`` 走的就是
+        ``opts`` 这条路。把它滤掉会让 ``bsk_inspect(action="debug", tab_id=N)``
+        静默打在别的标签上（校验层明明收下了它）——正是 REVIEW-ROUND2 的
+        P0-1 那一类错误。
+        """
+        return {
+            name: value
+            for name, value in args.items()
+            if name not in ("action", "debug_action")
+        }
+
+    @staticmethod
+    def _render_debug(debug_action: str, result: Any) -> str:
+        """把 debug 的原始载荷渲染成给模型看的文本。
+
+        刻意**不做字段重映射**：``debug`` 的输出形态由 action 决定
+        （列表、body 切片、导出路径、等待结果……），任何"统一化"都会丢掉
+        模型真正要看的东西。所以这里只是套一层中文抬头 + 序列化。
+        """
+        import json
+
+        if isinstance(result, str):
+            body = result
+        else:
+            try:
+                body = json.dumps(result, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                body = repr(result)
+        if not body.strip():
+            body = "（bsk 没有返回任何内容。）"
+        return f"debug {debug_action} 的原始返回：\n{body}"
+
+    async def _run_observe(self, key: str, args: dict) -> str:
+        """``bsk_inspect(action="observe")``。
+
+        为什么单独一个方法而不是直接 ``await service.observe(key)``：
+        ``bsk observe`` 的 CLI **确实**接受 ``--cursor`` / ``--max-depth`` /
+        ``--max-tokens`` / ``--tab-id``（已用 ``bsk observe --help`` 实测确认），
+        而 ``service.observe(key)`` 的签名只有 ``key`` —— 走它会把校验层
+        收下的这四个参数**静默丢掉**，模型以为翻页/限深生效了，实际没有。
+        这正是 REVIEW-ROUND2 的 P0-1 那一类缺陷。
+
+        所以这里按 ``service`` 的**实际能力**分两条路（用签名探测，不写死）：
+
+        - service 支持某个参数 → 正常转发；
+        - 不支持 → 明确告诉模型"这个参数当前不生效"，并且**在能给替代方案时
+          给出替代**（``max_depth``/``max_tokens`` 可以改用 snapshot）。
+
+        绝不静默：宁可让模型知道"这个旋钮没接上"，也不要它拿着一个
+        没生效的参数继续往下推理。
+
+        Note:
+            这是 **main.py 单方面的兼容处理**，``bsk/service.py`` 一行没动
+            （本次作业范围只允许改 main.py 与 _conf_schema.json）。
+            ``service.observe`` 补上这些形参之后，本方法会自动走"支持"那条
+            分支，无需再改代码 —— 探测是运行期做的。
+        """
+        supported = self._observe_supported_params()
+        forward: dict[str, Any] = {}
+        ignored: list[str] = []
+        for name in ("cursor", "max_depth", "max_tokens", "tab_id"):
+            value = args.get(name)
+            if value is None:
+                continue
+            if name in supported:
+                forward[name] = value
+            else:
+                ignored.append(name)
+
+        # 只有 cursor 是 observe 独有的：它没有等价替代，被忽略时必须说清楚，
+        # 否则模型会以为"下一页拿到了"，而实际上拿到的是同一页。
+        if "cursor" in ignored:
+            return self._fail(
+                "observe 的 cursor（继续读取被省略的内容）当前不可用："
+                "本插件的服务层还没接上它。\n"
+                "请不要传 cursor，改为重新 observe 一次拿到当前完整内容；"
+                "如果内容被截断，请用 bsk_inspect(action=\"snapshot\") 配合 "
+                "max_depth / max_tokens 控制返回量。"
+            )
+
+        observation = await self.service.observe(key, **forward)
+        text = self.service.render_page(observation)
+        if ignored:
+            text += (
+                "\n（注意：这次传入的 "
+                + "、".join(ignored)
+                + " 当前不生效，返回的是完整内容。"
+                "要控制返回量请改用 bsk_inspect(action=\"snapshot\")。）"
+            )
+        return text
+
+    @staticmethod
+    def _observe_supported_params() -> frozenset[str]:
+        """探测 ``service.observe`` 实际接受哪些可选参数。
+
+        运行期反射而不是写死常量：``bsk/service.py`` 是另一个代理的作业面，
+        它随时可能补上 ``cursor``/``max_depth``/``max_tokens``/``tab_id``。
+        写死的话，那边一补齐，这里就会变成"新增的能力被我挡住"——比现在的
+        静默丢弃好，但仍然是错的。反射让两边自动对齐。
+
+        探测失败（拿不到签名）时返回空集合：退化成"只调 observe(key)"，
+        与改造前的行为一致，绝不因为一次反射失败就把工具打崩。
+        """
+        import inspect
+
+        try:
+            sig = inspect.signature(BskService.observe)
+        except (TypeError, ValueError):  # pragma: no cover - 内建/装饰器异常
+            return frozenset()
+
+        allowed_kinds = (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        supported: set[str] = set()
+        for name, param in sig.parameters.items():
+            if name in ("self", "key"):
+                continue
+            # 有 **kwargs 时，任何名字都能传进去。
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                return frozenset({"cursor", "max_depth", "max_tokens", "tab_id"})
+            if param.kind in allowed_kinds:
+                supported.add(name)
+        return frozenset(supported)
+
+    async def _run_screenshot(self, key: str, args: dict) -> str:
+        """``bsk_inspect(action="screenshot")``：截图并回一段文字描述。
+
+        ⚠️ 与旧工具 ``bsk_screenshot`` 的**唯一行为差异**，必须说清楚：
+        这里的 handler 返回 ``str``（schema 覆写后框架按普通函数调用它），
+        **不是** async generator，所以拿不到 ``yield event.image_result(...)``
+        那条路 —— 新工具不会把图片发给用户，只回一段描述文字。
+
+        这是本次改造里唯一的功能回退点，已在交付报告里如实列出。
+        要真的把图片发出去，目前只能用兼容保留的 ``bsk_screenshot``
+        （它还能整页截图，新工具也没有这个能力）。
+        """
+        payload = await self.service.screenshot_ex(
+            key,
+            ref=args.get("ref", ""),
+            tab_id=args.get("tab_id"),
+        )
+        message = payload.for_llm
+        if payload.warning:
+            message = f"{message}\n注意：{payload.warning}"
+        return (
+            f"{message}\n"
+            "（说明：新工具只返回这段文字描述，不会把图片作为消息发出去；"
+            f"截图文件在 {payload.path}。"
+            "需要把图片直接发给用户时，请改用 bsk_screenshot。）"
+        )
+
+    async def _run_logs(
+        self, key: str, kind: str, args: dict, *, include_stack: bool
+    ) -> str:
+        """console / network 两个分支，共用 ``bsk_logs`` 那套游标与渲染。
+
+        复用既有实现（TOOL-SPEC H4）：``_next_since`` 的游标推进规则、
+        ``LOGS_RENDER_LIMIT`` 的展示上限、``render_console`` 的双重截断，
+        全部走旧工具同一条路径，新工具只多做一次参数传递。
+        """
+        cursor = int(args.get("since") or 0)
+        label = LOGS_LABELS[kind]
+        if kind == "console":
+            log = await self.service.read_console_ex(
+                key,
+                since=cursor,
+                limit=args.get("limit"),
+                max_text_chars=args.get("max_text_chars"),
+                include_stack=include_stack,
+                tab_id=args.get("tab_id"),
+            )
+        else:
+            log = await self.service.read_network_ex(
+                key,
+                since=cursor,
+                limit=args.get("limit"),
+                max_text_chars=args.get("max_text_chars"),
+                tab_id=args.get("tab_id"),
+            )
+        return self._render_logs(label, cursor, log)
+
+    @staticmethod
+    def _render_logs(label: str, cursor: int, log: ConsoleLog) -> str:
+        """渲染日志结果（与 ``bsk_logs`` 同一套文案与游标约定）。"""
+        next_cursor = _next_since(cursor, log)
+        if not log.entries:
+            return (
+                f"从第 {cursor} 条之后到现在，这段时间内没有捕获到{label}。\n"
+                "常见原因：页面本来就没输出、还没有新动作发生，或者浏览器会话"
+                "是刚重建的（重建后日志会从头开始）。\n"
+                f"可以保持 since={next_cursor} 再查一次，或先做点页面操作再看。"
+            )
+
+        body = BskService.render_console(log, limit=LOGS_RENDER_LIMIT)
+        shown = min(len(log.entries), LOGS_RENDER_LIMIT)
+        hidden = len(log.entries) - shown
+        lines = [
+            f"{label}（本次返回 {len(log.entries)} 条，展示 {shown} 条）：",
+            body,
+        ]
+        if hidden > 0:
+            lines.append(
+                f"（还有 {hidden} 条这次没展示，把 since 设成下面这个值再读一次"
+                "就能接着看。）"
+            )
+        lines.append(
+            f"下次只看新增的{label}，请传 since={next_cursor}"
+            f"（只返回序号大于 {next_cursor} 的日志；传 0 则从头读）。"
+        )
+        return "\n".join(lines)
+
+    # --- bsk_interact --------------------------------------------------
+
+    async def _run_interact(self, key: str, action: str, args: dict) -> str:
+        """bsk_interact 的 9 个分支，全部走 ``service.interact`` 一个入口。"""
+        opts = {
+            name: value
+            for name, value in args.items()
+            if name not in ("action", "tab_id")
+        }
+        # 【裁决 1】**必须**在这里改名，且只能是这里。
+        #
+        # 校验层输出的键是 ``key``（对齐 DSH 的公共参数名，模型看到的就是它），
+        # 而 ``service.interact(self, key, action, ...)`` 的 ``key`` 已经是
+        # **会话键**。Python 的形参绑定不允许两个 ``key`` 共存：
+        #
+        #     interact(k, "press", key="Enter")
+        #     -> TypeError: got multiple values for argument 'key'
+        #
+        # 把会话键改成传关键字也一样撞（换成 action 那一侧）。所以改名只能
+        # 发生在**调用之前**，service 内部救不了自己。
+        if action == "press":
+            opts["press_key"] = opts.pop("key")
+        result = await self.service.interact(
+            key, action, tab_id=args.get("tab_id"), **opts
+        )
+        return self._render_interact(action, result)
+
+    @staticmethod
+    def _render_interact(action: str, result: dict) -> str:
+        """渲染交互结果。
+
+        ``service.interact`` 的返回是"通用字段 + 该 action 的结果字段"的
+        并集，字段名原样来自 bsk 载荷（不重映射）。这里只挑几个通用字段说
+        人话，其余原样附上，避免模型因为看不到回执而怀疑操作没生效。
+        """
+        lines = [f"已执行 {action}。"]
+        session = result.get("session")
+        if session:
+            lines.append(f"会话：{session}")
+        target = result.get("target")
+        if target:
+            lines.append(f"目标元素：{target}")
+        if result.get("changed"):
+            lines.append(
+                "这个动作会改变页面，接下来请用 bsk_inspect(action=\"observe\") "
+                "确认结果（页面变化后元素编号会变，不要沿用旧的 @eN）。"
+            )
+
+        extra = {
+            name: value
+            for name, value in result.items()
+            if name not in ("session", "action", "target", "changed", "tab_id")
+            and value not in (None, "", [], {})
+        }
+        if extra:
+            rendered = "、".join(f"{name}={value!r}" for name, value in extra.items())
+            lines.append(f"浏览器返回的其他信息：{rendered}")
+        return "\n".join(lines)
+
+    # --- bsk_tabs ------------------------------------------------------
+
+    async def _run_tabs(self, key: str, action: str, args: dict) -> str:
+        """bsk_tabs 的 6 个分支，全部走 ``service.tabs``。"""
+        opts = {
+            name: value
+            for name, value in args.items()
+            if name not in ("action", "tab_id")
+        }
+        # ``service.tabs`` 的 ``tab_id`` 关键字参数与 ``opts["tab_id"]``
+        # 是同一个东西的两个入口（它内部就是 ``tab_id if tab_id is not None
+        # else opts.get("tab_id")``）。这里统一走关键字参数，避免同一个值
+        # 出现两份。list/create 的校验器只在模型显式传了 tab_id 时才写回它，
+        # 所以 ``args.get("tab_id")`` 为 None 时就等于"没传"。
+        result = await self.service.tabs(
+            key, action, tab_id=args.get("tab_id"), **opts
+        )
+        return self._render_tabs(action, result)
+
+    @staticmethod
+    def _render_tabs(action: str, result: dict) -> str:
+        """渲染标签页管理的结果。"""
+        if action == "list":
+            tabs = result.get("tabs") or []
+            if not tabs:
+                return (
+                    "没有列出任何标签页。可能是当前会话还没有可用标签页，"
+                    "或 scope 过滤掉了它们（scope=user 列用户的、agent 列"
+                    "Agent Window 的、all 列全部）。"
+                )
+            lines = [f"标签页（{len(tabs)} 个）："]
+            for tab in tabs:
+                if not isinstance(tab, dict):
+                    continue
+                tab_id = tab.get("tab_id", tab.get("id", "?"))
+                title = tab.get("title") or "（无标题）"
+                url = tab.get("url") or ""
+                active = "［当前活动］" if tab.get("active") else ""
+                lines.append(f"  - id={tab_id} {title}{active}")
+                if url:
+                    lines.append(f"      {url}")
+            lines.append("要操作其中某一页，把它的 id 传给 tab_id。")
+            return "\n".join(lines)
+
+        lines = [f"已执行 tab {action}。"]
+        if result.get("tab_id") is not None:
+            lines.append(f"标签页 id：{result['tab_id']}")
+        extra = {
+            name: value
+            for name, value in result.items()
+            if name not in ("session", "action", "tab_id", "tabs")
+            and value not in (None, "", [], {})
+        }
+        if extra:
+            rendered = "、".join(f"{name}={value!r}" for name, value in extra.items())
+            lines.append(f"浏览器返回的其他信息：{rendered}")
+        if action == "borrow":
+            lines.append(
+                "这一页原本是用户自己的标签页，现在被移进了 Agent Window。"
+                "用完请尽快用 bsk_tabs(action=\"return\") 还回去"
+                "（停止会话时也会自动归还）。"
+            )
+        return "\n".join(lines)
+
+    # --- bsk_assist ----------------------------------------------------
+
+    async def _run_assist(self, key: str, action: str, args: dict) -> str:
+        """bsk_assist 的 resize / emulate / request-help 三个分支。"""
+        if action == "resize":
+            result = await self.service.resize_window(
+                key,
+                args["width"],
+                args["height"],
+                tab_id=args.get("tab_id"),
+            )
+            return (
+                f"已把窗口调整为 {result.get('width')}x{result.get('height')}。"
+                "（窗口尺寸是会话级的，与具体标签页无关。）"
+            )
+
+        if action == "emulate":
+            result = await self.service.emulate(
+                key,
+                device=args.get("device", ""),
+                width=args.get("width"),
+                height=args.get("height"),
+                mobile=args.get("mobile", False),
+                off=args.get("off", False),
+                tab_id=args.get("tab_id"),
+            )
+            if result.get("off"):
+                return "已清除这个会话上的全部设备模拟设置。"
+            parts = []
+            if result.get("device"):
+                parts.append(f"设备预设 {result['device']}")
+            if result.get("width") and result.get("height"):
+                parts.append(f"视口 {result['width']}x{result['height']}")
+            detail = "，".join(parts) if parts else "（bsk 未回显具体参数）"
+            return (
+                f"已应用设备模拟：{detail}。\n"
+                "模拟只作用于会话当前的活动标签页；要恢复请用 off=true。"
+            )
+
+        # request-help
+        result = await self.service.request_help(
+            key,
+            args["prompt"],
+            title=args.get("title", ""),
+            targets=args.get("targets") or [],
+            timeout_ms=args.get("timeout_ms") or 300000,
+            completion_criteria=args.get("completion_criteria"),
+            tab_id=args.get("tab_id"),
+        )
+        return self._render_request_help(result)
+
+    @staticmethod
+    def _render_request_help(result: dict) -> str:
+        """渲染 request-help 的结果。
+
+        核心是**如实转达 outcome 的语义**：只有 ``continued`` 与 ``completed``
+        表示用户已经做完（TOOL-SPEC §1.6）。其余取值（``cancelled`` /
+        ``timed_out`` / ``navigated`` / ``disabled``）都**不是**继续信号 ——
+        如果模型把它们当成"用户可以继续了"，它会接着去操作一个真人根本
+        没碰过的页面，然后照着错误的前提回答用户。
+        """
+        outcome = str(result.get("outcome") or "")
+        # 这里刻意不用 Markdown 加粗（**...**）：这段文字会被原样发到
+        # QQ / 微信等不渲染 Markdown 的平台，星号会直接显示给用户。
+        # 强调靠中文措辞本身（"没有完成"、"不能当成"）。
+        meanings = {
+            "continued": "用户已经完成了他该做的事，可以继续。",
+            "completed": "用户完成了全部步骤，可以继续。",
+            "cancelled": "用户主动取消了这次求助，没有完成。",
+            "timed_out": "等到超时用户也没有完成，没有完成。",
+            "navigated": "用户把页面导航到了别处，请求被中断，不能当成已完成。",
+            "disabled": "这个部署里的求助功能被禁用了，用户根本没看到提示。",
+        }
+        if outcome in ("continued", "completed"):
+            head = f"求助结果：{outcome} —— {meanings[outcome]}"
+        elif outcome:
+            head = (
+                f"求助结果：{outcome} —— {meanings.get(outcome, '这不是继续信号。')}"
+                "不要把它当成用户已完成。"
+            )
+        else:
+            head = (
+                "求助结果：bsk 没有返回可识别的 outcome。"
+                "不能假定用户已经完成 —— 请先看一眼页面实际状态再决定下一步。"
+            )
+        return (
+            f"{head}\n"
+            "（本工具只是显示一个提示浮层给用户看，它自己不会代替用户做任何操作。）"
+        )
+
+    # ------------------------------------------------------------------
+    # 六个新工具（bsk_session / bsk_page / bsk_inspect / bsk_interact /
+    #            bsk_tabs / bsk_assist）
+    #
+    # 签名一律是 (self, event, **kwargs)：框架按**形参名**注入参数
+    # （astr_agent_tool_exec.py:763 的 `handler(event, *args, **kwargs)`），
+    # 签名里没有的名字会 TypeError → 框架抛 "Tool handler parameter mismatch"。
+    # 用 **kwargs 接住全部参数，多传的不会导致调用失败，真正的校验在
+    # bsk/tools.py 的纯函数里做（与 DSH 的 open object root 同构）。
+    #
+    # docstring 只写描述、**不写 Args: 段** —— schema 由 bsk/tools.py 覆写，
+    # Args 段不再是 schema 来源。描述里必须写清 action 取值：覆写失败时
+    # 它是模型唯一能看到的说明。每个 docstring 控制在 300 字符以内（token 成本）。
+    # ------------------------------------------------------------------
+
+    @filter.llm_tool("bsk_session")
+    async def bsk_session(self, event: AstrMessageEvent, **kwargs):
+        """管理浏览器会话：启动、停止、列出。
+
+        action 取 start / stop / list：
+        - start：启动一个新的浏览器会话（可用 url 直接打开网页）
+        - stop：停止当前会话
+        - list：列出本插件创建的会话（谁都能用，便于自助排查）
+
+        首次使用浏览器功能前必须先 start 一个会话；后续操作会自动复用它。
+        """
+        return await self._dispatch("bsk_session", event, kwargs)
+
+    @filter.llm_tool("bsk_page")
+    async def bsk_page(self, event: AstrMessageEvent, **kwargs):
+        """在浏览器里导航，并等待页面加载。
+
+        action 取 navigate / back / forward / reload / wait：
+        - navigate 打开网址；back / forward 走历史；reload 刷新（hard 绕缓存）
+        - wait 只等页面自己加载完，**不做任何导航**（点了会跳转的链接之后用它）
+
+        页面变化后元素编号会失效，请重新 observe 再操作。
+        """
+        return await self._dispatch("bsk_page", event, kwargs)
+
+    @filter.llm_tool("bsk_inspect")
+    async def bsk_inspect(self, event: AstrMessageEvent, **kwargs):
+        """读取页面状态，必要时开始抓包调试。
+
+        action 取 observe / snapshot / html / screenshot / console / network / debug。
+        读页面**优先用 observe**（最常用，给出正文与 @eN 元素编号）；
+        snapshot 是无游标的静态可达性树；html 取原始 HTML（有字节上限）；
+        screenshot 只回文字描述、**不会把图片发给用户**；console / network 支持
+        since 游标增量读；debug 用 debug_action 控制抓包与网络规则。
+        """
+        return await self._dispatch("bsk_inspect", event, kwargs)
+
+    @filter.llm_tool("bsk_interact")
+    async def bsk_interact(self, event: AstrMessageEvent, **kwargs):
+        """与页面交互：点击、输入、按键、滚动等。
+
+        action 取 click / hover / wheel / scroll-to / focus / blur / fill /
+        select / press。target 支持快照引用（如 @e3）或 CSS 选择器；
+        fill 还要 value，select 还要 values，press 必填 key。
+        scroll-to 带连字符（不是 scroll_to）。
+        操作后请 observe 一次确认结果。
+        """
+        return await self._dispatch("bsk_interact", event, kwargs)
+
+    @filter.llm_tool("bsk_tabs")
+    async def bsk_tabs(self, event: AstrMessageEvent, **kwargs):
+        """管理浏览器标签页：列出、新建、切换、关闭、借用、归还。
+
+        action 取 list / create / select / close / borrow / return。
+        select / close / borrow / return 必填 tab_id，取自 list 或 create。
+        ⚠️ borrow 会把**用户自己**的标签页移进 Agent Window（会动到用户正在看的
+        窗口），用完请尽快 return；会话停止时会自动归还。
+        """
+        return await self._dispatch("bsk_tabs", event, kwargs)
+
+    @filter.llm_tool("bsk_assist")
+    async def bsk_assist(self, event: AstrMessageEvent, **kwargs):
+        """调整窗口与设备模拟，或请真人帮忙完成页内步骤。
+
+        action 取 resize / emulate / request-help。
+        resize 必填 width 与 height（各 100..7680）；emulate 用 device 或
+        width+height(+mobile)，或单独用 off 清除；request-help 必填 prompt，
+        会显示提示浮层等用户操作。outcome 里**只有 continued 与 completed**
+        表示用户已完成，其余取值都不是。
+        """
+        return await self._dispatch("bsk_assist", event, kwargs)
+
+    # ------------------------------------------------------------------
     # 工具 1：打开网页
     # ------------------------------------------------------------------
 
@@ -492,6 +1613,7 @@ class BskBrowserPlugin(Star):
     async def bsk_open(self, event: AstrMessageEvent, url: str, new_session: bool = False):
         """用浏览器打开一个网页，并返回页面标题和可交互元素。
 
+        （兼容保留，新用法请优先用 `bsk_page`（action="navigate"）。）
         会复用当前聊天已有的浏览器会话；如果没有就新建一个。
         打开后请用 bsk_read 重新读取页面，或用 bsk_act 操作元素。
 
@@ -539,6 +1661,7 @@ class BskBrowserPlugin(Star):
     async def bsk_read(self, event: AstrMessageEvent):
         """读取当前浏览器页面的内容和可交互元素编号。
 
+        （兼容保留，新用法请优先用 `bsk_inspect`（action="observe"）。）
         返回页面标题、正文摘要，以及形如 @e1、@e2 的元素编号。
         这些编号可以直接用在 bsk_act 的 target 参数里。
         页面刚变化过时建议先调用本工具，因为编号可能会变。
@@ -576,6 +1699,12 @@ class BskBrowserPlugin(Star):
     ):
         """在当前浏览器页面上执行一个操作（点击、输入、按键、滚动等）。
 
+        （兼容保留，新用法请优先用 `bsk_interact`：click → 保持不变，
+        hover / wheel / focus / blur / fill / select / press 也都在它里面；
+        本工具独有的 reload → `bsk_page`（action="reload"）、
+        navigate_back → `bsk_page`（action="back"）、
+        navigate_forward → `bsk_page`（action="forward"）、
+        wait_for_navigation → `bsk_page`（action="wait"）。）
         操作完成后建议调用 bsk_read 确认结果，因为页面变化后元素编号会变。
         如果页面正在加载（点了会跳转的链接、提交表单后），可以先用
         wait_for_navigation 等它加载完，再去读取，否则可能读到旧页面。
@@ -628,6 +1757,10 @@ class BskBrowserPlugin(Star):
     async def bsk_screenshot(self, event: AstrMessageEvent, full_page: bool = False):
         """给当前浏览器页面截图，并直接把图片发给用户。
 
+        （兼容保留，新用法请优先用 `bsk_inspect`（action="screenshot"）。
+        注意：新工具目前**只返回一段文字描述，不会把图片发给用户**；
+        要真的把图片发出去、或要整页截图（full_page），请继续用本工具
+        —— 这两件事目前只有本工具做得到。）
         图片会以消息形式发送，你不需要描述图片内容，除非用户要求。
 
         Args:
@@ -672,6 +1805,7 @@ class BskBrowserPlugin(Star):
     async def bsk_close(self, event: AstrMessageEvent):
         """关闭当前聊天正在使用的浏览器会话（会关掉那个 Agent Window）。
 
+        （兼容保留，新用法请优先用 `bsk_session`（action="stop"）。）
         用户说"关掉浏览器""不用了""结束"时调用这个。
         长时间不用的会话也会自动回收，但显式关闭更干净。
 
@@ -700,6 +1834,10 @@ class BskBrowserPlugin(Star):
         """检查浏览器环境是否正常（bsk 是否安装、浏览器扩展是否连上、有多少会话）。
 
         当浏览器操作失败、或用户问"为什么用不了"时调用这个来排查。
+        它额外给出 bsk 版本与运行时长、已连接的浏览器实例（含"无响应"与
+        "版本不匹配"标记）、本对话那条会话的忙碌/不确定状态 —— 这些是
+        bsk_session（action="list"）看不到的，所以排查环境问题请用本工具
+        （它不带"请优先用新工具"的引导：它没有等价替代品）。
 
         Args:
         """
@@ -794,6 +1932,8 @@ class BskBrowserPlugin(Star):
     async def bsk_evaluate(self, event: AstrMessageEvent, expression: str):
         """在当前页面里执行一段 JavaScript 表达式，并返回它的值。
 
+        （兼容保留。本插件独有的能力，新工具里**没有**对应替代
+        —— 它是超出 BrowserSkill 的部分，请继续用本工具。）
         这是高风险能力，默认关闭，且默认仅管理员可用（两项都在插件配置里，
         需要管理员先去打开）。只在 bsk_read 读不到需要的东西时才用它，例如：
         - 读取页面上没有直接显示的数据（元素属性、输入框里已有的内容）；
@@ -836,6 +1976,8 @@ class BskBrowserPlugin(Star):
     ):
         """读取浏览器页面上捕获的控制台消息或网络请求，用于排查页面问题。
 
+        （兼容保留，新用法请优先用 `bsk_inspect`：读控制台用
+        action="console"，读网络请求用 action="network"。）
         什么时候用它：
         - 页面看起来没反应、报错、按钮点了没效果，想知道背后发生了什么；
         - 页面数据没显示出来，想确认某个接口是不是请求失败或返回了错误状态码；

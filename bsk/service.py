@@ -29,11 +29,17 @@ from .config import (
     Settings,
     as_timeout_seconds,
 )
-from .errors import CODE_BROWSER_AMBIGUOUS, BskBrowserAmbiguous, BskError
+from .errors import (
+    CODE_BROWSER_AMBIGUOUS,
+    BskBrowserAmbiguous,
+    BskError,
+    BskProtocolError,
+)
 from .journal import SessionJournal
 from .logger import NULL_LOGGER, LoggerLike
 from .models import (
     BrowserInstance,
+    BskSession,
     ConsoleLog,
     EvaluateResult,
     NavigateResult,
@@ -1275,6 +1281,51 @@ class BskService:
         return ConsoleLog.from_json(result.data if isinstance(result.data, dict) else {})
 
     @staticmethod
+    def _format_entry_time(raw: Any) -> str:
+        """把 bsk 日志条目的时间戳渲染成 ``HH:MM:SS ``（带尾空格），拿不准就返回空串。
+
+        为什么需要"拿不准就空串"：**bsk 两种日志的时间戳量纲不同**，
+        这是实测出来的，不是猜的：
+
+        - ``console`` 条目给的是 **Unix 毫秒**（实测 ``1791230905814.595``）；
+        - ``network`` 条目给的是 **daemon 启动以来的毫秒**（实测 ``106552.928851``）。
+
+        早先这里直接 ``time.localtime(entry.timestamp)``，对 console 的
+        13 位毫秒值会抛 ``OSError: [Errno 22] Invalid argument``
+        —— 整条 ``render_console`` 崩掉，用户看到的是"未预期的错误"。
+
+        修法按**量级**判别量纲（三种都实测过）：
+
+        - ``>= 1e11``：Unix **毫秒**（2001-09-09 之后），除以 1000 当秒用 ——
+          这是 ``console`` 的常见形态，必须支持，否则时间戳等于白加；
+        - ``1e9 ~ 1e11``：Unix **秒**；
+        - 其余（相对毫秒、0、负数、非数值、超出范围）：**不显示**。
+
+        宁可少一个时间戳，也不能让渲染抛异常。
+        """
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(value) or value <= 0:
+            return ""
+
+        if value >= 1e11:
+            seconds = value / 1000.0
+        elif value >= 1e9:
+            seconds = value
+        else:
+            return ""
+
+        # 再兜一次界：2286 年之前才格式化（time_t 在 32 位平台上会溢出）。
+        if not (1e9 <= seconds < 1e10):
+            return ""
+        try:
+            return f"{time.strftime('%H:%M:%S', time.localtime(seconds))} "
+        except (OSError, ValueError, OverflowError):
+            return ""
+
+    @staticmethod
     def render_console(log: ConsoleLog, *, limit: int = 50, url_max: int = 200) -> str:
         """把控制台/网络日志渲染成给模型的文本，做双重截断。
 
@@ -1290,9 +1341,7 @@ class BskService:
             url = (entry.url or "")[:url_max]
             # 有 timestamp 就带上时刻 —— 排查时序问题（"报错发生在跳转前还是后"）
             # 时这是唯一的时间锚点。bsk 没给就整段省略，不显示 0。
-            when = ""
-            if entry.timestamp > 0:
-                when = f"{time.strftime('%H:%M:%S', time.localtime(entry.timestamp))} "
+            when = BskService._format_entry_time(entry.timestamp)
             if entry.kind == "failure":
                 # failure 条目没有 status 字段，只有 error_text。
                 # 失败原因是这一条唯一有用的信息（如 net::ERR_FAILED），
@@ -1315,3 +1364,1985 @@ class BskService:
         if log.truncated:
             lines.append("（bsk 报告日志被截断）")
         return "\n".join(lines)
+
+    # ==================================================================
+    # 用例 6-11：新工具（bsk_session / bsk_page / bsk_inspect /
+    # bsk_interact / bsk_tabs / bsk_assist）的后端能力
+    # ==================================================================
+    #
+    # 这一整段的命令形式**只**以 ``bsk-0.3.2-cli-capability-report.md``
+    # 的实测帮助文本为唯一依据（下称"CLI 报告"）。每条 ``--xxx`` 后面都
+    # 标了它在报告里的章节；**报告里查不到的参数一律不发，也绝不臆造**。
+    #
+    # 既有方法一律不动：新工具走新方法，旧工具继续走旧方法，
+    # 共用的是更下面那批基础设施（``_timeout`` / ``sessions.execute`` /
+    # ``verify_shot`` / ``cleanup_shots`` …）。
+
+    # ------------------------------------------------------------------
+    # 会话注册表：谁建的、哪个是 current
+    # ------------------------------------------------------------------
+
+    # 会话键 -> session_id 的本地映射。它同时承担两个职责：
+    #
+    # 1. ``owns(key)`` 判定"这个会话是不是本插件建的"；
+    # 2. ``list_sessions()`` 在不访问 daemon 的前提下报告 pending_cleanup。
+    #
+    # 为什么必须自己记：``SessionManager.stats()`` 只暴露"槽位里当前有没有
+    # 活会话"，而 bsk 的 ``session list`` 既是**异步**的（本方法被设计成
+    # 同步），又会把**别的程序**（例如用户自己的 DSH）建出来的会话一起列出来
+    # —— 那正是本插件从头到尾在避免的混淆（见 session.py 模块文档第 3 条）。
+    #
+    # ⚠️ 它是"尽力而为"的台账，不是事实源：``sessions.release`` 走的是
+    # SessionManager 自己的槽位，台账只在正常路径上被同步。所以
+    # ``list_sessions`` 的 ``state`` 字段以 SessionManager 为准，台账只补
+    # session_id 与"上次看到它是什么时候"。
+
+    def _owned(self) -> dict[str, str]:
+        """取会话台账，首次访问时按需创建。
+
+        为什么不用 ``__init__`` 里赋值：本文件有大量测试会绕过
+        ``__init__``（``object.__new__`` / 假对象 / 直接挂属性），
+        把状态初始化放在访问点上可以让它们全部继续工作。
+        """
+        owned = getattr(self, "_owned_sessions", None)
+        if owned is None:
+            owned = {}
+            self._owned_sessions = owned
+        return owned
+
+    def _current_key_slot(self) -> list[str]:
+        """取 current key 的容器（单元素列表，便于原地改写）。
+
+        - 从未 start 过 → current 是空串，表示"没有 current 会话"；
+        - ``None`` 表示"用户还没做过任何选择"：此时 :meth:`current_key`
+          会回退到会话管理器里最近活跃的那个会话（既有行为，向后兼容）。
+        """
+        slot = getattr(self, "_current_session_key", None)
+        if not isinstance(slot, list) or len(slot) != 1:
+            slot = [None]
+            self._current_session_key = slot
+        return slot
+
+    def owns(self, key: str) -> bool:
+        """该 key 是否是本插件创建的会话。
+
+        判定依据有两处，任一处命中即为真：
+
+        1. 本地台账里有它的 ``session_id``；
+        2. ``SessionManager`` 当前确实持有这个 key 的槽位。
+
+        对外来 id（用户随口编的、或别的程序建的会话键）返回 ``False``
+        —— 调用方据此拒绝操作，且**不访问 daemon**（TOOL-SPEC §3 第 1 条）。
+        """
+        if not isinstance(key, str):
+            return False
+        clean = key.strip()
+        if not clean:
+            return False
+        if clean in self._owned():
+            return True
+        entries = getattr(self.sessions, "_entries", None)
+        if isinstance(entries, dict) and clean in entries:
+            return True
+        # 最后一条退路：本会话管理器自己的活跃会话清单。它让"只注入了
+        # 一个假 sessions 对象"的调用方也能得到正确的所有权判定。
+        try:
+            stats = self.sessions.stats()
+        except Exception:  # noqa: BLE001 - stats 是诊断接口，坏了不该影响判定
+            return False
+        details = stats.get("details") if isinstance(stats, dict) else None
+        if isinstance(details, list):
+            return any(
+                isinstance(d, dict) and d.get("key") == clean for d in details
+            )
+        return False
+
+    def set_current(self, key: str) -> None:
+        """把某个 key 设为 current 会话。未知 key 不做任何事。
+
+        "未知"= 空串，或不是本插件创建的键（见 :meth:`owns`）。
+        静默忽略是刻意的：``set_current`` 常被当作"顺手激活一下"来调用，
+        让一个拼错的 key 把 current 清掉，比什么都不做更糟。
+        """
+        if not isinstance(key, str):
+            return
+        clean = key.strip()
+        if not clean or not self.owns(clean):
+            return
+        self._current_key_slot()[0] = clean
+
+    def current_key(self) -> str:
+        """当前 current 会话的 key，没有则返回空串。
+
+        三态语义（与 DSH 对齐）：
+
+        - 调用方显式选过（``start`` 或带 ``session`` 参数激活）→ 就返回它；
+        - 选过、但那个会话已经关了 → 返回空串（**不**悄悄回退到别的会话：
+          "current 已经没了"是模型必须知道的事实，替它挑一个只会让后续
+          操作打在一个它没预期的会话上）；
+        - 从来没选过 → 回退到会话管理器里最近活跃的会话，拿不到就空串。
+          这是保持向后兼容的那一支（既有代码没有"current"这个概念，
+          一直用的是"这个 key 自己的会话"）。
+        """
+        slot = self._current_key_slot()
+        chosen = slot[0]
+        if chosen is None:
+            return self._most_recent_session_key()
+        return chosen if chosen in self._owned() else ""
+
+    def _most_recent_session_key(self) -> str:
+        """会话管理器里最近活跃的 key（拿不到时返回空串）。"""
+        entries = getattr(self.sessions, "_entries", None)
+        if isinstance(entries, dict) and entries:
+            alive = [e for e in entries.values() if not getattr(e, "closed", False)]
+            if alive:
+                try:
+                    return max(alive, key=lambda e: getattr(e, "last_used", 0.0)).key
+                except Exception:  # noqa: BLE001 - 诊断路径，退化成"没有 current"
+                    return ""
+        try:
+            stats = self.sessions.stats()
+        except Exception:  # noqa: BLE001
+            return ""
+        details = stats.get("details") if isinstance(stats, dict) else None
+        if isinstance(details, list):
+            for item in reversed(details):
+                if isinstance(item, dict) and item.get("key"):
+                    return str(item["key"])
+        return ""
+
+    @staticmethod
+    def _coerce_device(raw: Any) -> str | None:
+        """把 ``--device`` 的取值收敛成 CLI 报告第 9 节列出的预设之一。
+
+        Returns:
+            合法的 device 名（小写）；``None`` 表示**不是**那 7 个预设之一，
+            调用方必须整体放弃 ``--device`` 而不是原样转发。
+
+        Note:
+            这个白名单不是猜的：CLI 报告 §9（``bsk emulate``）逐字列出了全部
+            内置预设 —— ``iphone-14``, ``iphone-14-pro-max``, ``iphone-se``,
+            ``pixel-7``, ``galaxy-s23``, ``ipad-mini``, ``galaxy-tab-s8``。
+            TOOL-SPEC §1.1 的 ``device`` 枚举也是同样这 7 个。
+
+        Note:
+            为什么宁可不发也不原样转发：转发一个 bsk 不认识的值，换来的是
+            底层报错，模型完全看不出该怎么办；而从 ``--browser`` 上我们已经有
+            实证 —— 用不可核实的值去选目标会**静默选错**。两条路都比
+            "只开窗口、不模拟设备、并如实说明"更差。
+        """
+        if not isinstance(raw, str):
+            return None
+        clean = raw.strip().lower()
+        return clean if clean in EMULATE_DEVICES else None
+
+    async def start_session(
+        self,
+        *,
+        url: str = "",
+        width: int | None = None,
+        height: int | None = None,
+        no_focus: bool = False,
+        browser: str = "",
+        device: str = "",
+        key: str = "",
+    ) -> dict:
+        """启动一个新的浏览器会话并使其成为 current。
+
+        key 是调用方给的会话键（main.py 的 _key 算出来的），用于在 SessionManager
+        里登记。返回 {"session_id":..., "browser_instance_id":..., "url":..., "device":...}
+        失败抛 BskError。
+
+        命令形式（CLI 报告 §5 ``session start``）：:
+
+            bsk session start --no-focus --json [--browser <ID>] [--width N --height N]
+
+        Note:
+            ``--no-focus`` 是本插件从第一天起的硬要求（不能抢用户焦点）：
+            实测会抢焦点的那条路径会让用户正在输入的东西失焦。
+            CLI 报告 §5 把它列为不带值的开关，所以这里默认就发；
+            模型即使显式传 ``no_focus=False`` 也不会取消它（见下）。
+
+        Note:
+            ``--width``/``--height`` 必须**同时**给出（CLI 报告 §5 原文：
+            "必须与 ``--height`` 同时给出才生效"）。只给一个时：
+            两个都不发（而不是发一个）—— 发一个只会被 bsk 忽略，
+            却会让模型以为尺寸已经生效。
+
+        Note:
+            ``--width``/``--height``/``--browser`` 走
+            ``SessionManager.acquire(key, start_args=[...])`` 这个正规接缝
+            透传到 ``session start`` 的 argv 上，其余环节一律照常
+            （``acquire`` 的并发去重与占位 → ``_evict_for_capacity`` 的 LRU
+            淘汰 → ``_start_into`` 的 journal 落盘与 ``closed`` 竞态处理 →
+            ``_start`` 里"配置 → 探测 → bsk 默认"的浏览器选择链路）。
+
+            因为它是**按调用栈传递**的参数，不同 key 并发建会话时互不干扰；
+            而且已有会话时 ``start_args`` 被完全忽略，会话失效后的自动重建
+            也不带它 —— 尺寸只在"这一次真的新建会话"时有意义。
+        """
+        del no_focus  # 会话永远后台打开，见上面的 Note。
+        target_key = (key or "").strip()
+
+        # --width/--height 必须同时给（报告 §5）；browser 为空时**刻意不发
+        # --browser**：让 SessionManager 走它自己那条"配置 → 探测 → 默认"的
+        # 链路 —— 那条链路上有硬性守护："探测到多个浏览器却让 bsk 自己挑"
+        # 必须报错，绝不能静默随机选一个。
+        extra: list[str] = []
+        if width is not None and height is not None:
+            extra += ["--width", str(int(width)), "--height", str(int(height))]
+        if browser:
+            extra += ["--browser", browser]
+
+        session = await self.sessions.acquire(
+            self._start_key(target_key), start_args=extra
+        )
+
+        wanted_device = (device or "").strip()
+        applied_device = ""
+        if wanted_device:
+            # 设备模拟必须打在标签页上，所以要在会话建好之后再做（CLI 报告 §9：
+            # ``emulate`` 的可用范围是当前活动标签）。
+            try:
+                await self.emulate(session.session_id, device=wanted_device)
+                applied_device = wanted_device
+            except BskError as exc:
+                self._logger.warning(
+                    "会话 %s 建好了，但设备模拟（device=%s）失败：%s",
+                    session.session_id,
+                    wanted_device,
+                    exc.message,
+                )
+
+        final_url = ""
+        if url:
+            nav = await self.navigate(session.session_id, url)
+            final_url = nav.get("final_url") or nav.get("url") or ""
+
+        if target_key:
+            self._owned()[target_key] = session.session_id
+            self._current_key_slot()[0] = target_key
+
+        return {
+            "session_id": session.session_id,
+            "browser_instance_id": session.browser_instance_id,
+            "url": final_url,
+            "device": applied_device,
+        }
+
+    def _start_key(self, key: str) -> str:
+        """给会话管理器用的 key：调用方没给就沿用 current 的 key。
+
+        不能传空串 —— 会话管理器是按 key 分槽位的，空 key 会让所有
+        "没传 session"的调用方共用同一个槽位。
+        """
+        if key:
+            return key
+        return self.current_key() or "default"
+
+    async def stop_session(self, key: str) -> dict:
+        """停止当前会话。返回 {"stopped": bool, "session_id": str}。
+
+        命令形式（CLI 报告 §5 ``session stop``）：``bsk session stop <ID>``。
+        id 是**位置参数**（bsk 里唯一的例外），且**绝不使用** ``--all``
+        —— 那会连带停掉别的程序（例如用户自己的 DSH）创建的会话。
+
+        key 为空时按 current 解析（这是 ``bsk_session(action="stop")``
+        省略 ``session`` 参数的那条路径）。
+        """
+        target = (key or "").strip() or self.current_key()
+        if not target:
+            raise self._no_current_session_error("停止")
+
+        session_id = self._owned().get(target, "")
+        stopped = await self.sessions.release(target)
+
+        # 台账要跟着走：不管 stop 成不成功，本地都**不再**持有这个会话
+        # （``release`` 已经把它从槽位摘掉了）。留着记录会让
+        # ``list_sessions`` 永远报一个已经没了的会话。
+        if target in self._owned():
+            if not session_id:
+                session_id = self._owned().get(target, "")
+            del self._owned()[target]
+        slot = self._current_key_slot()
+        if slot[0] == target:
+            slot[0] = ""
+
+        return {"stopped": bool(stopped), "session_id": session_id}
+
+    def list_sessions(self) -> dict:
+        """列出本插件创建的全部会话（不访问 daemon）。
+
+        返回 {"pending_cleanup": int, "sessions": [{"key","session_id",
+        "browser_instance_id","current","state"}]}
+
+        Note:
+            本方法是**同步**的（接口冻结如此），所以它绝不能去跑
+            ``bsk session list``（那是子进程调用，只能异步）。这也正是它
+            存在的理由：模型想知道"我现在有哪些会话"时，不该为此付一次
+            daemon 往返，更不该看到**别人的**会话 —— 那正是本插件从头到尾
+            在避免的混淆。
+
+        ``state`` 取值：
+
+        - ``active``：会话管理器槽位里有一个活的会话；
+        - ``stopped``：管理器已经不持有它了（刚才被 stop / 被 LRU 淘汰 /
+          空闲回收），但台账说明它曾由本插件创建；
+        - ``pending_cleanup``：本地已经没有它了，但 journal 里还留着记录
+          —— 说明上一次进程没来得及正常 stop。**不要**再往这个 id 上发命令，
+          它属于一个已经退出的进程；清理走 :meth:`recover_orphans`。
+        """
+        pending = self._pending_cleanup_ids()
+        current = self.current_key()
+
+        entries = getattr(self.sessions, "_entries", None)
+        entries = entries if isinstance(entries, dict) else {}
+
+        sessions: list[dict[str, Any]] = []
+        for key, session_id in self._owned().items():
+            entry = entries.get(key)
+            if entry is not None and not getattr(entry, "closed", False):
+                state = "active"
+            elif session_id and session_id in pending:
+                state = "pending_cleanup"
+            else:
+                state = "stopped"
+            sessions.append(
+                {
+                    "key": key,
+                    "session_id": session_id,
+                    # 活跃会话以管理器里的对象为准（它才是事实源），
+                    # 已停会话只能报台账里的历史值。
+                    "browser_instance_id": (
+                        getattr(getattr(entry, "session", None), "browser_instance_id", "")
+                        if state == "active"
+                        else ""
+                    ),
+                    "current": bool(current) and key == current,
+                    "state": state,
+                }
+            )
+
+        return {"pending_cleanup": len(pending), "sessions": sessions}
+
+    def _pending_cleanup_ids(self) -> set[str]:
+        """journal 里记着、但本地已不再持有的 session_id 集合。
+
+        journal 是"尽力而为"的辅助机制（见 ``bsk/journal.py``），所以这里
+        任何异常都退化成"没有待清理项"—— 报不出来只是少一条提示，
+        绝不该让 ``list_sessions`` 整个失败。
+        """
+        journal = getattr(self, "journal", None)
+        if journal is None:
+            return set()
+        try:
+            recorded = journal.load()
+        except Exception:  # noqa: BLE001
+            return set()
+        if not recorded:
+            return set()
+        alive = {
+            sid for sid in self._owned().values() if sid
+        }
+        if isinstance(getattr(self.sessions, "_entries", None), dict):
+            for entry in self.sessions._entries.values():
+                sid = getattr(getattr(entry, "session", None), "session_id", "")
+                if sid:
+                    alive.add(sid)
+        return {
+            str(item.session_id)
+            for item in recorded
+            if getattr(item, "session_id", "") and item.session_id not in alive
+        }
+
+    def _no_current_session_error(self, what: str) -> BskError:
+        """构造"没有 current 会话，而这次操作又需要它"的可操作错误。
+
+        面向模型，所以必须说清两件事：现在没有会话，以及下一步该调什么。
+        """
+        return BskError(
+            f"没有 current 会话，无法{what}",
+            friendly=(
+                f"当前没有浏览器会话，所以无法{what}。\n"
+                "请先调用 bsk_session(action=\"start\") 打开一个会话，"
+                "或在本次调用里显式给出要操作的 session。"
+            ),
+            code="no_current_session",
+        )
+
+    # ------------------------------------------------------------------
+    # 会话解析：session 参数 → 实际要操作的 key
+    # ------------------------------------------------------------------
+
+    def _resolve(self, session: str = "", *, param: str = "session") -> str:
+        """把调用方给的会话标识解析成 SessionManager 用的 key。
+
+        三条规则（TOOL-SPEC §3 第 1 条 + 接口冻结）：
+
+        1. 省略/空白 → 用 current；没有 current 就报可操作错误；
+        2. 显式给出，且 :meth:`owns` 认它 → **激活它**（它成为 current），
+           返回它；
+        3. 显式给出，但不是本插件建的 → 报错，且**不访问 daemon**
+           （所有权判定全在本地，见 :meth:`owns`）。
+
+        Args:
+            session: 调用方给的会话键或 session_id。
+            param: 出错的参数名，只用于文案。
+
+        Note:
+            为什么按 **key** 而不是按 session_id 解析：SessionManager 的
+            锁、LRU、空闲回收全部以 key 为单位（同一个 key 严格串行）。
+            拿 session_id 去凑一个 key，就会绕开那把锁 —— 两条命令同时
+            打在同一个会话上，bsk 会回 ``session_busy``。所以 session_id
+            只作为"key 的别名"来解析，解析完仍然回到 key 上执行。
+        """
+        raw = (session or "").strip() if isinstance(session, str) else ""
+        if raw:
+            key = self._key_for(raw)
+            if key:
+                self.set_current(key)
+                return key
+            raise BskError(
+                f"{param} 指定的会话不属于本插件：{raw}",
+                friendly=(
+                    f"「{raw}」不是本插件创建的会话，已拒绝操作"
+                    "（我不会去动别的程序或用户自己的浏览器会话）。\n"
+                    "请改用 bsk_session(action=\"list\") 看当前有哪些会话，"
+                    "或调用 bsk_session(action=\"start\") 新建一个。"
+                ),
+                code="foreign_session",
+            )
+        current = self.current_key()
+        if current:
+            return current
+        raise self._no_current_session_error("执行这次操作")
+
+    def _key_for(self, session: str) -> str:
+        """把 session 键或 session_id 解析成本插件持有的 key（认不出返回空串）。"""
+        if not session:
+            return ""
+        if self.owns(session):
+            return session
+        # 允许用 session_id 指代（用户从 bsk_session(list) 里抄下来的就是它）。
+        session_id = session.strip()
+        for key, sid in self._owned().items():
+            if sid and sid == session_id:
+                return key
+        entries = getattr(self.sessions, "_entries", None)
+        if isinstance(entries, dict):
+            for key, entry in entries.items():
+                sid = getattr(getattr(entry, "session", None), "session_id", "")
+                if sid and sid == session_id:
+                    return key
+        return ""
+
+    @staticmethod
+    def _session_field(key: str) -> str:
+        """回执里回显的 ``session`` 字段值。
+
+        约定（TOOL-SPEC §4）：每个结果都要回显实际生效的会话，模型靠它确认
+        操作对象。这里给的是**会话键**：它正是模型下次该传进 ``session``
+        参数的值（传 session_id 也行，但键更直接，且不会因为会话重建而过期）。
+        """
+        return key
+
+    # ------------------------------------------------------------------
+    # 新方法共用的三个小工具
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _with_tab_id(args: list[str], tab_id: int | None) -> list[str]:
+        """把 ``--tab-id`` 追加到 argv 上。tab_id 为 None 时原样返回。
+
+        依据：DSH 的 ``appendTabId``（``phase-one-runtime.ts:47-49``）只在传了
+        ``tabId`` 时才追加 ``--tab-id``；未传 = Agent Window 的当前活动标签。
+
+        为什么单独一个辅助而不是每处手写：CLI 报告里 ``--tab-id`` 出现在十几条
+        子命令的选项表里（§7/§9/§10/§11/§12/§13/§14/§15/§16/§17/§20…），
+        十处各写一遍 trim/类型转换，迟早有一处写成 ``str(tab_id)`` 把
+        ``"@e3"`` 这种脏值原样发出去。这里统一收敛成整数。
+
+        Note:
+            位置无关：clap 不在意 ``--tab-id`` 与 ``--session``/``--json`` 的
+            先后。本文件统一把它放在命令自带参数之后、``--session`` 之前
+            （除 debug 外，那里为了不打断筛选参数的分组，放在最前）。
+        """
+        if tab_id is None:
+            return args
+        return [*args, *BskService._tab_args(tab_id)]
+
+    @staticmethod
+    def _tab_args(tab_id: int | None) -> list[str]:
+        """``--tab-id`` 参数（CLI 报告：几乎每条会话命令都有，且都可省略）。"""
+        if tab_id is None:
+            return []
+        return ["--tab-id", str(int(tab_id))]
+
+    def _size_args(self, width: int | None, height: int | None) -> list[str]:
+        """``--width`` / ``--height``：**必须同时给**，否则两个都不发。
+
+        依据：CLI 报告 §5（``session start``）"必须与 ``--height`` 同时给出
+        才生效"、§9（``emulate``）"无 ``--device`` 时要求同时给"。
+        只给一个时发出去只会被 bsk 忽略，却会让模型以为尺寸已生效 ——
+        那不是"容错"，是骗人。
+        """
+        if width is None or height is None:
+            return []
+        return ["--width", str(int(width)), "--height", str(int(height))]
+
+    # ------------------------------------------------------------------
+    # bsk_page：导航与等待
+    # ------------------------------------------------------------------
+
+    async def navigate(
+        self,
+        key: str,
+        url: str,
+        *,
+        wait_until: str = "load",
+        timeout_ms: int | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """导航到一个网址。返回 {"url","final_url","reached"}。
+
+        命令形式（CLI 报告 §17）::
+
+            bsk navigate [OPTIONS] [URL]
+              --wait-until <WAIT_UNTIL>   默认 load；load/domcontentloaded/networkidle/commit
+              --timeout <TIMEOUT>         默认 30s
+
+        ``reached`` **可以**是 ``"timeout"``，那是结果不是错误
+        （TOOL-SPEC §1.2 明说），照原样回传让模型自己判断。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = []
+        if wait_until and wait_until != "load":
+            args += ["--wait-until", str(wait_until)]
+        if timeout_ms is not None:
+            args += ["--timeout", self._bsk_duration(timeout_ms)]
+        nav = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(
+                ["navigate", url, *args], tab_id
+            )
+            + ["--session", sid, "--json"],
+            # 超时下限复用 navigate 那一档（45s，必须大于 bsk 自己的 30s）。
+            timeout=self._timeout(TIMEOUT_NAVIGATE),
+            allow_uncertain=False,
+        )
+        parsed = NavigateResult.from_json(nav.data)
+        return {
+            "session": self._session_field(session_key),
+            "url": parsed.url or url,
+            "final_url": parsed.final_url or parsed.url or url,
+            "reached": parsed.reached,
+        }
+
+    async def history(
+        self,
+        key: str,
+        direction: str,
+        *,
+        wait_until: str = "load",
+        timeout_ms: int | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """前进/后退。direction 是 "back" 或 "forward"。
+
+        命令形式（CLI 报告 §17/§18/§19）：``bsk navigate back`` /
+        ``bsk navigate forward`` 与顶层 ``navigate-back`` / ``navigate-forward``
+        等价。这里用 ``navigate <direction>`` 的子命令形式：
+        它和既有的 ``service.act(action="navigate_back")`` 发的是同一条命令，
+        不引入第二种写法。
+        """
+        session_key = self._resolve(key)
+        if direction not in ("back", "forward"):
+            raise BskError(
+                f"history 的方向非法：{direction}",
+                friendly="只能后退（back）或前进（forward），请检查 direction 参数。",
+                code="bad_direction",
+            )
+        args: list[str] = []
+        if wait_until and wait_until != "load":
+            args += ["--wait-until", str(wait_until)]
+        if timeout_ms is not None:
+            args += ["--timeout", self._bsk_duration(timeout_ms)]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(
+                ["navigate", direction, *args], tab_id
+            )
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_NAVIGATE),
+            allow_uncertain=False,
+        )
+        parsed = NavigateResult.from_json(result.data)
+        return {
+            "session": self._session_field(session_key),
+            "direction": direction,
+            "url": parsed.url,
+            "final_url": parsed.final_url or parsed.url,
+            "reached": parsed.reached,
+        }
+
+    async def reload_page(
+        self,
+        key: str,
+        *,
+        hard: bool = False,
+        wait_until: str = "load",
+        timeout_ms: int | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """刷新当前页。hard=True 绕缓存。
+
+        命令形式（CLI 报告 §20）::
+
+            bsk reload --hard --wait-until <W> --timeout <T> --session <ID> --json
+        """
+        session_key = self._resolve(key)
+        args: list[str] = []
+        if hard:
+            args.append("--hard")
+        if wait_until and wait_until != "load":
+            args += ["--wait-until", str(wait_until)]
+        if timeout_ms is not None:
+            args += ["--timeout", self._bsk_duration(timeout_ms)]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["reload", *args], tab_id)
+            + ["--session", sid, "--json"],
+            # CLI 报告 §20：reload 自己的 --timeout 默认 15s，比 navigate 短一档。
+            timeout=self._timeout(TIMEOUT_HISTORY),
+            allow_uncertain=False,
+        )
+        parsed = NavigateResult.from_json(result.data)
+        return {
+            "session": self._session_field(session_key),
+            "hard": bool(hard),
+            "url": parsed.url,
+            "final_url": parsed.final_url or parsed.url,
+            "reached": parsed.reached,
+        }
+
+    async def wait_for(
+        self,
+        key: str,
+        *,
+        wait_until: str = "load",
+        timeout_ms: int = 30000,
+        tab_id: int | None = None,
+    ) -> dict:
+        """只等待页面生命周期事件，不做任何导航。
+
+        命令形式（CLI 报告 §33）::
+
+            bsk wait-for-navigation --wait-until <W> --timeout <T> --session <ID> --json
+
+        Note:
+            这是**只读**的（不改页面状态），所以 ``allow_uncertain=True``：
+            上一次操作结果未知时，正是最需要"等一等看页面有没有自己稳定下来"
+            的时候。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = []
+        if wait_until and wait_until != "load":
+            args += ["--wait-until", str(wait_until)]
+        args += ["--timeout", self._bsk_duration(timeout_ms)]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(
+                ["wait-for-navigation", *args], tab_id
+            )
+            + ["--session", sid, "--json"],
+            # 纯等待：bsk 自己的预算是 timeout_ms，外层必须比它大（见模块顶部
+            # "下限的第一条原则"），否则我们会先把它掐掉。
+            timeout=self._wait_timeout(timeout_ms),
+            allow_uncertain=True,
+        )
+        parsed = NavigateResult.from_json(result.data)
+        return {
+            "session": self._session_field(session_key),
+            "final_url": parsed.final_url or parsed.url,
+            "reached": parsed.reached,
+        }
+
+    @staticmethod
+    def _bsk_duration(milliseconds: int | float) -> str:
+        """把毫秒数渲染成 bsk 接受的时间字面量（``30s`` / ``1500ms`` / ``1m``）。
+
+        依据：CLI 报告 §17/§18/§20/§33/§32 反复写明 ``--timeout`` 接受
+        ``30s``, ``1m``, ``1500ms`` 这类带单位的字面量。
+
+        Note:
+            刻意不写裸数字：只有 ``wait-ms``（§34）的**位置参数**才把裸整数
+            解释成毫秒，``--timeout`` 没有这条约定。带单位是唯一确定安全的写法。
+            ``ms`` 不是 ``s`` 的整倍数时保留毫秒，避免把 1500ms 悄悄说成 1s。
+        """
+        value = float(milliseconds)
+        if value <= 0:
+            value = 1.0
+        if value % 1000 == 0:
+            return f"{int(value) // 1000}s"
+        return f"{int(value)}ms"
+
+    def _wait_timeout(self, timeout_ms: int) -> float:
+        """纯等待类命令的外层超时：比它自己的预算多留一点余量。
+
+        ``wait_for`` 与 ``request_help`` 都会把预算交给 bsk 自己控制，
+        我们的外层超时只是"防止它卡死"的兜底。两个约束：
+
+        - 必须 **大于** bsk 自己的预算（否则我们会先把它掐掉，
+          而它正要成功返回 —— 见模块顶部"下限的第一条原则"）；
+        - 不能超过框架上限（否则用户看到的是框架抛的英文
+          ``execution timeout``，而不是我们写的中文提示）。
+        """
+        requested = float(timeout_ms) / 1000.0
+        wanted = requested + WAIT_TIMEOUT_MARGIN_SEC
+        ceiling = self.framework_timeout_ceiling()
+        if ceiling is None:
+            return wanted
+        return max(min(wanted, ceiling), min(requested, ceiling))
+
+    # ------------------------------------------------------------------
+    # bsk_inspect：读取与调试
+    # ------------------------------------------------------------------
+
+    async def snapshot(
+        self,
+        key: str,
+        *,
+        max_depth: int | None = None,
+        max_tokens: int | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """aria 快照（与 observe 的区别：无 cursor，静态可访问性树）。
+
+        命令形式（CLI 报告 §11）::
+
+            bsk snapshot --max-depth <N> --max-tokens <N> --session <ID> --json
+
+        只读，所以 ``allow_uncertain=True``（与 ``observe`` 同一条理由）。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = []
+        if max_depth is not None:
+            args += ["--max-depth", str(int(max_depth))]
+        if max_tokens is not None:
+            args += ["--max-tokens", str(int(max_tokens))]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["snapshot", *args], tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_OBSERVE),
+            allow_uncertain=True,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        raw_text = data.get("text")
+        text = raw_text if isinstance(raw_text, str) else ""
+        ref_count = data.get("ref_count")
+        return {
+            "session": self._session_field(session_key),
+            "text": text,
+            "ref_count": ref_count if isinstance(ref_count, int) else 0,
+            "tab_id": data.get("tab_id") if isinstance(data.get("tab_id"), int) else 0,
+            "truncated": data.get("truncated") is True,
+        }
+
+    async def get_html(
+        self,
+        key: str,
+        *,
+        ref: str = "",
+        max_bytes: int = 524288,
+        tab_id: int | None = None,
+    ) -> dict:
+        """导出原始 HTML。ref 非空时限定到该子树。
+
+        命令形式（CLI 报告 §16）::
+
+            bsk get-html --ref <REF> --max-bytes <N> --session <ID> --json
+
+        Note:
+            刻意**不发** ``--out``（§16 有它，但那是"把 HTML 写到文件而不是
+            stdout"）：本工具要把 HTML 交给模型看，写进一个临时文件只会多出
+            一件需要清理的东西，而且那份文件的内容我们还得再读回来。
+            ``--max-bytes`` 就是长度控制手段（TOOL-SPEC §1.3 默认 524288）。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = ["--max-bytes", str(int(max_bytes))]
+        if ref:
+            args += ["--ref", ref]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["get-html", *args], tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_OBSERVE),
+            allow_uncertain=True,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        html = data.get("html")
+        if not isinstance(html, str):
+            # 认不出的结构不能悄悄返回空串：那会被模型当成"页面没有 HTML"。
+            html = ""
+        size = data.get("byte_size") or data.get("bytes")
+        return {
+            "session": self._session_field(session_key),
+            "ref": ref,
+            "max_bytes": int(max_bytes),
+            "html": html,
+            "byte_size": size if isinstance(size, int) else len(html.encode("utf-8")),
+        }
+
+    async def read_console_ex(
+        self,
+        key: str,
+        *,
+        since: int = 0,
+        limit: int | None = None,
+        max_text_chars: int | None = None,
+        include_stack: bool = False,
+        tab_id: int | None = None,
+    ) -> ConsoleLog:
+        """read_console 的扩展版（多 limit/max_text_chars/include_stack）。
+        既有的 read_console(key, since) 保持不变并委托到本方法。
+
+        命令形式（CLI 报告 §13）::
+
+            bsk console --since <N> --limit <N> --max-text-chars <N>
+                        --include-stack --session <ID> --json
+
+        ``--include-stack`` 只有 ``console`` 有（§14 明确 network 没有）。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = ["--since", str(int(since))]
+        if limit is not None:
+            args += ["--limit", str(int(limit))]
+        if max_text_chars is not None:
+            args += ["--max-text-chars", str(int(max_text_chars))]
+        if include_stack:
+            args.append("--include-stack")
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["console", *args], tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_QUICK),
+            allow_uncertain=True,
+        )
+        return ConsoleLog.from_json(result.data if isinstance(result.data, dict) else {})
+
+    async def read_network_ex(
+        self,
+        key: str,
+        *,
+        since: int = 0,
+        limit: int | None = None,
+        max_text_chars: int | None = None,
+        tab_id: int | None = None,
+    ) -> ConsoleLog:
+        """read_network 的扩展版。
+
+        命令形式（CLI 报告 §14）::
+
+            bsk network --since <N> --limit <N> --max-text-chars <N> --session <ID> --json
+
+        ``network`` **没有** ``--include-stack``（§14 的括号注），
+        所以本方法也不接受这个参数。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = ["--since", str(int(since))]
+        if limit is not None:
+            args += ["--limit", str(int(limit))]
+        if max_text_chars is not None:
+            args += ["--max-text-chars", str(int(max_text_chars))]
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["network", *args], tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_QUICK),
+            allow_uncertain=True,
+        )
+        return ConsoleLog.from_json(result.data if isinstance(result.data, dict) else {})
+
+    async def debug(self, key: str, debug_action: str, **opts: Any) -> Any:
+        """bsk debug 直通。返回原始解析后的 JSON（不做字段重映射）。
+        opts 是校验过的调试参数（snake_case）。
+
+        命令形式（CLI 报告 §15）::
+
+            bsk debug [OPTIONS] <ACTION> [ID] ... --session <ID> --json
+
+        ``<ACTION>`` 是位置参数；``[ID]`` 也是位置参数（request / operation /
+        rule_enable / rule_disable / rule_remove / replay / pin / unpin 需要它）。
+
+        Note:
+            本方法**照原样返回** bsk 的载荷，一个字段都不重映射
+            （TOOL-SPEC §2 的硬要求）。理由：debug 的输出形态由 action 决定
+            （列表、单条 body 切片、导出路径、等待结果……），任何"统一化"
+            都会丢掉模型真正要看的东西。
+
+        Note:
+            **``allow_uncertain`` 按 action 分级**（安全设计，不能一刀切）：
+
+            - :data:`MUTATING_DEBUG_ACTIONS` 里的 5 个 —— ``replay`` /
+              ``rule_add`` / ``rule_enable`` / ``rule_disable`` /
+              ``rule_remove`` —— 一律 ``allow_uncertain=False``。
+              ``replay`` 会**带着用户的 cookie 重新发送**抓到的请求
+              （DSH 自己的描述就是 "may change server data"），
+              规则类 action 能改写/伪造真实流量。它们和 click/fill 同一档：
+              上一次结果未知时重复执行，可能造成重复提交或伪造流量。
+            - 其余（``performance`` / ``requests`` / ``console`` /
+              ``export`` / ``capabilities`` / ``wait`` …）只读证据或等待，
+              ``allow_uncertain=True`` —— 页面状态不明时恰恰最需要看这些。
+
+            （早先这里写过"replay 不属于写操作"的论证，那是错的：判断标准
+            不是"BSK 服务端会不会自己校验"，而是"重放一次会不会改变外部
+            可见的状态"。会变的就必须挡住。）
+
+        Note:
+            ``wait`` 的超时不能走常规规则。``wait_ms`` 的合法上限是
+            60000ms（CLI 报告 §15 的 0..60000），而 ``_timeout(TIMEOUT_DEBUG)``
+            在默认配置下是 60 秒 —— 两者相等，意味着一次**合法的最长等待**
+            会被我们自己的外层超时同时掐死，用户看到的是超时错误而不是
+            等到的结果。所以 ``wait`` 改用 :meth:`_wait_timeout`：
+            它保证外层超时 > bsk 自己的预算（+5 秒余量），同时不越过框架上限。
+            DSH 对同一处也是专门放宽的（``debug-tool.ts:238-240``：
+            ``Math.max(defaultTimeoutMs, (waitMs ?? 10000) + 15000)``）。
+
+        Args:
+            key: 会话键（或 session 参数的原值）。
+            debug_action: 24 个 debug action 之一（TOOL-SPEC §2）。
+            **opts: 该 action 的参数，见 :data:`DEBUG_VALUE_FLAGS`。
+                其中 ``tab_id`` 可以只放在 ``opts`` 里（``bsk debug`` 本来
+                就有 ``--tab-id``，见 CLI 报告 §15）；本方法还额外接受
+                显式的 ``tab_id=`` 关键字参数，两者等价。
+        """
+        session_key = self._resolve(key)
+        action = str(debug_action)
+
+        args: list[str] = []
+        explicit_tab_id = opts.pop("tab_id", None)
+        for name, flag in DEBUG_VALUE_FLAGS.items():
+            value = opts.get(name)
+            if value is None or value == "" or value is False:
+                continue
+            args += [flag, self._render_debug_value(name, value)]
+        for name, flag in DEBUG_BOOL_FLAGS.items():
+            if opts.get(name) is True:
+                args.append(flag)
+
+        tail: list[str] = []
+        id_arg = opts.get("id")
+        if id_arg is not None and id_arg != "":
+            tail.append(str(id_arg))
+
+        readonly = action not in MUTATING_DEBUG_ACTIONS
+        timeout = (
+            self._wait_timeout(self._coerce_wait_ms(opts.get("wait_ms")))
+            if action == "wait"
+            else self._timeout(TIMEOUT_DEBUG)
+        )
+
+        result = await self.sessions.execute(
+            session_key,
+            # --tab-id 放在最前面：DEBUG_VALUE_FLAGS 里它本来也会被渲染，
+            #   这里显式再传一次是为了让"只给 tab_id 关键字参数"也能生效；
+            #   两者同时给出时以关键字参数为准（上面的 pop 已把它从 opts 摘走，
+            #   所以不会出现两个 --tab-id）。
+            lambda sid: [
+                "debug",
+                *self._tab_args(
+                    int(explicit_tab_id) if explicit_tab_id is not None else None
+                ),
+                *args,
+                action,
+                *tail,
+                "--session",
+                sid,
+                "--json",
+            ],
+            timeout=timeout,
+            allow_uncertain=readonly,
+        )
+        return result.data
+
+    @staticmethod
+    def _coerce_wait_ms(raw: Any) -> int:
+        """把 ``wait_ms`` 收敛成非负整数毫秒（非法值用 bsk 自己的默认 10000）。
+
+        依据：CLI 报告 §15 写着 ``--wait-ms <WAIT_MS>`` 默认 10000、范围
+        0..60000。``wait`` 动作没给 ``wait_ms`` 时，bsk 会等 10 秒；
+        我们的外层超时必须按**它实际会等多久**来算，所以这里回退到同一个
+        10000，而不是 0。
+        """
+        if isinstance(raw, bool) or raw is None:
+            return 10000
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 10000
+        if value < 0:
+            return 10000
+        return value
+
+    @staticmethod
+    def _render_debug_value(name: str, value: Any) -> str:
+        """把 debug 的一个带值参数渲染成命令行字面量。
+
+        - ``rule`` / ``replay`` / ``completion_criteria`` 这类 JSON 参数：
+          用紧凑 JSON（``separators``）序列化。依据是 CLI 报告的示例原文
+          —— ``--completion-criteria '{"any":[{"url_contains":"/dashboard"}],"stable_for_ms":1000}'``
+          是**一个** argv 元素，不是 shell 拼出来的；我们直接过 argv 列表，
+          所以只要内容是合法 JSON 即可（不需要 shell 引号）。
+        - 布尔：小写 ``true``/``false``，与 CLI 报告里 ``--await-promise <bool>``
+          的默认值写法一致。
+        - 其余（含 path 等）转字符串。
+        """
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if name in ("rule", "replay", "completion_criteria"):
+            if isinstance(value, str):
+                # 已经是字符串：原样透传（校验层负责确认它是合法 JSON）。
+                return value
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value)
+
+    # ------------------------------------------------------------------
+    # bsk_interact：统一交互入口
+    # ------------------------------------------------------------------
+
+    async def interact(
+        self, key: str, action: str, *, tab_id: int | None = None, **opts: Any
+    ) -> dict:
+        """统一的页面交互入口。
+
+        action 取值见 TOOL-SPEC §1.4。
+        opts 是校验过的参数（target/value/values/key/button/click_count/
+        modifiers/capture_id/image_x/image_y/settle_ms/hold_ms/
+        delta_x/delta_y/timeout_ms/no_clear）。
+
+        Returns:
+            {"session": str, "tab_id": int|None, ...该 action 的结果字段}
+
+        Note:
+            写类动作必须传 allow_uncertain=False 给 sessions.execute
+            （安全设计，见 TOOL-SPEC H4）。
+
+        Note:
+            与既有 :meth:`act` 的分工：``act`` 只覆盖 13 个"动作 + 按键/滚动"
+            的组合，且没有 canvas 点击、hold、settle、no-clear 这些参数。
+            ``act`` 的签名与行为**一个字都不改**（旧工具依赖它），
+            两条路径共用下面同一张 argv 构造表 :data:`INTERACT_SPECS`，
+            所以同一个 action 在两边发出的命令行逐字节相同。
+
+        Note:
+            ⚠️ **接口冻结里的一处矛盾**（已在交付报告里列出，没有自行改签名）：
+            本方法的第一个参数（会话键）叫 ``key``，而 ``press`` 动作要按的键
+            在 TOOL-SPEC §1.4 里同样叫 ``key``。在 Python 里这两个名字
+            无法共存 —— ``interact(k, "press", key="Enter")`` 会直接
+
+                TypeError: interact() got multiple values for argument 'key'
+
+            （已验证：位置参数填满形参 ``key`` 之后，同名关键字进不了
+            ``**opts``。把会话键改传关键字也一样撞，只是换成
+            "multiple values for argument 'action'" 那一侧。）
+
+            本方法因此在 ``opts`` 里**同时接受** ``key`` 与 ``press_key``：
+
+            .. code-block:: python
+
+                await service.interact(k, "press", press_key="Enter")   # 推荐
+                await service.interact(k, "press", **{"key": "Enter"})  # 等价
+
+            ``press_key`` 是我为这个动作选的别名，理由有两条：
+
+            1. 它是 ``**opts`` 里的一个普通键，不占形参名，所以能真正传进来；
+            2. 它不与工具层的校验结果冲突 —— 调用方只要做一次
+               ``opts["press_key"] = opts.pop("key")``，其余 8 个动作的
+               opts 原样透传即可。
+
+            **如果最终决定统一用别的名字，请改这一处别名表**
+            （``_PRESS_KEY_ALIASES``），签名本身不用动。
+        """
+        for alias in _PRESS_KEY_ALIASES:
+            if alias in opts and "key" not in opts:
+                opts["key"] = opts.pop(alias)
+        session_key = self._resolve(key)
+        argv, readonly = self._build_interact_args(action, opts)
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(argv, tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(self._interact_timeout_builtin(action)),
+            # 写类动作（click/fill/press/select/hover）绝不允许在不确定态下执行
+            # —— 那可能造成重复点击、重复提交。
+            allow_uncertain=readonly,
+        )
+        out: dict[str, Any] = {
+            "session": self._session_field(session_key),
+            "action": action,
+            "tab_id": self._payload_tab_id(result.data),
+        }
+        out.update(self._interact_result(action, opts, result.data, readonly))
+        return out
+
+    @staticmethod
+    def _payload_tab_id(data: Any) -> int | None:
+        """从载荷里取 ``tab_id``；没有就给 ``None``（不编造 0）。"""
+        if isinstance(data, dict):
+            value = data.get("tab_id")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    @staticmethod
+    def _interact_result(
+        action: str, opts: dict[str, Any], data: Any, readonly: bool
+    ) -> dict[str, Any]:
+        """把交互结果摊平成给模型看的字段。
+
+        不重映射 bsk 的字段名：直接把载荷里的标量与短列表并进来。
+        截断策略交给上层渲染（这里只保证不把二进制/巨型结构带出去）。
+        """
+        out: dict[str, Any] = {
+            "target": str(opts.get("target") or ""),
+            "changed": readonly is False,
+        }
+        if isinstance(data, dict):
+            for name, value in data.items():
+                if name == "tab_id":
+                    continue  # 已在 interact 里单独放过
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    out[name] = value
+        if action == "wheel":
+            out["delta_x"] = int(opts.get("delta_x") or 0)
+            out["delta_y"] = int(opts.get("delta_y") or 0)
+        if action == "press":
+            out["key"] = str(opts.get("key") or "")
+        return out
+
+    @staticmethod
+    def _interact_timeout_builtin(action: str) -> float:
+        """交互动作的超时下限（全部按 ``TIMEOUT_ACTION`` 那一档算）。
+
+        CLI 报告里 click/hover/wheel/scroll-to/focus/blur/fill/press/select
+        的 ``--timeout`` 默认值**全都是 30s**，与 ``TIMEOUT_ACTION`` 的定义
+        完全一致（那个常量的注释就写着"与 bsk 自身默认 --timeout 30s 对齐"）。
+        """
+        del action
+        return TIMEOUT_ACTION
+
+    @staticmethod
+    def _build_interact_args(action: str, opts: dict[str, Any]) -> tuple[list[str], bool]:
+        """把交互参数翻译成 bsk 命令行参数（不含 ``--session``）。
+
+        Returns:
+            ``(argv, readonly)``。``readonly=True`` 表示允许在会话不确定态下
+            执行（只有 ``wheel``/``scroll_to``/``focus``/``blur`` 这四种
+            "不改变页面数据"的动作）。
+
+        Raises:
+            BskError: 该 action **在 bsk CLI 里没有对应子命令**时。
+                绝不臆造参数（本次实现的硬约束）。
+
+        Note:
+            ``target`` 一律走**位置参数**，不发 ``--ref`` / ``--selector``：
+            CLI 报告 §21-§29 明确写了位置参数"使用 --ref/--selector 时可省略"，
+            即三选一。位置参数同时接受 ``@e3``/``e3``/CSS 选择器，交给 CLI
+            自己判别（TOOL-SPEC §1.4 的"唯一特例"只在 ``press`` 上，
+            而 ``press`` 的 ref 是 ``--ref``，见下）。
+        """
+        # 兼容两种写法：新工具（bsk_interact）用连字符的 "scroll-to"（对齐 DSH
+        # 与 bsk CLI 的子命令名），旧工具（bsk_act）用下划线的 "scroll_to"。
+        # 归一化放在这一处，两条路径都能用，也避免将来再出现"键对不上"的静默失败。
+        # 注意方向：表的键是**连字符**形式，所以要把下划线换成连字符。
+        spec = INTERACT_SPECS.get(action) or INTERACT_SPECS.get(
+            action.replace("_", "-")
+        )
+        target = str(opts.get("target") or "")
+        if spec is None:
+            from .errors import BskError as _Err
+
+            raise _Err(
+                f"bsk CLI 没有对应 {action} 的子命令",
+                friendly=(
+                    f"「{action}」不是可用的交互动作；可选值："
+                    + " / ".join(INTERACT_SPECS)
+                    + "。"
+                ),
+                code="unsupported_action",
+            )
+
+        if spec.requires_target and not target:
+            from .errors import BskError as _Err
+
+            raise _Err(
+                f"{action} 需要 target",
+                friendly=(
+                    f"「{action}」必须指定要操作的元素："
+                    "给 target 传元素编号（如 @e3）或 CSS 选择器。"
+                ),
+                code="missing_target",
+            )
+
+        argv: list[str] = [spec.argv[0]]
+
+        # ID / KEY 这类"必填的位置参数"（press 的按键、tab 的 id）。
+        for placeholder in spec.leading_positionals:
+            value = opts.get(placeholder)
+            if value is None or value == "":
+                from .errors import BskError as _Err
+
+                raise _Err(
+                    f"{action} 缺少 {placeholder}",
+                    friendly=f"「{action}」必须提供 {placeholder} 参数。",
+                    code="missing_argument",
+                )
+            argv.append(str(value))
+
+        # 目标位置参数。
+        if spec.allows_target and target:
+            argv.append(target)
+
+        # 选项（顺序固定，便于测试与人工核对）。
+        for name, flag in spec.value_flags:
+            value = opts.get(name)
+            if value is None or value is False:
+                continue
+            if value == "" and (action, name) not in _EMPTY_VALUE_OK:
+                continue
+            if name == "values":
+                for item in value if isinstance(value, (list, tuple)) else [value]:
+                    argv += [flag, str(item)]
+                continue
+            if name == "modifiers":
+                argv += [flag, ",".join(str(m) for m in value)]
+                continue
+            if name == "click_count":
+                argv += [flag, str(int(value))]
+                continue
+            argv += [flag, str(value)]
+        for name, flag in spec.bool_flags:
+            if opts.get(name) is True:
+                argv.append(flag)
+        for name, flag in spec.ms_flags:
+            value = opts.get(name)
+            if value is None:
+                continue
+            argv += [flag, ServiceHelper.ms_value(value)]
+
+        return argv, spec.readonly
+
+    # ------------------------------------------------------------------
+    # bsk_tabs：标签管理
+    # ------------------------------------------------------------------
+
+    async def tabs(
+        self, key: str, action: str, *, tab_id: int | None = None, **opts: Any
+    ) -> dict:
+        """标签管理。
+
+        action: list / create / select / close / borrow / return
+        opts: tab_id / scope / url / active / index
+
+        命令形式（CLI 报告 §7）：
+
+        - ``tab list --scope <SCOPE>``（默认 ``all``，可选 user/agent/all）
+        - ``tab create --url <URL> --index <N> --no-active``（默认聚焦新标签）
+        - ``tab close <TAB_ID>`` / ``tab select <TAB_ID>``（位置参数）
+        - ``tab borrow <TAB_ID> --timeout <T>``（§7 的 ``--no-confirm`` 是
+          已废弃兼容标志，**不发** —— 是否确认由扩展决定，发了也改变不了行为）
+        - ``tab return <TAB_ID>``
+
+        ``tab_id`` 对 select/close/borrow/return 是**必填的位置参数**
+        （§7 里这四个的表格都标了必填），对 list/create 不使用。
+
+        Note:
+            ``tab_id`` 这个名字在本方法里有**两个不同的含义**，必须分清：
+
+            - **位置参数**（``tab select <TAB_ID>`` / ``close`` / ``borrow`` /
+              ``return``）—— 要操作的那一个标签，就是下面的 ``tab_id`` 参数；
+            - **``--tab-id`` 选项** —— "这条命令打在哪个标签上"。
+
+            CLI 报告 §7 里，前四个子命令的表格**只列了 ``--session``**，
+            没有 ``--tab-id``；而 ``--tab-id`` 在报告里是其它命令（§9-§21）
+            的选项。所以对 ``tabs`` 而言：``tab_id`` 永远走位置参数，
+            **不发 ``--tab-id``**。这也是本方法没有跟着其它方法一起接
+            ``tab_id=`` 关键字参数的原因（那会把同一个名字指到两个东西上）。
+        """
+        session_key = self._resolve(key)
+        spec = TABS_SPECS.get(action)
+        if spec is None:
+            raise BskError(
+                f"不支持的标签动作：{action}",
+                friendly=(
+                    f"「{action}」不是可用的标签动作。可用的有："
+                    "list / create / select / close / borrow / return。"
+                ),
+                code="unsupported_action",
+            )
+
+        argv: list[str] = ["tab", spec.argv[1]]
+        target_tab_id = tab_id if tab_id is not None else opts.get("tab_id")
+        if spec.takes_tab_id:
+            if target_tab_id is None or target_tab_id == "":
+                raise BskError(
+                    f"tab {action} 需要 tab_id",
+                    friendly=(
+                        f"「tab {action}」必须给出要操作的标签 id"
+                        "（先用 bsk_tabs(action=\"list\") 查看）。"
+                    ),
+                    code="missing_tab_id",
+                )
+            argv.append(str(int(target_tab_id)))
+
+        if action == "list":
+            scope = opts.get("scope")
+            if scope:
+                argv += ["--scope", str(scope)]
+        elif action == "create":
+            url = opts.get("url")
+            if url:
+                argv += ["--url", str(url)]
+            index = opts.get("index")
+            if index is not None:
+                argv += ["--index", str(int(index))]
+            # --no-active 是"后台打开"，所以 active=True（默认）时不发任何开关。
+            if opts.get("active") is False:
+                argv.append("--no-active")
+
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: [*argv, "--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_ACTION),
+            # 标签管理本身是"窗口/标签"操作，不是页面写操作；但它会改变
+            # 会话能看到的标签集合，且 borrow/return 涉及用户自己的标签。
+            # 保守起见一律不允许在不确定态下执行 —— 与写类动作同一档。
+            allow_uncertain=False,
+        )
+        data = result.data
+        out: dict[str, Any] = {
+            "session": self._session_field(session_key),
+            "action": action,
+        }
+        if action == "list":
+            out["tabs"] = self._render_tabs(data)
+            out["tab_id"] = None
+        else:
+            out["tab_id"] = (
+                int(target_tab_id)
+                if isinstance(target_tab_id, int)
+                and not isinstance(target_tab_id, bool)
+                else None
+            )
+            if isinstance(data, dict):
+                for name, value in data.items():
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        out.setdefault(name, value)
+        return out
+
+    @staticmethod
+    def _render_tabs(data: Any) -> list[dict[str, Any]]:
+        """把 ``tab list`` 的载荷收敛成一段稳定的标签清单。
+
+        CLI 报告 §7 明确说元素级 JSON 结构**未取到**（取它需要先建会话，
+        那属于状态变更）。所以这里只认最保守的形态：
+
+        - 载荷是列表 → 逐项取 ``id``/``tab_id``、``title``、``url``、
+          ``active``、``window_id``，缺的字段就不放进去（**不编造**）；
+        - 载荷不是列表 → 返回空列表。
+
+        刻意不猜字段名之外的语义，也不做任何"补齐"：模型看到的就是 bsk
+        返回的东西。元素结构将来变了，这里最多是少显示几个字段，
+        不会显示错的东西。
+        """
+        if not isinstance(data, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            row: dict[str, Any] = {}
+            for src, dst in (
+                ("id", "id"),
+                ("tab_id", "tab_id"),
+                ("title", "title"),
+                ("url", "url"),
+                ("active", "active"),
+                ("window_id", "window_id"),
+            ):
+                if src in item:
+                    row[dst] = item[src]
+            if row:
+                out.append(row)
+        return out
+
+    # ------------------------------------------------------------------
+    # bsk_assist：窗口、设备模拟、请人帮忙
+    # ------------------------------------------------------------------
+
+    async def resize_window(
+        self, key: str, width: int, height: int, *, tab_id: int | None = None
+    ) -> dict:
+        """调整 Agent Window 大小。
+
+        命令形式（CLI 报告 §8）::
+
+            bsk window resize --width <W> --height <H> --session <ID> --json
+
+        ``--width``/``--height`` 在这里都是**必填**（§8 的 usage 行直接标了），
+        合法范围 100..=7680 —— 范围校验在上层纯函数里做（TOOL-SPEC §1.6），
+        这一层不重复实现。
+
+        Args:
+            tab_id: 接受它只为与其它方法保持**同一个调用形状**（DSH 的
+                ``appendTabId`` 是把 ``tabId`` 发给全部六个工具的）。
+                但它在这里**不会被转发** —— 见下。
+
+        Note:
+            ``tab_id`` 被刻意忽略：CLI 报告 §8 是 ``window resize`` 的**完整**
+            选项表，里面**没有** ``--tab-id``（只有 ``--session`` /
+            ``--width`` / ``--height``），而它的 usage 行也把它标成必填项。
+            这张表与其它命令（§9-§21 都列了 ``--tab-id``）的对比很明确：
+            这个子命令不接受 ``--tab-id``。发一个报告里查不到的 flag 会让
+            clap 直接报参数错误，整条命令失败 —— 那比"忽略这个尺寸无关的
+            参数"糟得多。窗口是会话级的，本就没有"给某个标签 resize"的语义。
+        """
+        del tab_id  # CLI §8 无此选项，见 docstring 的 Note。
+        session_key = self._resolve(key)
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: [
+                "window",
+                "resize",
+                "--width",
+                str(int(width)),
+                "--height",
+                str(int(height)),
+                "--session",
+                sid,
+                "--json",
+            ],
+            timeout=self._timeout(TIMEOUT_ACTION),
+            # 改窗口尺寸不碰页面数据，不确定态下做它是安全的。
+            allow_uncertain=True,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        return {
+            "session": self._session_field(session_key),
+            "width": data.get("width") if isinstance(data.get("width"), int) else int(width),
+            "height": data.get("height") if isinstance(data.get("height"), int) else int(height),
+        }
+
+    async def emulate(
+        self,
+        key: str,
+        *,
+        device: str = "",
+        width: int | None = None,
+        height: int | None = None,
+        mobile: bool = False,
+        off: bool = False,
+        tab_id: int | None = None,
+    ) -> dict:
+        """移动设备环境模拟。
+
+        命令形式（CLI 报告 §9）::
+
+            bsk emulate --device <D> --width <W> --height <H> --mobile --off
+                        --session <ID> --json
+
+        Note:
+            ``--off`` 在 CLI 报告里写着"**与所有其他选项互斥**"，所以它一旦
+            为真，其余参数一个都不发（互斥校验在上层做，但这一层也不该
+            自己造出非法组合）。
+
+        Note:
+            报告 §9 里还有 ``--dpr`` / ``--ua`` / ``--accept-language`` /
+            ``--touch`` / ``--no-touch`` / ``--max-touch-points`` /
+            ``--no-mobile`` / ``--tab-id``。它们**不在** TOOL-SPEC §1.6 的
+            参数表里，所以本方法不接受更细的开关 —— 少一个旋钮只是少一种
+            玩法，多一个无人校验的旋钮才会出问题。``--tab-id`` 例外，
+            它对所有带标签的命令都有效，但本工具没有"换标签再模拟"的语义，
+            故也不发（模拟总是作用于会话当前的活动标签，与 CLI 报告 §9 的
+            默认值一致）。
+        """
+        session_key = self._resolve(key)
+
+        if off:
+            args = ["--off"]
+        else:
+            args = []
+            device_name = self._coerce_device(device)
+            if device_name:
+                args += ["--device", device_name]
+            # --width/--height 必须同时给（报告 §9：无 --device 时要求同时给；
+            # 有 device 时给出则表示"手动覆盖预设的单个字段"，所以给了就一起给）。
+            args += self._size_args(width, height)
+            if mobile:
+                args.append("--mobile")
+
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["emulate", *args], tab_id)
+            + ["--session", sid, "--json"],
+            timeout=self._timeout(TIMEOUT_ACTION),
+            allow_uncertain=True,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        return {
+            "session": self._session_field(session_key),
+            "off": bool(off),
+            "device": (data.get("device") if isinstance(data.get("device"), str) else "") or "",
+            "width": data.get("width") if isinstance(data.get("width"), int) else 0,
+            "height": data.get("height") if isinstance(data.get("height"), int) else 0,
+        }
+
+    async def request_help(
+        self,
+        key: str,
+        prompt: str,
+        *,
+        title: str = "",
+        targets: list[str] | None = None,
+        timeout_ms: int = 300000,
+        completion_criteria: dict | None = None,
+        tab_id: int | None = None,
+    ) -> dict:
+        """请真人完成页内步骤（验证码/登录/确认）。
+
+        返回 {"outcome": str, ...}。outcome 见 TOOL-SPEC §1.6。
+
+        命令形式（CLI 报告 §35）::
+
+            bsk request-help --prompt <P> --title <T> --target <T>...
+                             --timeout <T> --completion-criteria <JSON>
+                             --session <ID> --json
+
+        Note:
+            ``--target`` **可重复**（报告 §35 原文），所以每个目标一个
+            ``--target``。
+
+        Note:
+            ``--completion-criteria`` 的整体值就是那个 JSON 字符串
+            （报告 §35 的示例原文：
+            ``'{"any":[{"url_contains":"/dashboard"}],"stable_for_ms":1000}'``）。
+            注意示例里的键是 **snake_case**（``url_contains`` /
+            ``stable_for_ms``），所以本方法收下调用方给的 snake_case 字典后
+            **整体**序列化成**一个** argv 元素，不做任何二次改写 ——
+            逐键翻译只会把两个已经对齐的命名空间又拧开一次。
+        """
+        session_key = self._resolve(key)
+        args: list[str] = ["--prompt", str(prompt)]
+        if title:
+            args += ["--title", str(title)]
+        for target in targets or []:
+            args += ["--target", str(target)]
+        args += ["--timeout", self._bsk_duration(timeout_ms)]
+        if completion_criteria:
+            args += [
+                "--completion-criteria",
+                self._render_debug_value("completion_criteria", completion_criteria),
+            ]
+
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(["request-help", *args], tab_id)
+            + ["--session", sid, "--json"],
+            # 这是**人在回路**的操作：真人要走到电脑前、看清提示、动手做完。
+            # 所以外层超时必须比 bsk 自己的预算（--timeout，默认 5m）更大，
+            # 否则我们会在人还没做完的时候先把它掐掉。
+            timeout=self._wait_timeout(timeout_ms),
+            # 只读：它不改页面，只是显示一个面板并等人。
+            allow_uncertain=True,
+        )
+        data = result.data if isinstance(result.data, dict) else {}
+        outcome = data.get("outcome")
+        if not isinstance(outcome, str) or not outcome:
+            # 认不出 outcome 时**不猜**成 continued（那会被模型当成"用户可以继续了"，
+            # 而真人可能根本没动手）。给一个明确的未知值 + 原始载荷。
+            outcome = ""
+        out: dict[str, Any] = {
+            "session": self._session_field(session_key),
+            "outcome": outcome,
+            "continued": outcome in ("continued", "completed"),
+        }
+        if isinstance(data, dict):
+            for name, value in data.items():
+                if name == "outcome":
+                    continue
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    out.setdefault(name, value)
+        return out
+
+    # ------------------------------------------------------------------
+    # bsk_inspect(screenshot) / 兼容层：截图的扩展版
+    # ------------------------------------------------------------------
+
+    async def screenshot_ex(
+        self,
+        key: str,
+        *,
+        ref: str = "",
+        full_page: bool = False,
+        tab_id: int | None = None,
+    ) -> ShotPayload:
+        """screenshot 的扩展版（多 ref）。既有的 screenshot(key, full_page=)
+        保持不变并委托到本方法。
+
+        命令形式（CLI 报告 §10）::
+
+            bsk screenshot --ref <REF> --full-page --out <PATH> --session <ID> --json
+
+        Note:
+            ``ref`` 与 ``full_page`` 在 CLI 报告里是两个独立选项
+            （``--ref`` 把截图裁剪到该元素或 Canvas 区域；``--full-page``
+            是滚动拼接全页），报告没有说它们互斥，所以本方法两个都照传。
+            Canvas 点击（``click --capture/--image-x/--image-y``）依赖
+            ``screenshot --ref`` 返回的 capture id，所以 ``ref`` 非空时
+            我们**不**加 ``--full-page``：报告明确说 ``--capture`` 绑定的是
+            "``screenshot --ref`` 返回的图像"，而全页拼接出来的图不是那个区域。
+        """
+        session_key = self._resolve(key)
+        directory = self.settings.screenshot_dir or self._default_shot_dir()
+        out_path = make_shot_path(directory, session_key)
+
+        use_full_page = bool(full_page) and not ref
+        timeout = (
+            self._timeout(self.fullpage_budget())
+            if use_full_page
+            else self._timeout(TIMEOUT_SCREENSHOT)
+        )
+
+        argv = ["screenshot", "--out", str(out_path)]
+        if ref:
+            argv += ["--ref", ref]
+        if use_full_page:
+            argv.append("--full-page")
+
+        result = await self.sessions.execute(
+            session_key,
+            lambda sid: self._with_tab_id(argv, tab_id)
+            + ["--session", sid, "--json"],
+            timeout=timeout,
+            # 截图是只读动作。
+            allow_uncertain=True,
+        )
+        shot = Screenshot.from_json(result.data)
+        if not shot.path:
+            shot.path = str(out_path)
+
+        ok, reason = verify_shot(shot)
+        warning = "" if ok else f"截图可能不完整：{reason}"
+
+        # 顺手清理旧图，避免磁盘无限增长（失败不影响主流程）。
+        try:
+            removed = cleanup_shots(directory)
+            if removed:
+                self._logger.debug("清理了 %d 张旧截图", removed)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("截图清理失败（忽略）：%r", exc)
+
+        payload = ShotPayload(
+            path=shot.path,
+            width=shot.width,
+            height=shot.height,
+            byte_size=shot.byte_size,
+            for_llm=self._describe_shot(shot, use_full_page),
+            warning=warning,
+        )
+        if ref:
+            payload.for_llm += f"（已裁剪到元素 {ref}。）"
+        return payload
+
+
+# --- 新方法用的表格与常量 ------------------------------------------------
+#
+# 这些表格是"bsk 子命令 → argv"的**唯一事实源**：``act``（既有）与
+# ``interact``（新）都从它们构造命令行，所以同一个动作用哪条路径调用，
+# 发出去的命令都逐字节相同。每一条后面标了 CLI 报告的章节。
+
+# ``--timeout`` 的额外余量：纯等待类命令的外层超时 = 它自己的预算 + 这么多。
+#
+# 为什么需要：``wait_for`` 与 ``request_help`` 把"等多久"交给了 bsk 自己
+# （``--timeout``），我们的外层超时只是防它卡死的兜底。取 5 秒与
+# ``FRAMEWORK_TIMEOUT_SAFETY_MARGIN_SEC`` 同一个数量级：足够它把结果写回
+# stdout，又不至于让"没完成"的等待多拖很久。
+WAIT_TIMEOUT_MARGIN_SEC = 5.0
+
+TIMEOUT_HISTORY = 20.0
+"""``reload`` / ``navigate-back`` / ``navigate-forward`` 的下限（秒）。
+
+依据 CLI 报告：这三条命令自己的 ``--timeout`` 默认值都是 **15s**
+（§18/§19/§20），比 ``navigate`` 的 30s 低一档。所以它们的下限取 20 秒 ——
+比 bsk 自己的默认值大，满足"外层超时必须大于 bsk 自身的 --timeout"这条
+原则（见模块顶部），又不必像 navigate 那样留到 45 秒。
+"""
+
+TIMEOUT_DEBUG = 20.0
+"""``debug`` 的下限（秒）。
+
+CLI 报告 §15 里 ``debug`` 的各个选项没有统一的自带超时（只有 ``--wait-ms``
+默认 10000）。取 20 秒 = ``wait-ms`` 默认值的两倍，足够覆盖"等一下再读证据"
+的常见用法，又不会在 daemon 不响应时把用户挂太久。
+"""
+
+EMULATE_DEVICES: frozenset[str] = frozenset(
+    {
+        "iphone-14",
+        "iphone-14-pro-max",
+        "iphone-se",
+        "pixel-7",
+        "galaxy-s23",
+        "ipad-mini",
+        "galaxy-tab-s8",
+    }
+)
+"""``bsk emulate --device`` 的 7 个内置预设（CLI 报告 §9 逐字列出）。
+
+这是**白名单**而不是"格式校验"：转发一个 bsk 不认识的设备名换来的是底层
+报错（模型看不出该怎么办），而用不可核实的值去选目标在 ``--browser`` 上
+已经有"静默选错"的实证。发不出去比发错好。
+"""
+
+MUTATING_DEBUG_ACTIONS: frozenset[str] = frozenset(
+    {
+        "rule_add",
+        "rule_enable",
+        "rule_disable",
+        "rule_remove",
+        "replay",
+    }
+)
+"""``bsk debug`` 里**会改变服务端数据/真实流量**的 action。
+
+它们不能用 ``allow_uncertain=True``（见 :meth:`BskService.debug`）：
+
+- ``replay`` —— 会**带着用户的 cookie 重新发送**抓到的请求，DSH 自己的描述
+  就是 "may change server data"；
+- ``rule_add`` / ``rule_enable`` / ``rule_disable`` / ``rule_remove`` ——
+  能改写/伪造真实请求与响应。
+
+其余 action（``performance`` / ``requests`` / ``console`` / ``export`` /
+``capabilities`` / ``wait`` …）都只是读证据或等待，属于只读。
+"""
+
+
+@dataclass(slots=True)
+class _InteractSpec:
+    """一条交互动作 → bsk 命令的映射。
+
+    Attributes:
+        argv: 命令头（例如 ``["scroll-to"]``；``["click"]``）。
+        leading_positionals: 必填的**前置位置参数**名（``press`` 的 ``key``）。
+        allows_target: ``target`` 是否作为位置参数拼进去。
+        requires_target: 是否要求 ``target`` 非空。
+        value_flags: ``(参数名, flag)`` 列表，按固定顺序拼接。
+        bool_flags: ``(参数名, flag)`` 开关。
+        ms_flags: ``(参数名, flag)``，值是毫秒，渲染成 ``30s``/``1500ms``。
+        readonly: True 表示允许在会话不确定态下执行。
+    """
+
+    argv: tuple[str, ...]
+    leading_positionals: tuple[str, ...] = ()
+    allows_target: bool = False
+    requires_target: bool = False
+    value_flags: tuple[tuple[str, str], ...] = ()
+    bool_flags: tuple[tuple[str, str], ...] = ()
+    ms_flags: tuple[tuple[str, str], ...] = ()
+    readonly: bool = False
+
+
+# 9 个 action（TOOL-SPEC §1.4）。CLI 报告的章节：§21 click、§22 hover、
+# §23 wheel、§24 scroll-to、§25 focus、§26 blur、§27 fill、§29 select、
+# §28 press。
+#
+# readonly 的判定标准是"这个动作会不会改变页面数据"：
+#   - wheel / scroll_to / focus / blur 只改变视口或焦点，不提交任何东西，
+#     不确定态下做它们是安全的（而且常常正是"看清楚刚才到底点了什么"所需）；
+#   - click / hover / fill / select / press 会改页面数据（悬停会展开菜单、
+#     触发页面自己的 JS），一律按写类动作处理。
+#
+# ⚠️ ``press`` 的 target 走 ``--ref``（CLI 报告 §28：``--ref`` 是"派发按键前
+# 先聚焦的可选 snapshot ref"）—— 这是 TOOL-SPEC §1.4 点名的"唯一特例"。
+# 这里只发 ``--ref``，不发 ``--selector``：两个都发是非法组合，而
+# "用户到底想要哪个"无从判断（ref 与 selector 的判别规则在上层校验层）。
+INTERACT_SPECS: dict[str, _InteractSpec] = {
+    "click": _InteractSpec(
+        argv=("click",),
+        allows_target=True,
+        requires_target=True,
+        value_flags=(
+            ("button", "--button"),
+            ("click_count", "--click-count"),
+            ("modifiers", "--modifiers"),
+            ("capture_id", "--capture"),
+            ("image_x", "--image-x"),
+            ("image_y", "--image-y"),
+        ),
+        ms_flags=(("timeout_ms", "--timeout"),),
+    ),
+    "hover": _InteractSpec(
+        argv=("hover",),
+        allows_target=True,
+        requires_target=True,
+        value_flags=(("modifiers", "--modifiers"),),
+        ms_flags=(
+            ("settle_ms", "--settle"),
+            ("timeout_ms", "--timeout"),
+        ),
+    ),
+    "wheel": _InteractSpec(
+        argv=("wheel",),
+        allows_target=True,
+        value_flags=(
+            ("delta_x", "--delta-x"),
+            ("delta_y", "--delta-y"),
+            ("modifiers", "--modifiers"),
+        ),
+        ms_flags=(("timeout_ms", "--timeout"),),
+        readonly=True,
+    ),
+    # 键用连字符，与 bsk CLI 的子命令名、以及 bsk/tools.py 里
+    # TOOL_ACTIONS 的写法逐字一致（DSH 的 action 名也是 "scroll-to"）。
+    # 曾经这里写成下划线的 "scroll_to"，而 tools.validate 输出的是连字符，
+    # 两边对不上导致该 action 落进"没有对应子命令"分支、完全不可用。
+    "scroll-to": _InteractSpec(
+        argv=("scroll-to",),
+        allows_target=True,
+        requires_target=True,
+        ms_flags=(("timeout_ms", "--timeout"),),
+        readonly=True,
+    ),
+    "focus": _InteractSpec(
+        argv=("focus",),
+        allows_target=True,
+        requires_target=True,
+        ms_flags=(("timeout_ms", "--timeout"),),
+        readonly=True,
+    ),
+    "blur": _InteractSpec(
+        argv=("blur",),
+        allows_target=True,
+        requires_target=True,
+        ms_flags=(("timeout_ms", "--timeout"),),
+        readonly=True,
+    ),
+    "fill": _InteractSpec(
+        argv=("fill",),
+        allows_target=True,
+        requires_target=True,
+        # fill 的 --value 是必填的（CLI 报告 §27），而且**空串也要发出去**：
+        # "把字段清空"是一个正当操作，按"空值就跳过"的通用规则处理会做不到
+        # 这件事（还会把一次清空悄悄变成一次不改动）。例外登记在
+        # _EMPTY_VALUE_OK 里。
+        value_flags=(("value", "--value"),),
+        bool_flags=(("no_clear", "--no-clear"),),
+        ms_flags=(("timeout_ms", "--timeout"),),
+    ),
+    "select": _InteractSpec(
+        argv=("select",),
+        allows_target=True,
+        requires_target=True,
+        value_flags=(("values", "--value"),),
+        ms_flags=(("timeout_ms", "--timeout"),),
+    ),
+    "press": _InteractSpec(
+        argv=("press",),
+        leading_positionals=("key",),
+        value_flags=(("target", "--ref"),),
+        ms_flags=(
+            ("hold_ms", "--hold-ms"),
+            ("timeout_ms", "--timeout"),
+        ),
+    ),
+}
+
+# ``fill`` 的 ``--value`` 允许是空串（"清空这个字段"）。
+# 单独一张表而不是在 spec 里加字段：只有它一条有这个需求，加一个只被用到
+# 一次的开关会让 _InteractSpec 变复杂，而复杂度正是要省的东西。
+_EMPTY_VALUE_OK: frozenset[tuple[str, str]] = frozenset({("fill", "value")})
+
+# ``press`` 要按的键在 ``interact(**opts)`` 里可以用的名字。
+#
+# 为什么需要别名：``interact(self, key, action, **opts)`` 的形参 ``key`` 就是
+# 会话键，而 TOOL-SPEC §1.4 给 press 的按键参数起的名字也是 ``key`` ——
+# 后者因此**永远传不进** ``**opts``（Python 会先报 "multiple values for
+# argument 'key'"）。这是接口冻结里的一处矛盾，本文件不擅自改签名，
+# 只在 opts 层兼容一个不冲突的名字。保留 "key" 是为了让
+# ``interact(k, "press", **{"key": "Enter"})`` 这种写法也说得通
+# （技术上它进不了 opts，留着只是让人一眼看出对应关系）。
+_PRESS_KEY_ALIASES: tuple[str, ...] = ("press_key", "key")
+
+
+@dataclass(slots=True)
+class _TabSpec:
+    """一条标签动作 → bsk 命令的映射。"""
+
+    argv: tuple[str, str]
+    takes_tab_id: bool
+
+
+# 6 个 action（TOOL-SPEC §1.5），全部来自 CLI 报告 §7。
+TABS_SPECS: dict[str, _TabSpec] = {
+    "list": _TabSpec(argv=("tab", "list"), takes_tab_id=False),
+    "create": _TabSpec(argv=("tab", "create"), takes_tab_id=False),
+    "select": _TabSpec(argv=("tab", "select"), takes_tab_id=True),
+    "close": _TabSpec(argv=("tab", "close"), takes_tab_id=True),
+    "borrow": _TabSpec(argv=("tab", "borrow"), takes_tab_id=True),
+    "return": _TabSpec(argv=("tab", "return"), takes_tab_id=True),
+}
+
+# ``bsk debug`` 的带值选项（CLI 报告 §15 全表）。键是参数名（snake_case），
+# 值是命令行 flag。**只包含报告里真实存在的项**，一个都不加。
+DEBUG_VALUE_FLAGS: dict[str, str] = {
+    "tab_id": "--tab-id",
+    "run_id": "--run-id",
+    "name": "--name",
+    "since": "--since",
+    "limit": "--limit",
+    "part": "--part",
+    "offset": "--offset",
+    "max_chars": "--max-chars",
+    "pointer": "--pointer",
+    "rule": "--rule",
+    "rule_file": "--rule-file",
+    "replay": "--replay",
+    "replay_file": "--replay-file",
+    "budget": "--budget",
+    "slow_ms": "--slow-ms",
+    "window_ms": "--window-ms",
+    "url": "--url",
+    "method": "--method",
+    "resource_type": "--resource-type",
+    "status": "--status",
+    "state": "--state",
+    "kind": "--kind",
+    "fields": "--fields",
+    "wait_ms": "--wait-ms",
+    "command_id": "--command-id",
+    "output": "--output",
+}
+
+DEBUG_BOOL_FLAGS: dict[str, str] = {
+    "include_controlled": "--include-controlled",
+}
+
+
+class ServiceHelper:
+    """给上面的表格用的小工具集合（不实例化，纯静态）。"""
+
+    @staticmethod
+    def ms_value(value: Any) -> str:
+        """毫秒 → bsk 的时间字面量（``200ms`` / ``1s``）。"""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number <= 0:
+            number = 1.0
+        if number % 1000 == 0:
+            return f"{int(number) // 1000}s"
+        return f"{int(number)}ms"

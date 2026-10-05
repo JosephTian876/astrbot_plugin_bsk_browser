@@ -56,6 +56,7 @@ import contextlib
 import inspect
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -584,19 +585,34 @@ class SessionManager:
     # 公开 API
     # ------------------------------------------------------------------
 
-    async def acquire(self, key: str) -> BskSession:
-        """取当前 key 的会话；没有就建一个。
+    async def acquire(self, key: str, *, start_args: Sequence[str] = ()) -> BskSession:
+        """获取（必要时创建）某个 key 的会话。
 
         同一 key 并发调用只会 ``start`` 一次（其余协程等待并复用），
         返回的也是同一个对象。
 
+        Args:
+            key: 会话键。
+            start_args: 仅在该 key **需要新建会话**时，追加到 ``session start``
+                后面的额外参数（如 ``--width``/``--height``）。
+                **已有会话时完全忽略** —— 窗口尺寸只在建会话那一刻有意义。
+
         Note:
             返回值主要用于读取 ``session_id`` / ``agent_window_id``，
             或者用来判断 ``uncertain``。真正的命令执行请走 ``execute()``。
+
+        Note:
+            ``start_args`` 是**按调用栈传递**的普通参数，不是任何形式的全局/
+            实例状态：并发地给不同 key 建会话时，各自的参数只落在各自那条
+            ``session start`` 上，绝无串味。同时，会话失效后的自动重建
+            （``_restart`` → ``_start_into``）**不带** ``start_args`` ——
+            重建是为了把会话恢复回来，不是为了改窗口尺寸；把一个过期的
+            尺寸参数重放到重建命令上，只会让"恢复"变成一次意外的改尺寸。
         """
         self._ensure_open()
+        extra = tuple(str(item) for item in start_args)
         async with self._locked_entry(key) as entry:
-            await self._ensure_session(entry)
+            await self._ensure_session(entry, start_args=extra)
             self._touch(entry)
             return entry.session
 
@@ -1017,21 +1033,40 @@ class SessionManager:
             self._entries[key] = entry
             return entry
 
-    async def _ensure_session(self, entry: _Entry) -> BskSession:
-        """确保槽位里有一个可用的会话（占位 entry 在这里才真正 start）。"""
+    async def _ensure_session(
+        self, entry: _Entry, *, start_args: tuple[str, ...] = ()
+    ) -> BskSession:
+        """确保槽位里有一个可用的会话（占位 entry 在这里才真正 start）。
+
+        Args:
+            start_args: 仅在**这一步真的要新建会话**时生效，见
+                :meth:`acquire`。已有会话时直接返回，参数被忽略。
+        """
         if entry.session.is_valid():
             return entry.session
-        return await self._start_into(entry)
+        return await self._start_into(entry, start_args=start_args)
 
-    async def _start_into(self, entry: _Entry, *, is_rebuild: bool = False) -> BskSession:
+    async def _start_into(
+        self,
+        entry: _Entry,
+        *,
+        is_rebuild: bool = False,
+        start_args: tuple[str, ...] = (),
+    ) -> BskSession:
         """新建一个 bsk 会话并原地写进槽位。
 
         进函数先把 id 清空：万一 ``start`` 失败，槽位必须如实报告"当前没有
         会话"，否则下次 ``execute`` 会拿着死 id 再撞一次 ``not_found``。
+
+        Args:
+            is_rebuild: 这是不是一次"会话失效后的重建"（只影响计数器）。
+            start_args: 追加到 ``session start`` 后面的额外参数。只有
+                :meth:`acquire` 那条路径会传；重建路径（:meth:`_restart`）
+                刻意不传 —— 重建是为了恢复，不是为了改窗口尺寸。
         """
         previous_id = entry.session.session_id
         entry.session.session_id = ""
-        fresh = await self._start()
+        fresh = await self._start(start_args=start_args)
         # 立刻落盘 —— 这是整个崩溃恢复机制的起点。
         #   必须在这里（而不是等 acquire 返回后）写：从 start 成功到调用方拿到
         #   会话之间有任何一处崩溃，那个会话就已经无人知晓了。
@@ -1072,13 +1107,23 @@ class SessionManager:
                 False：bsk 已经说了这个会话不存在，再 stop 一次既多花一次往返，
                 又可能误杀"别的程序刚建出来的同 id 会话"（4 个小写字母的组合
                 空间并不大）。
+
+        Note:
+            重建**刻意不接收也不携带** ``start_args``：它的职责是把会话恢复
+            回可用状态，不是为了改窗口尺寸。原来的尺寸要求属于"当初那次建会话"
+            那一次调用，只在那一次有意义。
         """
         if stop_old and entry.session.is_valid():
             await self._stop_entry(entry)
         return await self._start_into(entry, is_rebuild=True)
 
-    async def _start(self) -> BskSession:
+    async def _start(self, *, start_args: Sequence[str] = ()) -> BskSession:
         """执行 ``session start`` 并解析出会话。
+
+        Args:
+            start_args: 追加到命令末尾的额外参数（``--width``/``--height`` 等）。
+                正常路径传空元组；只有"显式要求带尺寸建会话"的
+                :meth:`acquire` 会一路传到这里。
 
         Raises:
             BskError: 启动失败，或返回里没有 session_id（协议异常）。
@@ -1088,6 +1133,10 @@ class SessionManager:
         if browser_id:
             # 必须用 instance_id：实测 label 经常是空串，拿它选浏览器会选错。
             args += ["--browser", browser_id]
+        if start_args:
+            # 放在最后：位置无关（clap 不介意），但让"固定参数 → 自动选出的
+            # 浏览器 → 调用方额外要求的参数"这个顺序在日志/报错里一眼可读。
+            args += [str(item) for item in start_args]
 
         result = await self._runner.run_or_raise(args, timeout=self._start_timeout)
         session = BskSession.from_json(result.data)
