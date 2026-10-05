@@ -144,11 +144,12 @@ bsk --version
 
 ## 5. 配置项说明
 
-在 AstrBot WebUI 的插件配置页可以修改以下 15 项。默认值以下表为准（与 `_conf_schema.json`、`bsk/config.py` 完全一致）。
+在 AstrBot WebUI 的插件配置页可以修改以下 16 项。默认值以下表为准（与 `_conf_schema.json`、`bsk/config.py` 完全一致）。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `enabled` | 布尔 | `true` | 插件总开关。关掉后所有浏览器工具直接拒绝调用，但不用卸载插件。 |
+| `legacy_tools` | 布尔 | `true` | 是否同时注册 8 个旧版工具。默认开启，老用户升级后一切照旧；关掉后只保留新工具，每轮对话可省下 3864 字符的工具说明（实测）。**`bsk_evaluate` 不受这一项影响**（它有独立的 `enable_evaluate`）。详见第 6 节。 |
 | `bsk_path` | 字符串 | `"bsk"` | `bsk` 可执行文件的位置。填 `bsk` 表示从系统 PATH 查找；找不到时改填绝对路径，如 `C:\Users\Alice\.local\bin\bsk.exe`。 |
 | `browser_instance_id` | 字符串 | `""`（空） | 指定用哪个浏览器。留空即可：插件会自动选用唯一一个已连接的浏览器；同时连了好几个时才会报错要求你指定。 |
 | `command_timeout_sec` | 浮点 | `60.0` | 所有浏览器命令的统一超时（你愿意等多久）。每条命令另有一个内置的「最少需要多久」（打开网页 45 秒、读取页面 15 秒等），插件取两者里较大的那个 —— 所以调大这一项一定生效，调小它也不会让慢命令提前失败。最多填 110。整页截图通常不需要动这一项（实测约 11 秒），详见第 9 节第 1 条。 |
@@ -161,7 +162,7 @@ bsk --version
 | `screenshot_dir` | 字符串 | `""`（空） | 截图保存目录。留空即可，会存到插件数据目录下的 `astrbot_plugin_bsk_browser\shots`（即 `data\plugin_data\astrbot_plugin_bsk_browser\shots`）。要自己指定就得填完整路径；目录不存在会自动创建（父级目录也会一起建）。 |
 | `journal_path` | 字符串 | `""`（空） | 会话所有权记录文件的位置。留空即可，会写到插件数据目录下的 `astrbot_plugin_bsk_browser\sessions.json`（即 `data\plugin_data\astrbot_plugin_bsk_browser\sessions.json`）。这份记录记的是「插件自己开过哪些浏览器会话」：万一 AstrBot 被强制结束（任务管理器结束进程、崩溃、断电）来不及关窗口，下次启动时插件靠它把自己遗留的那些会话精确关掉（只认 id 和窗口号，不会碰别的程序开的会话）。只有想固定这个文件的位置、方便自己打开查看时才填完整路径。 |
 | `max_page_chars` | 整数 | `3000` | 单次读网页时最多把多少个字符交给模型。网页正文动辄几万字，全塞进去会占满上下文、变慢变贵。最大 20000。执行 JavaScript 的返回值也按这个上限截断。 |
-| `enable_evaluate` | 布尔 | `false` | **允许执行 JavaScript（高风险，默认关闭）。强烈建议保持关闭**，详见下方说明。打开后模型会多出一个 `bsk_evaluate` 工具。 |
+| `enable_evaluate` | 布尔 | `false` | **允许执行 JavaScript（高风险，默认关闭）。强烈建议保持关闭**，详见下方说明。打开后模型才能真的用上 `bsk_evaluate` 工具。 |
 | `evaluate_require_admin` | 布尔 | `true` | 执行 JavaScript 仅限管理员。建议保持开启。开启时，即使关掉了 `admin_only` 或把某人加进白名单，**非管理员依然不能执行脚本**。 |
 
 ### ⚠️ 关于 `admin_only`（默认开启）
@@ -211,21 +212,66 @@ bsk --version
 
 ---
 
-## 6. 8 个工具的能力
+## 6. 14 个工具的能力
 
-插件向大模型注册了 8 个工具（其中 `bsk_evaluate` 默认关闭，关闭时不注册给模型）。你不需要记这些名字 —— 直接对机器人说人话就行，模型会自己决定调哪个。下表供你排查问题时对照。
+插件向大模型注册 **14 个工具**，按来历分成两组：
+
+- **6 个主工具（推荐）** —— 与腾讯 BrowserSkill 的命令结构一一对应，一个工具管一类事，用 `action` 参数选择具体动作，合计 **33 个 action**；
+- **8 个兼容保留的旧工具** —— 0.1.x 时代的单动作工具，行为一个字没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」。它们由配置项 `legacy_tools`（默认开启）控制。
+
+你不需要记这些名字 —— 直接对机器人说人话就行，模型会自己决定调哪个。下表供你排查问题时对照。
+
+### 6.1 六个主工具（推荐）
+
+| 工具名 | 做什么 | `action` 取值 | 模型通常在什么时候调用 |
+|---|---|---|---|
+| `bsk_session` | 管理浏览器会话：启动、停止、列出。 | `start`、`stop`、`list`（3 个） | 要用浏览器前先 `start`；用户说「关掉浏览器」时 `stop`；排查「我这边还有会话吗」时 `list`。 |
+| `bsk_page` | 页面导航与等待。 | `navigate`、`back`、`forward`、`reload`、`wait`（5 个） | 用户说「打开 xxx」「回到上一页」时；点了会跳转的链接之后用 `wait` 等加载完成，避免读到旧页面。 |
+| `bsk_inspect` | 读取页面状态；抓控制台消息与网络请求；按需开启任务范围内的抓包调试。 | `observe`、`snapshot`、`html`、`screenshot`、`console`、`network`、`debug`（7 个，其中 `debug` 下另有 24 个子动作） | 最常用的是 `observe`（读正文 + 元素编号）；用户说「截个图」时用 `screenshot`；页面看起来没反应时用 `console` / `network` 查背后发生了什么。 |
+| `bsk_interact` | 与页面交互：点击、输入、按键、滚动等。 | `click`、`hover`、`wheel`、`scroll-to`、`focus`、`blur`、`fill`、`select`、`press`（9 个） | 用户说「点那个按钮」「在搜索框里输入 xxx」「往下滚一点」时。操作完通常再 `observe` 一次确认结果。 |
+| `bsk_tabs` | 管理当前会话可见的标签页。 | `list`、`create`、`select`、`close`、`borrow`、`return`（6 个） | 需要同时开好几页、或在多个标签页之间来回切换时。⚠️ `borrow` 会把**你自己**的标签页移进 Agent Window，用完请尽快 `return`（停止会话时会自动归还）。 |
+| `bsk_assist` | 调整窗口尺寸、模拟手机/平板设备、请真人帮忙完成页内步骤。 | `resize`、`emulate`、`request-help`（3 个） | 要测响应式布局时用 `resize` / `emulate`；遇到验证码、短信码这类机器人做不了的事，用 `request-help` 弹出提示浮层等你操作。 |
+
+几点需要知道的行为：
+
+- `bsk_inspect` 的 `screenshot` **只回一段文字描述，不会把图片发给你**。要真的收到图片、或要整页长图，请让机器人用旧工具 `bsk_screenshot`（见 6.2）。
+- `bsk_session(start)` 的 `no_focus` 参数目前没有效果：本插件始终在后台打开窗口，不抢焦点。保留这个参数只是为了让参数名与 BrowserSkill 对齐。
+- `bsk_assist` 的 `request-help` 返回的 `outcome` 里，**只有 `continued` 与 `completed` 表示你已经做完了**；`cancelled` / `timed_out` / `navigated` / `disabled` 都不是。这一点插件会如实转达给模型，避免它在你根本没碰过的页面上继续操作。
+
+### 6.2 八个兼容保留的旧工具
 
 | 工具名 | 做什么 | 模型通常在什么时候调用 |
 |---|---|---|
 | `bsk_open` | 打开一个网址，并顺带把页面内容读回来（标题 + 正文摘要 + 可交互元素编号）。已有会话就复用，没有就新建。参数：`url`（必填，必须 `http://` 或 `https://` 开头）、`new_session`（可选，`true` 表示先关掉当前会话重开一个）。 | 用户说「打开 xxx」「去 xxx 看看」时；页面卡死或需要重新登录时用 `new_session=true` 重开。 |
 | `bsk_read` | 读取当前页面的内容和可交互元素编号。返回页面标题、正文摘要，以及形如 `@e1`、`@e2` 的元素编号。 | 用户说「这个页面写了什么」时；或刚做完一次点击/输入、需要确认页面变化时。页面变化后编号会变，所以操作完建议重新读一次。 |
-| `bsk_act` | 在当前页面上执行一个操作（点击、输入、按键、滚动等），动作列表见下。 | 用户说「点那个按钮」「在搜索框里输入 xxx」「往下滚一点」时。操作完通常会再调 `bsk_read` 确认结果。 |
-| `bsk_screenshot` | 给当前页面截图，并直接把图片发给你。参数：`full_page`（可选，`true` 截取整个长页面，较慢；默认只截可见区域）。 | 用户说「截个图看看」时。 |
+| `bsk_act` | 在当前页面上执行一个操作（点击、输入、按键、滚动等），动作列表见 6.4。 | 用户说「点那个按钮」「在搜索框里输入 xxx」「往下滚一点」时。操作完通常会再调 `bsk_read` 确认结果。 |
+| `bsk_screenshot` | 给当前页面截图，并直接把图片发给你。参数：`full_page`（可选，`true` 截取整个长页面，较慢；默认只截可见区域）。 | 用户说「截个图看看」时。**目前只有它能真的把图片发出去、也只有它能整页截图**，新工具做不到这两件事。 |
 | `bsk_close` | 关闭当前聊天正在使用的浏览器会话（会关掉那个 Agent Window）。 | 用户说「关掉浏览器」「不用了」「结束」时。长时间不用的会话也会自动回收，但显式关闭更干净。 |
 | `bsk_status` | 检查环境：`bsk` 是否装好、浏览器扩展是否连上、当前有多少会话。这个工具不需要管理员权限，方便任何人自助排查。 | 用户说「为什么用不了」「检查一下」时；或任何浏览器操作失败后。 |
-| `bsk_evaluate` ⚠️ | 在页面里执行任意 JavaScript 并返回结果，参数：`expression`（要执行的 JS 表达式，如 `document.title`）。默认关闭，且默认仅管理员可用，见第 5 节的说明。返回值过长会被截断（上限同 `max_page_chars`）。 | 只有在你明确打开了 `enable_evaluate` 之后才存在。模型读到页面摘要后仍缺少某个具体值时可能调用它。 |
+| `bsk_logs` | 读控制台消息或网络请求，支持 `since` 游标增量读取。 | 与 `bsk_inspect` 的 `console` / `network` 等价，保留是为了兼容旧提示词的写法。 |
+| `bsk_evaluate` ⚠️ | 在页面里执行任意 JavaScript 并返回结果，参数：`expression`（要执行的 JS 表达式，如 `document.title`）。默认关闭，且默认仅管理员可用，见第 5 节的说明。返回值过长会被截断（上限同 `max_page_chars`）。 | 关闭时（默认）这个工具虽然也出现在模型的工具列表里，但**每次调用都会被拒绝**并返回一句中文说明，实际执行不了任何脚本。打开 `enable_evaluate` 后才真正可用。 |
 
-### `bsk_act` 支持的动作
+### 6.3 关于 `legacy_tools`：要不要关掉旧工具
+
+**默认开启（`true`），老用户升级后一切照旧** —— 这是刻意的默认值。AstrBot 的插件配置是「缺什么补什么、已有的不动」的合并语义，所以升级时旧配置里没有这一项，会自动补上默认值 `true`；如果默认成 `false`，等于在你毫不知情的情况下**静默删掉** 8 个工具，而正在用旧写法的提示词会突然发现工具「没了」。
+
+**关掉它能省多少**：模型每轮对话都要带上全部工具的说明和参数定义。实测（本机 AstrBot 4.28.1，按框架实际序列化给 provider 的体积计算）：
+
+| 配置 | 注册的工具 | 本插件工具说明的序列化体积 |
+|---|---|---|
+| `legacy_tools=true`（默认） | 14 个 | 19398 字符 |
+| `legacy_tools=false` | 7 个 | 15534 字符 |
+
+两者相差 **3864 字符**，这是**每一轮对话都要付的固定开销**。如果你的提示词和你自己都已经改用新工具，关掉它就能省下这笔钱。
+
+**注意 `legacy_tools=false` 后仍会注册 7 个而不是 6 个**：多出来的那一个是 `bsk_evaluate`，它**不受这一项影响**，由自己的开关 `enable_evaluate` 单独控制（见第 5 节）。所以上表里省下的 3864 字符是「8 个旧工具减去 `bsk_evaluate`」的净额。
+
+还有两个已知限制，关之前请先看一眼：
+
+1. 这一项**只在插件重新加载时生效**，改完配置要去插件管理里重载一次；
+2. 如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个工具，那个关闭状态会**优先**于这一项。
+
+### 6.4 `bsk_act` 支持的动作
 
 `action` 参数请取下列值（建议统一用下划线；写成横线（如 `scroll-to`）插件会先自动转成下划线再处理，两种写法都能用，但统一用下划线更不容易出错）：
 
@@ -246,6 +292,25 @@ bsk --version
 | `wait_for_navigation` | 等页面加载完成（点了会跳转的链接、提交表单之后用它，避免读到旧页面） | — |
 
 `target` 可以填两种东西：元素编号（`@e3`，来自 `bsk_read` 的输出），或 CSS 选择器（如 `#search`、`.submit-btn`，懂前端的话可以用）。
+
+### 6.5 与 BrowserSkill 的对应关系
+
+六个主工具是照着腾讯 BrowserSkill 的命令结构做的，**工具名换成 `bsk_` 前缀，但 action 名与参数名完全一致**：
+
+| 本插件 | BrowserSkill | 说明 |
+|---|---|---|
+| `bsk_session` | `browser_session` | 会话的启动、停止、列出 |
+| `bsk_page` | `browser_page` | 导航、前进后退、刷新、等待 |
+| `bsk_inspect` | `browser_inspect` | 读页面、截图、控制台、网络、调试 |
+| `bsk_interact` | `browser_interact` | 点击、输入、按键、滚动等页面交互 |
+| `bsk_tabs` | `browser_tabs` | 标签页的列出、新建、切换、关闭、借用、归还 |
+| `bsk_assist` | `browser_assist` | 窗口尺寸、设备模拟、请真人帮忙 |
+
+「action 名与参数名一致」不是巧合，是这次改造的目标：你按 BrowserSkill 文档写的提示词，把工具名换个前缀就能直接用。参数同时接受 `snake_case` 与 `camelCase`（BrowserSkill 文档里是后者），插件会自动归一化。
+
+**本插件超出 BrowserSkill 的部分**（BrowserSkill 本身不提供，请继续用旧工具）：执行任意 JavaScript 的 `bsk_evaluate`，以及 `bsk_screenshot` 的整页截图能力。
+
+> 本插件与腾讯没有任何隶属关系，工具命名沿用 `bsk_` 前缀是为了与 0.1.x 保持连续、并避免与生态里其它 `browser_*` 插件撞名，不代表官方。详见第 11 节。
 
 ---
 
@@ -384,7 +449,7 @@ bsk --version
    > **注意**：`fullpage_timeout_sec` 管的是「调用浏览器这一段最多等多久」，与模型生成回复的快慢无关。AstrBot 的 `tool_call_timeout` 限制的同样是工具执行耗时，不包含模型出 token 的时间。所以"模型很慢"不是调大这个值的理由 —— 只有页面特别慢、网络特别差才需要。
    >
    > 另外，视口截图（默认那一种）**不受 `fullpage_timeout_sec` 影响**，但它并不是固定在 30 秒：它和其余命令一样走「单条命令超时」那一项（`command_timeout_sec`），只是有一个 30 秒的下限保护 —— 默认配置下实际是 60 秒。实测视口截图只要 0.12 秒，所以通常无需为它调整任何东西。
-2. 执行任意 JavaScript 的能力默认关闭，且需要你主动承担风险。 `bsk` 有执行 JS 的能力，本插件把它做成了独立工具 `bsk_evaluate`，但默认不注册给模型（`enable_evaluate=false`），并且默认强制仅管理员（`evaluate_require_admin=true`，优先于 `admin_only` 与白名单）。只有你在配置里显式打开后才可用。打开它等于取消了"你能看见的操作"这条边界 —— 请先读完第 5 节的说明再决定。
+2. 执行任意 JavaScript 的能力默认关闭，且需要你主动承担风险。 `bsk` 有执行 JS 的能力，本插件把它做成了独立工具 `bsk_evaluate`，由 `enable_evaluate=false` 关闭，并且默认强制仅管理员（`evaluate_require_admin=true`，优先于 `admin_only` 与白名单）。只有你在配置里显式打开后才可用。打开它等于取消了"你能看见的操作"这条边界 —— 请先读完第 5 节的说明再决定。
 3. 需要你手动安装浏览器扩展，插件无法代劳。 `bsk` 和浏览器扩展都必须由你自行安装（插件既不包含也不分发它们），而且扩展必须由你在浏览器里手动确认「已连接」。
 4. 浏览器 Agent Window 共享你的登录态，它不是安全沙箱。 机器人能看到的东西，就是你在那个浏览器里登录着的东西。请只给你信任的人使用（见第 10 节）。
 5. ⚠️ `bsk` 会话空闲约 5 分钟会被回收，回收后机器人会「忘记」之前在哪个页面。 这不是猜测，是实测结果：会话被回收后，插件会自动重建一个新会话让命令不报错，但新会话停在空白页，原本打开的网页和填过的内容不会恢复。所以隔一段时间再用时，机器人可能需要你重新说一遍打开哪个网址。
@@ -446,7 +511,8 @@ bsk --version
 ```
 astrbot_plugin_bsk_browser/
 ├── main.py              # 唯一的框架适配层：插件类、配置读取、生命周期钩子、
-│                        #   8 个 @filter.llm_tool 工具函数（薄适配：取参数 → 调 service → 包结果）
+│                        #   14 个 @filter.llm_tool 工具函数（6 个多动作主工具 + 8 个兼容旧工具；
+│                        #   薄适配：取参数 → 调 service → 包结果）
 ├── bsk/                 # 纯逻辑包（零 astrbot 依赖，也不 import 内置 logging，可脱离框架单测）
 │   ├── logger.py        #   日志接口 LoggerLike + 空实现 NullLogger（由 main.py 注入真 logger）
 │   ├── paths.py         #   插件数据目录解析与降级（journal 与截图共用）
@@ -458,6 +524,8 @@ astrbot_plugin_bsk_browser/
 │   ├── pages.py         #   页面文本解析：标题、元素编号（@eN）、截断
 │   ├── shots.py         #   截图：唯一路径、魔数校验、自动清理
 │   ├── journal.py       #   会话所有权记录：原子写、读坏了当没有
+│   ├── tools.py         #   6 个主工具的规格唯一事实源：action 枚举、完整 JSON Schema、
+│   │                    #     参数归一化、逐 action 校验（纯函数，可独立单测）
 │   └── service.py       #   业务编排（工具函数的纯逻辑实现）
 ├── tests/               # 单元测试与契约测试
 ├── metadata.yaml        # AstrBot 插件元信息
@@ -473,8 +541,8 @@ D:\AstrBot\backend\python\python.exe -m unittest discover -s tests
 D:\AstrBot\backend\python\python.exe tests\verify_astrbot_contract.py
 ```
 
-- 第一条：跑 `tests/` 下的单元测试（配置解析、错误映射、页面解析、截图校验、会话状态机等）。不需要 AstrBot 运行中，也不需要浏览器。
-- 第二条：契约测试 —— 用真实的 AstrBot 环境 import `main.py`，验证插件能被加载、8 个工具能成功注册、参数定义正确。
+- 第一条：跑 `tests/` 下的单元测试（配置解析、错误映射、页面解析、截图校验、会话状态机、主工具规格与参数校验等）。不需要 AstrBot 运行中，也不需要浏览器。当前共 **714 个用例**（`unittest` 口径）。
+- 第二条：契约测试 —— 用真实的 AstrBot 环境 import `main.py`，验证插件能被加载、14 个工具能成功注册、参数定义正确。
 
 另有一个真实浏览器集成测试（需要你已装好 `bsk` 和扩展，且只访问 `example.com`）：
 

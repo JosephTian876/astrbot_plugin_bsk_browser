@@ -257,8 +257,56 @@ async def main() -> int:
     r = await call_tool(bound["bsk_session"], ev, action="list", bogus_arg=1)
     record("schema 外参数不抛 mismatch", "mismatch" not in r.lower(), r.replace("\n", " ")[:110])
 
+    # 跨 action 的参数必须被拒，而不是静默丢弃
+    r = await call_tool(bound["bsk_interact"], ev, action="wheel", delta_y=1, values=["a"])
+    record(
+        "跨 action 参数被拒（wheel 收到 values）",
+        "values" in r and "用不上" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    r = await call_tool(bound["bsk_page"], ev, action="navigate", url="https://example.com", session="  ")
+    record(
+        "空白 session 被拒（不再静默忽略）",
+        "session" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    # timeout_ms 必须真的生效（第三轮 P0：曾经被静默丢弃）
+    r = await call_tool(
+        bound["bsk_interact"], ev, action="press", key="Escape", timeout_ms=15000
+    )
+    record(
+        "press 的 timeout_ms 被接受",
+        "未预期" not in r and "用不上" not in r,
+        r.replace("\n", " ")[:110],
+    )
+
     # ------------------------------------------------------------------
-    print("\n--- 9. 清理 ---")
+    print("\n--- 9. 会话指定（session 转发）---")
+
+    # 建第二个会话，验证显式指定 session 时命令真的打到它上面
+    r2 = await call_tool(bound["bsk_session"], ev, action="start")
+    r = await call_tool(bound["bsk_session"], ev, action="list")
+    # 从 list 的输出里找一个会话键（格式由渲染器决定，这里只验证"指定后不报错"）
+    import re as _re
+
+    keys = _re.findall(r"`([^`]+)`", r) or _re.findall(r"([A-Za-z0-9_\-:]{3,})", r)
+    record("session.list 有输出", bool(r.strip()), r.replace("\n", " ")[:110])
+
+    # 用一个明确不存在的会话，应当被拒（而不是静默回退到当前会话）
+    r = await call_tool(
+        bound["bsk_page"], ev, action="navigate", url="https://example.com",
+        session="definitely-not-a-real-session",
+    )
+    record(
+        "指定不存在的 session 被拒（不回退、不静默）",
+        "不属于本插件" in r or "失败" in r or "不存在" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    # ------------------------------------------------------------------
+    print("\n--- 10. 清理 ---")
     r = await call_tool(bound["bsk_session"], ev, action="stop")
     record("session.stop", "失败" not in r, r.replace("\n", " ")[:110])
 

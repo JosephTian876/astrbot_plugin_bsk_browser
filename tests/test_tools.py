@@ -403,6 +403,146 @@ class TestDebugRules(unittest.TestCase):
         with self.assertRaises(tools.BskToolError):
             call("bsk_inspect", {"action": "debug", "debug_action": "__model__"})
 
+    def test_limit_range_enforced(self) -> None:
+        """`limit` 范围 1..100 —— 突变测试发现这条曾无回归保护。"""
+        for value, ok in ((1, True), (100, True), (0, False), (101, False), (-1, False)):
+            with self.subTest(limit=value):
+                raw = {"action": "debug", "debug_action": "requests", "limit": value}
+                if ok:
+                    call("bsk_inspect", raw)
+                else:
+                    with self.assertRaises(tools.BskToolError):
+                        call("bsk_inspect", raw)
+
+    def test_offset_range_enforced(self) -> None:
+        """`offset` 范围 0..65536。"""
+        for value, ok in ((0, True), (65536, True), (65537, False), (-1, False)):
+            with self.subTest(offset=value):
+                raw = {"action": "debug", "debug_action": "performance", "offset": value}
+                if ok:
+                    call("bsk_inspect", raw)
+                else:
+                    with self.assertRaises(tools.BskToolError):
+                        call("bsk_inspect", raw)
+
+    def test_max_chars_range_enforced(self) -> None:
+        """`max_chars` 范围 1..16384。"""
+        for value, ok in ((1, True), (16384, True), (0, False), (16385, False)):
+            with self.subTest(max_chars=value):
+                raw = {
+                    "action": "debug",
+                    "debug_action": "request",
+                    "id": "x",
+                    "max_chars": value,
+                }
+                if ok:
+                    call("bsk_inspect", raw)
+                else:
+                    with self.assertRaises(tools.BskToolError):
+                        call("bsk_inspect", raw)
+
+    def test_budget_range_enforced(self) -> None:
+        """`budget` 范围 4096..262144。"""
+        for value, ok in ((4096, True), (262144, True), (4095, False), (262145, False)):
+            with self.subTest(budget=value):
+                raw = {"action": "debug", "debug_action": "activity", "budget": value}
+                if ok:
+                    call("bsk_inspect", raw)
+                else:
+                    with self.assertRaises(tools.BskToolError):
+                        call("bsk_inspect", raw)
+
+    def test_slow_ms_only_for_aggregate(self) -> None:
+        """`slow_ms` 只对 aggregate 有意义 —— 别的 action 传它必须报错。"""
+        call(
+            "bsk_inspect",
+            {"action": "debug", "debug_action": "aggregate", "slow_ms": 1000},
+        )
+        for action in ("performance", "requests", "capabilities"):
+            with self.subTest(action=action):
+                with self.assertRaises(tools.BskToolError):
+                    call("bsk_inspect", {"action": "debug", "debug_action": action, "slow_ms": 1})
+
+    def test_window_ms_only_for_duplicates(self) -> None:
+        """`window_ms` 只对 duplicates 有意义。"""
+        call(
+            "bsk_inspect",
+            {"action": "debug", "debug_action": "duplicates", "window_ms": 1000},
+        )
+        with self.assertRaises(tools.BskToolError):
+            call(
+                "bsk_inspect",
+                {"action": "debug", "debug_action": "aggregate", "window_ms": 1000},
+            )
+
+    def test_controlled_only_actions(self) -> None:
+        """`include_controlled` 只对 aggregate / duplicates 有意义。"""
+        for action in tools.CONTROLLED_ONLY_DEBUG_ACTIONS:
+            with self.subTest(action=action):
+                call(
+                    "bsk_inspect",
+                    {"action": "debug", "debug_action": action, "include_controlled": True},
+                )
+        with self.assertRaises(tools.BskToolError):
+            call(
+                "bsk_inspect",
+                {"action": "debug", "debug_action": "performance", "include_controlled": True},
+            )
+
+    def test_part_requires_pointer(self) -> None:
+        """`part` 的五种取值不带 pointer 时都合法。"""
+        for part in tools.DEBUG_PART_VALUES:
+            with self.subTest(part=part):
+                call(
+                    "bsk_inspect",
+                    {
+                        "action": "debug",
+                        "debug_action": "request",
+                        "id": "x",
+                        "part": part,
+                    },
+                )
+
+    def test_pointer_restricts_part_to_request_or_response(self) -> None:
+        """带 `pointer` 时 `part` 只允许 request / response。
+
+        pointer 是 JSON 指针，只在完整请求/响应体里有意义；
+        带 pointer 却要 headers/metadata/timing 是自相矛盾的组合。
+        """
+        for part in ("request", "response"):
+            with self.subTest(part=part):
+                call(
+                    "bsk_inspect",
+                    {
+                        "action": "debug",
+                        "debug_action": "request",
+                        "id": "x",
+                        "pointer": "/a",
+                        "part": part,
+                    },
+                )
+        for part in ("headers", "metadata", "timing", "bogus"):
+            with self.subTest(part=part):
+                with self.assertRaises(tools.BskToolError):
+                    call(
+                        "bsk_inspect",
+                        {
+                            "action": "debug",
+                            "debug_action": "request",
+                            "id": "x",
+                            "pointer": "/a",
+                            "part": part,
+                        },
+                    )
+
+    def test_pointer_requires_valid_part(self) -> None:
+        """带 `pointer` 时 `part` 必填 —— 不填就不知道该解析哪一部分。"""
+        with self.assertRaises(tools.BskToolError):
+            call(
+                "bsk_inspect",
+                {"action": "debug", "debug_action": "request", "id": "x", "pointer": "/a"},
+            )
+
 
 class TestCompletionCriteria(unittest.TestCase):
     """``completion_criteria`` 的键名转换（这是 ``request-help`` 的命门）。
@@ -490,12 +630,143 @@ class TestTabIdPreserved(unittest.TestCase):
         self.assertIsNone(got.get("tab_id"))
 
 
+class TestTimeoutMsPreserved(unittest.TestCase):
+    """``timeout_ms`` 必须在**每一个**支持它的 interact action 上保留。
+
+    回归测试：第三轮审阅用突变测试发现，`click`/`fill`/`press` 三个分支
+    算出了 timeout_ms 却没写回返回 dict —— 模型传了超时既不报错也不生效，
+    命令仍按 bsk 默认的 30 秒走。慢页面上模型会误判成"操作失败"并重试，
+    进而造成重复点击/重复提交。
+
+    这条缺陷在 `tab_id` 那次修复中活了下来（同型问题换了个参数），
+    所以这里**逐个 action** 断言，而不是只抽查一个。
+    """
+
+    CASES = (
+        ("click", {"target": "@e1"}),
+        ("fill", {"target": "@e1", "value": "v"}),
+        ("press", {"key": "Enter"}),
+        ("hover", {"target": "@e1"}),
+        ("scroll-to", {"target": "@e1"}),
+        ("focus", {"target": "@e1"}),
+        ("blur", {"target": "@e1"}),
+        ("select", {"target": "@e1", "values": ["a"]}),
+        ("wheel", {"delta_y": 100}),
+    )
+
+    def test_timeout_ms_kept_on_every_action(self) -> None:
+        for action, extra in self.CASES:
+            with self.subTest(action=action):
+                got = call("bsk_interact", dict(extra, action=action, timeout_ms=5000))
+                self.assertEqual(got.get("timeout_ms"), 5000, action)
+
+    def test_timeout_ms_rejects_non_positive(self) -> None:
+        for bad in (0, -1):
+            with self.subTest(value=bad):
+                with self.assertRaises(tools.BskToolError):
+                    call("bsk_interact", {"action": "click", "target": "@e1", "timeout_ms": bad})
+
+
+class TestSessionPreserved(unittest.TestCase):
+    """``session`` 必须保留在 validate 的输出里（5 个多动作工具）。
+
+    回归测试：schema 里六个工具都有 session（对齐 DSH 的参数并集），
+    但校验器早先不写回、main.py 也只用本对话的键 —— 模型显式指定的会话
+    被静默丢弃，多会话场景下命令打在另一个会话上，且不报错。
+    """
+
+    CASES = (
+        ("bsk_page", {"action": "navigate", "url": "https://x"}),
+        ("bsk_inspect", {"action": "observe"}),
+        ("bsk_interact", {"action": "click", "target": "@e1"}),
+        ("bsk_tabs", {"action": "list"}),
+        ("bsk_assist", {"action": "resize", "width": 800, "height": 600}),
+    )
+
+    def test_session_kept(self) -> None:
+        for tool_name, raw in self.CASES:
+            with self.subTest(tool=f"{tool_name}.{raw['action']}"):
+                got = call(tool_name, dict(raw, session="grpA"))
+                self.assertEqual(got.get("session"), "grpA")
+
+    def test_session_absent_when_not_given(self) -> None:
+        got = call("bsk_page", {"action": "navigate", "url": "https://x"})
+        self.assertNotIn("session", got)
+
+    def test_blank_session_rejected(self) -> None:
+        """空白串不是"没给"，而是无效输入 —— 报错比静默忽略好。
+
+        静默忽略会让模型以为"我指定了会话"，实际用的是当前会话；
+        报错能让它自己改过来。
+        """
+        with self.assertRaises(tools.BskToolError):
+            call("bsk_page", {"action": "navigate", "url": "https://x", "session": "   "})
+
+
+class TestNoSpuriousArgvKeys(unittest.TestCase):
+    """不该出现的键不能进结果 —— 它们会变成命令行上的垃圾参数。
+
+    `--modifiers ''` 曾经恒发（`modifiers or []` 让服务层的判空失效）；
+    delta 曾被渲染成 `0.0` 浮点（CLI 的默认值是整数 `0`）。
+    """
+
+    def test_modifiers_absent_when_empty(self) -> None:
+        got = call("bsk_interact", {"action": "click", "target": "@e1"})
+        self.assertNotIn("modifiers", got)
+
+    def test_modifiers_kept_when_given(self) -> None:
+        got = call("bsk_interact", {"action": "click", "target": "@e1", "modifiers": ["ctrl"]})
+        self.assertEqual(got.get("modifiers"), ["ctrl"])
+
+    def test_delta_rendered_as_int(self) -> None:
+        got = call("bsk_interact", {"action": "wheel", "delta_y": 100})
+        self.assertIsInstance(got.get("delta_x"), int)
+        self.assertIsInstance(got.get("delta_y"), int)
+        self.assertEqual(got.get("delta_x"), 0)
+        self.assertEqual(got.get("delta_y"), 100)
+
+    def test_capture_id_absent_when_empty(self) -> None:
+        """capture_id 是 Canvas 点击专用；不传时不该出现空串。"""
+        got = call("bsk_interact", {"action": "click", "target": "@e1"})
+        self.assertEqual(got.get("capture_id"), "")
+
+
 class TestUnknownArguments(unittest.TestCase):
     """未知参数必须拒绝，而不是静默忽略。"""
 
     def test_rejects_unknown(self) -> None:
         with self.assertRaises(tools.BskToolError):
             call("bsk_page", {"action": "wait", "bogus": 1})
+
+    def test_rejects_unknown_on_every_tool(self) -> None:
+        """`check_known` 在六个工具上都必须生效。
+
+        突变测试曾发现「关掉 check_known」无任何测试报警 ——
+        那会让所有拼错的参数静默通过，一路传到命令行。
+        """
+        MINIMAL = (
+            ("bsk_session", {"action": "list"}),
+            ("bsk_page", {"action": "wait"}),
+            ("bsk_inspect", {"action": "observe"}),
+            ("bsk_interact", {"action": "wheel", "delta_y": 1}),
+            ("bsk_tabs", {"action": "list"}),
+            ("bsk_assist", {"action": "emulate", "off": True}),
+        )
+        for tool_name, raw in MINIMAL:
+            with self.subTest(tool=tool_name):
+                with self.assertRaises(tools.BskToolError):
+                    call(tool_name, dict(raw, totally_bogus_arg=1))
+
+    def test_unknown_per_action(self) -> None:
+        """同一工具的不同 action 也各自拒绝不属于自己的参数。
+
+        注意 `target` **不是** wheel 的非法参数 —— CLI 的 `wheel [TARGET]`
+        接受一个可选的命中点。这里换一个真正越界的参数。
+        """
+        with self.assertRaises(tools.BskToolError):
+            call("bsk_interact", {"action": "wheel", "delta_y": 1, "values": ["x"]})
+        with self.assertRaises(tools.BskToolError):
+            call("bsk_interact", {"action": "click", "target": "@e1", "delta_y": 1})
 
     def test_session_list_takes_nothing(self) -> None:
         call("bsk_session", {"action": "list"})

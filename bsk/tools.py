@@ -881,6 +881,36 @@ class _Ctx:
                 "例如 max_depth、timeout_ms），或先读一次工具说明。"
             )
 
+    def check_consumed(self, *keys: str) -> None:
+        """拒绝属于**别的 action** 的参数。
+
+        为什么还需要这一道（``check_known`` 拦不住）：六个工具的 schema 是
+        该工具**全部 action 参数的并集**（对齐 DSH 的扁平设计），所以
+        ``known`` 是并集 —— ``click`` 收到 ``delta_y``、``wheel`` 收到
+        ``values`` 都能通过 ``check_known``，然后被**静默丢弃**。
+
+        这与 ``tab_id``/``timeout_ms``/``session`` 那几次缺陷是同一类：
+        模型以为参数生效了，实际命令里没有它。区别是那几次是漏写回，
+        这次是跨 action 的键根本不该被接受。
+
+        Args:
+            *keys: 本 action **真正会消费**的参数名。不在其中的、且模型确实
+                给了值的参数，一律报错。
+        """
+        allowed = set(keys) | {"action"}
+        extras = sorted(
+            key
+            for key in self.args
+            if key not in allowed and self.given(key)
+        )
+        if extras:
+            self.fail(
+                f"{self.where()} 不接受参数 "
+                + "、".join(extras)
+                + "（它们属于同一个工具里的其他 action，传进来只会被忽略）；"
+                "请去掉它们，或改用对应的 action。"
+            )
+
     def as_str(self, key: str) -> str:
         """取字符串参数（空串归一成 ``""``）。"""
         value = self.raw(key)
@@ -1446,13 +1476,19 @@ def _validate_interact(ctx: _Ctx) -> dict:
                     f"收到的是 {click_count}。"
                 )
         ctx.check_known()
-        out.update({"target": target, "button": button, "modifiers": modifiers or [],
-                    "capture_id": capture_id})
+        # modifiers 为空时**不写进 out**：写空列表会让服务层的判空失效，
+        # 于是每条命令都多带一个 `--modifiers ''`。CLI 默认值虽是空串，
+        # 但显式传空串是否等价于"不指定"取决于扩展侧解析，不值得赌。
+        out.update({"target": target, "button": button, "capture_id": capture_id})
+        if modifiers:
+            out["modifiers"] = modifiers
         if click_count is not None:
             out["click_count"] = click_count
         if image_x is not None and image_y is not None:
             out["image_x"] = image_x
             out["image_y"] = image_y
+        if timeout_ms is not None:
+            out["timeout_ms"] = timeout_ms
         return out
 
     if action == "hover":
@@ -1462,7 +1498,9 @@ def _validate_interact(ctx: _Ctx) -> dict:
             ctx.fail(f"{ctx.where()} 的 target 不能是空白字符串。")
         settle_ms = ctx.as_int("settle_ms", positive=True)
         ctx.check_known()
-        out.update({"target": target, "modifiers": modifiers or []})
+        out.update({"target": target})
+        if modifiers:
+            out["modifiers"] = modifiers
         if settle_ms is not None:
             out["settle_ms"] = settle_ms
         if timeout_ms is not None:
@@ -1485,8 +1523,17 @@ def _validate_interact(ctx: _Ctx) -> dict:
                 "否则等于什么都没滚；请给一个非零的滚动量。"
             )
         ctx.check_known()
-        out.update({"delta_x": delta_x or 0.0, "delta_y": delta_y or 0.0,
-                    "modifiers": modifiers or []})
+        # delta 用整数渲染：CLI 报告里的默认值是整数 `0`，而 as_float 会得到
+        # float，str() 之后变成 "0.0"/"100.0"。服务层再 str() 一次就会把
+        # 浮点形态发进 argv —— 没必要冒这个险，滚动量本来就没有小数语义。
+        out.update(
+            {
+                "delta_x": int(delta_x or 0),
+                "delta_y": int(delta_y or 0),
+            }
+        )
+        if modifiers:
+            out["modifiers"] = modifiers
         if timeout_ms is not None:
             out["timeout_ms"] = timeout_ms
         return out
@@ -1516,8 +1563,17 @@ def _validate_interact(ctx: _Ctx) -> dict:
                 '请补上要输入的文本（想看齐输入框就传空字符串 ""）。'
             )
         ctx.check_known()
-        return {"target": target, "value": ctx.as_str("value"),
-                "no_clear": ctx.as_bool("no_clear"), "tab_id": tab_id}
+        out.update(
+            {
+                "target": target,
+                "value": ctx.as_str("value"),
+                "no_clear": ctx.as_bool("no_clear"),
+                "tab_id": tab_id,
+            }
+        )
+        if timeout_ms is not None:
+            out["timeout_ms"] = timeout_ms
+        return out
 
     if action == "select":
         ctx.require("target", "values")
@@ -1559,6 +1615,8 @@ def _validate_interact(ctx: _Ctx) -> dict:
         out["target"] = target
     if hold_ms is not None:
         out["hold_ms"] = hold_ms
+    if timeout_ms is not None:
+        out["timeout_ms"] = timeout_ms
     return out
 
 
@@ -1927,4 +1985,44 @@ def validate(tool_name: str, args: dict) -> dict:
         if value is None:
             continue
         result[key] = value
+
+    # ``session`` 统一在这里补：5 个多动作工具的 schema 里都有它（对齐 DSH 的
+    # 参数并集），而每个工具的校验器只关心自己的 action 专属参数，不该各自重复
+    # 处理会话。早先没有这一步，模型显式指定的 session 被**静默丢弃** ——
+    # 多会话场景下命令打在另一个会话上（与 tab_id 那一类缺陷同型）。
+    #
+    # ``bsk_session`` 不在此列：它的 session 有独立语义（"要停止哪个会话"），
+    # 该校验器自己会给出，这里不覆盖它。
+    if tool_name != "bsk_session" and "session" in TOOL_SCHEMAS[tool_name]["properties"]:
+        session = ctx.as_str("session").strip()
+        if session:
+            result["session"] = session
+
+    # ------------------------------------------------------------------
+    # 通用守卫：模型给了值、却没有出现在结果里的参数 = 被静默丢弃。
+    #
+    # 为什么要有这一道：「schema 收下了、执行时丢了」这个缺陷在本项目里
+    # 已经出现过**四次**（tab_id → timeout_ms → session → 跨 action 的键），
+    # 每一次都是靠人工审阅或突变测试才发现的，而且每次都只修了当时那一个参数。
+    # 逐个补是治标；这条守卫把整类问题一次性堵住 —— 以后任何新增 action
+    # 只要漏写回一个参数，这里立刻报错，而不是等下一轮审阅。
+    #
+    # 豁免清单只放**确实允许不写回**的键，且每个都要写明理由。
+    # ------------------------------------------------------------------
+    _DROP_OK = frozenset()
+    dropped = sorted(
+        key
+        for key in ctx.args
+        if key not in result
+        and key not in _DROP_OK
+        and ctx.given(key)
+    )
+    if dropped:
+        raise BskToolError(
+            f"{tool_name} 的 action={canonical} 收到了 "
+            + "、".join(dropped)
+            + "，但这一步用不上它们（照现在这样执行，它们会被忽略）。"
+            "请去掉它们，或改用会用到这些参数的那个 action；"
+            "如果你认为这是插件的缺陷，请把这个工具的调用参数告诉用户。"
+        )
     return result

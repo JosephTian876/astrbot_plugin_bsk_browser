@@ -4,6 +4,98 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-10-06
+
+对齐腾讯 BrowserSkill 的 DSH 插件形态，把工具按能力拆成 6 个多动作工具。
+这是一次**向后兼容的功能新增**：旧工具默认继续注册，老用户的用法与提示词不受影响。
+
+本次移植过程中用真机实测逐条核对了参考实现的行为，因此下方"修复"一节的多数条目
+不是新代码自带的缺陷，而是**照抄推理、没有实测**留下的错误 —— 单测全绿时它们依然存在。
+
+### 新增
+
+- **6 个多动作工具（共 33 个 action）**，参数名与 action 名均与参考实现一致：
+  - `bsk_session`（3）：打开 / 关闭 / 列出机器人自己的浏览器会话
+  - `bsk_page`（5）：导航、前进、后退、刷新（可绕缓存）、等待页面生命周期
+  - `bsk_inspect`（7）：读取页面（`observe` / `snapshot` / `html`）、`screenshot`、
+    控制台与网络请求，以及 `debug`（其下另有 24 个子动作）
+  - `bsk_interact`（9）：点击、悬停、滚轮、滚动到元素、聚焦、失焦、填表、下拉选择、按键
+  - `bsk_tabs`（6）：列出 / 新建 / 切换 / 关闭 / 借用 / 归还标签页
+  - `bsk_assist`（3）：窗口缩放、设备模拟、在页面上向真人求助
+- **标签页管理**：`bsk_tabs` 支持列出、新建、切换、关闭，以及 **借用用户自己已打开的
+  标签页**（`borrow`，用完 `return` 归还）—— 需要登录态的页面不必再让用户手动重开一次
+- **设备模拟与窗口缩放**：`bsk_assist` 的 `emulate` 内置 7 种设备预设
+  （iPhone / Pixel / Galaxy / iPad 等），`resize` 可直接改窗口尺寸，另可单独清除模拟
+- **网络调试**：`bsk_inspect(action="debug")` 提供 24 个子动作 —— 开始 / 结束抓包、
+  读取页面与请求证据、查看规则、导出，以及**显式控制网络流量**：`rule_add` /
+  `rule_enable` 可拦截、改写或伪造真实请求，`replay` 会重新发送一次请求
+  （**可能改动服务端数据**）
+- **页面内求助真人**：`bsk_assist(action="request-help")` 让模型在页面上高亮目标并
+  说明要做什么，然后等用户完成（例如扫码、短信验证码）。带 `completion_criteria`
+  完成条件判定：`continued` / `completed` 才算完成，`cancelled` / `timed_out` /
+  `navigated` / `disabled` 都不是
+- **观察的游标分页**：`observe` 支持 `cursor` / `max_depth` / `max_tokens`，
+  返回里给出 `next_cursor` 供续读，内容被截断时模型不再无从下手
+- **新配置项 `legacy_tools`（默认 `true`）**：控制旧的 8 个工具是否继续注册。
+  默认开启以保证升级无感；关掉可省下每轮对话约 2000 字符的工具描述开销。
+  `bsk_evaluate` 不受这一项影响（它有自己的高风险开关 `enable_evaluate`），
+  因此关掉后停用的是 7 个。该项只在插件重新加载时生效
+
+### 修复
+
+按严重性排序，全部为本次移植中实测发现：
+
+- **`scroll-to` 完全不可用（P0）**：`bsk_interact` 的 action 名是连字符
+  （`scroll-to`，与 CLI 子命令一致），而内部规格表的键写成了下划线 `scroll_to`，
+  两边对不上 —— 模型传对了名字反而报错。现两种写法都收，输出统一为连字符
+- **`tab_id` 在 8/10 个 action 被静默丢弃（P0）**：校验阶段读了它、却没写回结果，
+  模型指定了标签页**不报错也不生效**，命令打在另一个标签上。现全部保留
+- **`completion_criteria` 三层键名不一致，`request-help` 完全失效（P0）**：
+  schema 用 camelCase、内部校验用 snake_case、送进 CLI 的又是另一套，
+  三层各写各的。现在有唯一的转换表，两种写法都收
+- **`debug` 的 `replay` / `rule_*` 在"上次结果不确定"时仍会执行（P0，安全分级错误）**：
+  这两类动作会改变外部可见状态，判断标准应是"重放一次会不会改变服务端数据"，
+  而不是"bsk 自己会不会校验"。现已归入写类动作，在状态不确定时一律挡住
+- **`debug_action=wait` 的超时倒挂（P0）**：`wait_ms` 的合法上限是 60 秒，
+  而外层超时默认也是 60 秒 —— 一次**合法的最长等待**会被自己的超时掐死，
+  用户看到超时错误而不是等到的结果。现保证外层超时严格大于 bsk 自身预算
+- **`observe` 的 `cursor` / `max_depth` / `max_tokens` / `tab_id` 被丢弃（P0）**：
+  参数收下了却没有传下去，分页与限深限长形同虚设
+- **`console` 时间戳让渲染整条崩掉（P0）**：`bsk` 的 `console` 用 Unix 毫秒、
+  `network` 用相对毫秒，此前按同一种解释直接 `localtime()`，`console` 抛
+  `OSError` 导致渲染失败。现按来源分别解释
+- **截图落点出现重复的 `shots` 层级（P1）**：数据目录解析返回 `.../shots`
+  而落盘函数内部又拼一层，实际写成 `.../shots/shots/<会话id>/`
+- **若干文档事实错误（P1）**：工具数、用例数、自检项数均与实际不符；
+  「视口截图超时固定 30 秒」也是错的（实测随 `command_timeout_sec` 变化，
+  30 秒只是下限）。契约测试的工具清单改为从源码自动推导，杜绝再次过时
+
+### 变更
+
+- **`bsk_session` 的 `request_id` 参数已移除**：可选值语义依赖尚未实测的
+  `bsk session request` 三态行为，**不支持的能力就不该暴露给模型**。
+  详见下方「与 BrowserSkill 的差异」
+- **旧工具的 docstring 增加引导语**（"兼容保留，新用法请优先用 X"），
+  让模型在旧写法与新工具之间优先选择新工具。行为一个字未改。
+  8 个旧工具里有 6 个加上了引导语；`bsk_status` 与 `bsk_evaluate` 刻意不加 ——
+  前者给出的诊断信息是新工具看不到的，后者是本插件独有能力，
+  两者都没有等价替代品，加引导语反而会把模型从唯一可用的工具上引开
+
+### 与 BrowserSkill 的差异
+
+以下差异是**有意为之**，不是未完成项，如实标注如下：
+
+- **不支持 `request_id`（可恢复启动）**：依赖 `bsk session request` 的三态语义，
+  未实测前不暴露
+- **`current` 会话在 stop 后不回退**：参考实现会回退到最近 active 的会话，
+  本插件不回退 —— 避免用户的下一步操作被静默作用在另一个会话上
+- **无 SSE 实时观察 / 侧边栏 / 缩略图**：这三项属于展示层，AstrBot 没有对应接缝
+- **新增的 `bsk_inspect(action="screenshot")` 只回文字、不发图片**：它的 handler
+  返回字符串而不是 async generator，拿不到发图那条路。**要发图或要整页截图，
+  请继续用 `bsk_screenshot`** —— 这两件事目前只有它做得到
+- **`bsk_evaluate`（执行任意 JS）是本插件独有的**：DSH 不暴露它，因此新工具里
+  没有对应替代。风险由独立开关（`enable_evaluate`）与强制管理员双重门控
+
 ## [0.1.1] - 2026-10-05
 
 修复插件市场 LLM Guard 审核拒绝的两项问题。本次发布不含功能变更。
@@ -106,6 +198,7 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   清理永远返回 0
 - **权限提示与实现相反**：配置校验说白名单「不生效」，实际是白名单优先
 
+[0.2.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.2.0
 [0.1.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.1
 [0.1.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.0
 

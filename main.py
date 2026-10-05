@@ -836,7 +836,19 @@ class BskBrowserPlugin(Star):
             里，那边是唯一实现（TOOL-SPEC H4：新工具必须复用既有实现）。
         """
         action = args["action"]
-        key = self._key(event)
+        # 会话键的解析顺序（与 DSH 的 registry.resolve(args.session) 一致）：
+        # 1. 模型显式传了 session → 用它。service 的 _resolve 既认会话键也认
+        #    session_id；认不出来会报"不属于本插件"，不会静默打到别的会话。
+        # 2. 没传 → 用本对话的会话键（既有行为，向后兼容）。
+        #
+        # 为什么必须在这一层做：6 个工具的 schema 里都有 session 字段
+        # （对齐 DSH 的参数并集），服务层每个方法的第一个参数也正是会话标识。
+        # 早先只传 self._key(event)，于是模型显式指定的 session 被**静默丢弃**
+        # —— 多会话场景下命令打在另一个会话上，模型无从察觉。
+        #
+        # bsk_session 的 start/stop 不受影响：它们走 _run_session 自己解析
+        # session（那两处的 session 是"要操作哪个会话"的显式目标）。
+        key = str(args.get("session") or "").strip() or self._key(event)
 
         if tool == "bsk_session":
             return await self._run_session(key, action, args)
