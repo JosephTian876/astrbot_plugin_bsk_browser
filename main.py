@@ -1182,6 +1182,15 @@ class BskBrowserPlugin(Star):
                 + " 当前不生效，返回的是完整内容。"
                 "要控制返回量请改用 bsk_inspect(action=\"snapshot\")。）"
             )
+        # 分页闭环：把 next_cursor 回显给模型，否则它只知道"被截断了"却无从续读。
+        # 这是 DSH 的 browser_inspect(observe) 返回 nextCursor 的等价物。
+        cursor_next = getattr(observation, "next_cursor", "") or ""
+        if cursor_next:
+            text += (
+                f"\n（内容还没读完。把 cursor=\"{cursor_next}\" 传给下一次 "
+                'bsk_inspect(action="observe") 就能接着读。'
+                "注意中间不要穿插别的 observe/snapshot，那会让游标失效。）"
+            )
         return text
 
     @staticmethod

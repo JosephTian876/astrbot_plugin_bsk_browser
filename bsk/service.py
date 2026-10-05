@@ -585,11 +585,29 @@ class BskService:
     # 用例 2：读取页面
     # ------------------------------------------------------------------
 
-    async def observe(self, key: str) -> PageObservation:
+    async def observe(
+        self,
+        key: str,
+        *,
+        cursor: str = "",
+        max_depth: int | None = None,
+        max_tokens: int | None = None,
+        tab_id: int | None = None,
+    ) -> PageObservation:
         """读取当前页面的语义结构（VOM）。
 
         只调 ``observe``，不调 ``snapshot`` —— 实机验证两者输出逐字节相同，
         且都不带截图，同时调用纯属浪费一倍时间。
+
+        Args:
+            key: 会话键。
+            cursor: 续读游标。上一次返回的 ``next_cursor`` 原样传回来，
+                就能接着读上次被截断的那部分内容（``--cursor``）。
+                游标属于**同一次观察**：中间穿插新的 observe/snapshot
+                会让它失效，此时 refs 也会一起过期。
+            max_depth: VOM 树的最大深度（``--max-depth``）。
+            max_tokens: 渲染 token 的软上限（``--max-tokens``，约 4 字符/token）。
+            tab_id: 目标标签页（``--tab-id``）。不传 = Agent Window 的活动标签。
 
         Note:
             这是只读操作，所以 ``allow_uncertain=True``：即使上一次操作结果未知，
@@ -607,9 +625,17 @@ class BskService:
         counters_before = self.sessions.stats().get("counters", {})
         rebuilds_before = counters_before.get("not_found_rebuilds", 0)
 
+        args: list[str] = ["observe"]
+        if cursor:
+            args += ["--cursor", str(cursor)]
+        if max_depth is not None:
+            args += ["--max-depth", str(int(max_depth))]
+        if max_tokens is not None:
+            args += ["--max-tokens", str(int(max_tokens))]
+
         result = await self.sessions.execute(
             key,
-            lambda sid: ["observe", "--session", sid, "--json"],
+            lambda sid: self._with_tab_id(args, tab_id) + ["--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_OBSERVE),
             allow_uncertain=True,
         )

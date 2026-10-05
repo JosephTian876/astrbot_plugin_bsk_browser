@@ -207,6 +207,14 @@ class PageObservation:
     （实测 observe 报 910x604，截图是 1850x1208，DPR≈2）。
     """
 
+    next_cursor: str = ""
+    """续读游标（``observe --json`` 的 ``next_cursor``），空串表示没有更多。
+
+    拿到非空值时，把它原样作为下一次 ``observe`` 的 ``cursor`` 传回来，
+    就能接着读这次被截断的内容。**必须让模型看到它**，否则分页是死胡同：
+    模型只知道"内容被截断了"，却无从续读。
+    """
+
     @classmethod
     def from_json(cls, raw: Any) -> PageObservation:
         """从 ``observe --json`` 的输出构造（``text`` 的解析在 pages.py 里做）。"""
@@ -217,6 +225,7 @@ class PageObservation:
             ref_count=_as_int(raw.get("ref_count")),
             tab_id=_as_int(raw.get("tab_id")),
             truncated=_as_bool(raw.get("truncated")),
+            next_cursor=_as_str(raw.get("next_cursor")),
         )
 
 
