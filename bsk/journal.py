@@ -18,12 +18,25 @@
 2. 清理时必须逐条比对（见 ``session.SessionManager.recover_orphans``），
    匹配不上就跳过 —— 那不是我们的。
 
+v2 新增两个字段（``request_id`` / ``state``）：``bsk session start`` 支持
+``--request-id`` 之后，"创建一个会话"变成两段式 —— 令牌先落盘，会话创建
+成功后再补上 ``session_id``。于是 journal 里会出现**还没有 session_id、
+只有令牌**的记录，那是"start 的回执丢了"时唯一能把窗口找回来的线索
+（``session start`` 超时，窗口可能已经开出来了，但调用方拿不到 id）。
+读旧文件、写新文件都必须容忍这种半成品记录。
+
 设计约束（写代码时请勿破坏）：
 
 - 纯标准库，不 import astrbot，也不 import 内置 ``logging``；日志由 ``main.py``
   注入（见 ``bsk/logger.py``），未注入时走 ``NULL_LOGGER``，可独立单测；
-- 本模块的任何方法都不抛异常（``load`` / ``add`` / ``remove`` / ``clear``）：
-  它在插件启动路径上跑，一个异常就是插件加载失败；
+- 本模块的任何方法都不抛异常（``load`` / ``add`` / ``add_checked`` /
+  ``remove`` / ``remove_by_request`` / ``clear``）：它在插件启动路径上跑，
+  一个异常就是插件加载失败。``add_checked`` 同样不抛，但它**返回 bool**
+  报告成败 —— 需要知道"令牌到底落盘了没有"的调用方只能靠返回值，
+  因为这里的失败刻意不抛异常（见下一条）；
+- 「写失败」是静默的，所以凡是要靠成败做决策的调用点（例如发出
+  ``session start`` 之前必须先落盘启动令牌）**必须用** ``add_checked``
+  的返回值判断，不能靠捕获 ``add`` 的异常 —— 它从不抛；
 - 原子写：先写 ``<path>.tmp`` 再 ``os.replace()``，避免写一半被杀留下坏文件；
 - 显式 UTF-8：Windows 中文环境下默认编码是 gbk，写中文诊断信息会炸；
 - 读不到就当没有：文件不存在、是空文件、是半截 JSON、是二进制垃圾、
@@ -53,8 +66,15 @@ __all__ = [
     "now_seconds",
 ]
 
-JOURNAL_VERSION = 1
-"""文件格式版本。将来字段有变时靠它区分，现在只有一种。"""
+JOURNAL_VERSION = 2
+"""文件格式版本。
+
+- v1：只有 ``session_id`` 等字段；
+- v2：新增 ``request_id`` 与 ``state``（见 ``JournalEntry``）。
+
+版本号只用于诊断与将来演进：读的时候不按版本号分流，能读出多少算多少
+（``test_version_mismatch_still_loads_entries`` 钉住了这条）。
+"""
 
 
 def _as_str(value: Any) -> str:
@@ -120,6 +140,25 @@ class JournalEntry:
     pid: int
     """写入时的进程 pid。仅用于诊断（"这条记录是哪个进程留下的"）。"""
 
+    request_id: str = ""
+    """``session start --request-id`` 的启动令牌（v2）。
+
+    为什么它比 ``session_id`` 还早存在：令牌是**我们自己在发 start 之前**
+    生成的，所以"窗口可能已经开出来、但我们还没拿到 session_id"这段时间里，
+    令牌是唯一能定位那次启动的凭据。凭它调 ``session start --request-id``
+    即可取回（或取消）那次启动，不必去猜 id。
+
+    没有令牌的记录（v1 老文件、或普通 start）这里是空串。
+    """
+
+    state: str = ""
+    """这条记录当前处于哪一步（v2）。
+
+    取值由 ``SessionManager`` 定义，journal 只负责原样存取，不认识具体含义；
+    例如 ``prepared``（令牌已落盘、会话还没建出来）与 ``active``（会话已建成）。
+    空串表示"老记录，没有状态概念"。
+    """
+
     def to_json(self) -> dict[str, Any]:
         """转成可直接 ``json.dumps`` 的字典（字段顺序固定，便于人工比对）。"""
         return {
@@ -128,6 +167,8 @@ class JournalEntry:
             "agent_window_id": self.agent_window_id,
             "created_at": self.created_at,
             "pid": self.pid,
+            "request_id": self.request_id,
+            "state": self.state,
         }
 
     @classmethod
@@ -136,12 +177,17 @@ class JournalEntry:
 
         刻意"坏一条丢一条"而不是"坏一条丢整份"：手工编辑或半截写入的 journal
         里混进一条垃圾，不该让其他完好的记录一起作废。
+
+        丢弃的条件是 ``session_id`` 与 ``request_id`` **都**为空 ——
+        只知道令牌、还不知道 session_id 的记录必须保留：那正是
+        "``session start`` 超时、回执丢了"时唯一能把窗口找回来的东西。
         """
         if not isinstance(raw, dict):
             return None
         session_id = _as_str(raw.get("session_id")).strip()
-        if not session_id:
-            # 没有 session_id 的记录毫无用处，直接丢弃。
+        request_id = _as_str(raw.get("request_id")).strip()
+        if not session_id and not request_id:
+            # 两个身份都没有 —— 不知道该去停谁，这条记录没有任何用处。
             return None
         return cls(
             session_id=session_id,
@@ -149,14 +195,30 @@ class JournalEntry:
             agent_window_id=_as_int(raw.get("agent_window_id")),
             created_at=_as_float(raw.get("created_at")),
             pid=_as_int(raw.get("pid")),
+            request_id=request_id,
+            state=_as_str(raw.get("state")).strip(),
         )
+
+
+def _dedup_key(entry: JournalEntry) -> str:
+    """一条记录的去重键：优先用令牌，没有令牌才用 ``session_id``。
+
+    为什么不能只看 session_id：写前落盘的记录**天生还没有 session_id**，
+    两条并发启动的 pending 记录 session_id 都是空串 ——
+    按 session_id 去重会让它们互相覆盖（这是真实缺陷，不是理论风险）。
+
+    返回空串表示"这条记录没有任何可用身份"，调用方必须直接追加、
+    不做任何过滤（否则会把别的空键记录一起清掉）。
+    """
+    return entry.request_id or entry.session_id
 
 
 class SessionJournal:
     """把会话所有权记录存成一个 JSON 文件的 journal。
 
     刻意做成无内存状态的：每次读写都直接面对文件，配合一把
-    ``threading.Lock`` 串行化 ``add`` / ``remove`` / ``clear``。
+    ``threading.Lock`` 串行化 ``add`` / ``add_checked`` / ``remove`` /
+    ``remove_by_request`` / ``clear``。
     这样做的好处是"文件里有什么"与"我们以为什么"永远一致 ——
     这正是一个崩溃恢复机制最需要的性质。
 
@@ -169,6 +231,9 @@ class SessionJournal:
     Note:
         本类的公开方法都不抛异常。写失败只记 debug 日志：
         journal 是尽力而为的辅助机制，它的失败绝不该影响会话的正常创建与停止。
+
+        但"尽力而为"不等于"调用方无从知晓"：需要拿成败做决策的场景必须用
+        :meth:`add_checked`，它把同样的写入结果作为 ``bool`` 返回。
     """
 
     def __init__(self, path: str | Path, logger: LoggerLike | None = None) -> None:
@@ -217,16 +282,40 @@ class SessionJournal:
     def add(self, entry: JournalEntry) -> None:
         """写入一条记录（原子写：先写 ``.tmp`` 再 ``os.replace``）。
 
-        ``session_id`` 相同的旧记录会被替换 —— 同一个 id 只可能对应一条记录，
-        靠它去重可以避免崩溃重启后 journal 里堆出重复条目。
+        去重键见 :func:`_dedup_key`：优先用 ``request_id``，没有令牌才用
+        ``session_id``。同一个键只可能对应一条记录，重复写入即替换。
 
-        写失败（权限不足、目录建不出来、磁盘满）只记 debug 日志，不抛异常。
+        写失败（权限不足、目录建不出来、磁盘满）只记 debug 日志，不抛异常；
+        需要知道成败的调用方用 :meth:`add_checked`。
+        """
+        self.add_checked(entry)
+
+    def add_checked(self, entry: JournalEntry) -> bool:
+        """同 :meth:`add`，但**报告成败**。
+
+        为什么需要它：``SessionManager`` 在发出 ``session start`` 之前必须把启动
+        令牌落盘，而那一步要靠返回值判断能不能继续 —— 靠捕获 ``add`` 的异常是
+        做不到的（它刻意从不抛异常）。
+
+        Returns:
+            True 表示记录已经原子落盘；False 表示这次写入没成功
+            （序列化失败、目录建不出来、权限不足、磁盘满等），
+            调用方应当据此放弃后续依赖该记录的动作。
+
+        Note:
+            与 ``add`` 一样不抛异常。
         """
         with self._lock:
             current = self._read_unlocked()
-            merged = [e for e in current if e.session_id != entry.session_id]
+            key = _dedup_key(entry)
+            if key:
+                merged = [e for e in current if _dedup_key(e) != key]
+            else:
+                # 两个身份都为空：无法与其他记录比较，只能直接追加。
+                # 若拿空键去过滤，会把 journal 里所有空键记录一并抹掉。
+                merged = list(current)
             merged.append(entry)
-            self._write_unlocked(merged)
+            return self._write_unlocked(merged)
 
     def remove(self, session_id: str) -> None:
         """删掉指定 ``session_id`` 的记录。不存在时是空操作。"""
@@ -237,6 +326,25 @@ class SessionJournal:
             remaining = [e for e in current if e.session_id != session_id]
             if len(remaining) == len(current):
                 # 本来就没有 —— 不必要地重写文件只会增加损坏窗口。
+                return
+            self._write_unlocked(remaining)
+
+    def remove_by_request(self, request_id: str) -> None:
+        """删掉指定 ``request_id``（启动令牌）的记录。不存在时是空操作。
+
+        按令牌删的能力是必须的：取消一次可恢复启动之后，那条 pending 记录
+        手里只有一个令牌，用 :meth:`remove` 是删不掉的。
+
+        空串直接返回 —— 令牌为空时"删掉所有没有令牌的记录"显然不是调用方的
+        意思（那会连带删掉 v1 老记录），宁可什么都不做。
+        没有匹配项时不重写文件：少一次写就少一个损坏窗口。
+        """
+        if not request_id:
+            return
+        with self._lock:
+            current = self._read_unlocked()
+            remaining = [e for e in current if e.request_id != request_id]
+            if len(remaining) == len(current):
                 return
             self._write_unlocked(remaining)
 
@@ -275,7 +383,9 @@ class SessionJournal:
             self._logger.debug("会话 journal 不是合法 JSON（按空处理）：%r", exc)
             return []
 
-        # 正式格式：{"version": 1, "entries": [...]}。
+        # 正式格式：{"version": N, "entries": [...]}。版本号只用于诊断，
+        # 这里不按它分流 —— v1 与 v2 的差异在 JournalEntry.from_json 里按
+        # 字段缺省处理（缺 request_id/state 就是空串）。
         raw_entries: Any = None
         if isinstance(data, dict):
             raw_entries = data.get("entries")
@@ -294,13 +404,18 @@ class SessionJournal:
                 result.append(entry)
         return result
 
-    def _write_unlocked(self, entries: list[JournalEntry]) -> None:
+    def _write_unlocked(self, entries: list[JournalEntry]) -> bool:
         """真正写文件的实现（原子写）。调用方必须持有锁，且本方法不抛异常。
 
         步骤：建目录 → 写 ``.tmp`` → ``flush`` + ``fsync`` → ``os.replace``。
 
         ``os.replace`` 在 Windows 与 POSIX 上都是原子的覆盖，所以任何时刻
         读到的要么是旧的完整内容、要么是新的完整内容，不会读到写了一半的文件。
+
+        Returns:
+            True 表示新内容已经完整落到主文件上；False 表示这次写入失败
+            （序列化失败、目录建不出来、权限不足、磁盘满等），主文件保持原样。
+            失败时只记 debug 日志，绝不抛异常 —— 调用方需要靠返回值判断。
         """
         payload = {
             "version": JOURNAL_VERSION,
@@ -310,7 +425,7 @@ class SessionJournal:
             text = json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as exc:  # noqa: BLE001 - 理论上不会发生，兜底
             self._logger.debug("会话 journal 序列化失败（忽略）：%r", exc)
-            return
+            return False
 
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -326,6 +441,8 @@ class SessionJournal:
             self._logger.debug("会话 journal 写入失败（忽略）：%r", exc)
             with contextlib.suppress(Exception):
                 self.tmp_path.unlink(missing_ok=True)
+            return False
+        return True
 
 
 def now_seconds() -> float:

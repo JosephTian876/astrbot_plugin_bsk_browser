@@ -58,6 +58,18 @@ CODE_PERMISSION_DENIED = "permission_denied"
 CODE_BROWSER_AMBIGUOUS = "browser_ambiguous"
 """同时连着多个浏览器，而用户没有指定用哪一个。必须改配置才能继续，重试无用。"""
 
+CODE_CANCELLED = "cancelled"
+"""可恢复启动的请求已被取消。
+
+实测（bsk 0.3.2）：对已取消的令牌调 ``session start --request-id`` 返回
+``exit=2`` + ``{"code": "cancelled", "message": "start request cancelled..."}``；
+对 ``prepared`` 状态调 ``--claim`` 返回同一形状（``start request cannot be claimed``）。
+
+**它是"已按调用方的要求抑制"的成功语义，不是可重试的失败** ——
+绝不能因此回退到不带 ``--request-id`` 的普通 start（那会开出一个
+没有任何所有权凭据保护的窗口，正是这次要修的 bug）。
+"""
+
 # 这些 reason 出现在错误 JSON 的 data.reason 里，表示"动作可能已经生效"，
 # 此时绝对禁止重试，否则可能重复点击/重复提交表单。
 OUTCOME_UNKNOWN_REASONS: frozenset[str] = frozenset(
@@ -187,6 +199,22 @@ class BskVersionError(BskError):
         return False
 
 
+class BskStartCancelled(BskError):
+    """这次可恢复启动已被取消（``code="cancelled"``）。
+
+    与普通失败的关键区别：重试与回退都是错的 —— 重试会被同一条墓碑再次拒绝，
+    回退到普通 start 则会绕开取消。所以 ``retryable`` 恒为 False。
+
+    Note:
+        ``classify()`` 刻意没有把它纳入映射（那是共享分类器，改动面太大），
+        转换由调用点显式做，判定用 :func:`is_cancelled_error`。
+    """
+
+    @property
+    def retryable(self) -> bool:
+        return False
+
+
 class BskBrowserAmbiguous(BskError):
     """同时连着多个浏览器，而用户没有指定要用哪一个。
 
@@ -207,6 +235,19 @@ class BskBrowserAmbiguous(BskError):
     @property
     def retryable(self) -> bool:
         return False
+
+
+# --- 判定辅助 ---
+
+
+def is_cancelled_error(exc: BaseException) -> bool:
+    """这个异常是不是「请求已被取消」（而不是普通失败）。
+
+    为什么不用 ``isinstance``：``cancelled`` 可能在调用链的任意一层被转换成
+    别的异常类型（例如包装后的 ``BskError``），但 ``code`` 会一路保留下来。
+    因此判定只看 ``code``，不认类型。
+    """
+    return getattr(exc, "code", "") == CODE_CANCELLED
 
 
 # --- 构造错误的统一入口 ---

@@ -670,5 +670,285 @@ class TestJournalEntry(unittest.TestCase):
         self.assertEqual(JournalEntry.from_json(entry.to_json()), entry)
 
 
+# ----------------------------------------------------------------------
+# v2：启动令牌（request_id）与状态（state）
+#
+# 为什么单独一组：可恢复启动改成了两段式 —— 令牌先落盘，会话建出来之后再
+# 补 session_id。于是 journal 里会出现"只有令牌、还没有 session_id"的记录，
+# 而那正是"start 回执丢了"时唯一能把窗口找回来的东西。这一组把这条新语义
+# 钉死，顺带钉死按令牌去重（旧实现按 session_id 去重会让两条 pending 记录
+# 互相覆盖 —— 那是真实缺陷）。
+# ----------------------------------------------------------------------
+
+
+class TestRequestIdAndState(JournalTestCase):
+    """v2 字段：读旧文件、留 pending 记录、按令牌去重与删除。"""
+
+    def test_journal_version_is_two(self) -> None:
+        """版本号必须已经升到 2（有守护测试才不会被无意间回退）。"""
+        self.assertEqual(JOURNAL_VERSION, 2)
+
+    def test_v1_file_is_still_readable(self) -> None:
+        """v1 老文件（没有新字段）必须照常读进来，新字段给默认值。
+
+        "读得到旧数据"是可恢复启动机制的地基：升级插件时磁盘上躺着的正是
+        上一次进程留下的 v1 文件，读不出来就等于所有历史记录全丢。
+        """
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "session_id": "mnaa",
+                            "browser_instance_id": "c900a3da",
+                            "agent_window_id": 111,
+                            "created_at": 1.0,
+                            "pid": 1234,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].session_id, "mnaa")
+        self.assertEqual(loaded[0].agent_window_id, 111)
+        # 老记录没有令牌，也没有状态概念 —— 必须是空串而不是 None。
+        self.assertEqual(loaded[0].request_id, "")
+        self.assertEqual(loaded[0].state, "")
+
+    def test_pending_entry_with_only_request_id_is_kept(self) -> None:
+        """只有令牌、没有 session_id 的记录不能被丢弃 —— 这是本次扩展的核心。"""
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": JOURNAL_VERSION,
+                    "entries": [
+                        {
+                            "session_id": "",
+                            "request_id": "T1",
+                            "state": "prepared",
+                            "browser_instance_id": "c900a3da",
+                            "created_at": 2.0,
+                            "pid": 99,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1, "带令牌的 pending 记录被 from_json 丢掉了")
+        self.assertEqual(loaded[0].session_id, "")
+        self.assertEqual(loaded[0].request_id, "T1")
+        self.assertEqual(loaded[0].state, "prepared")
+
+    def test_entry_with_neither_identity_is_dropped(self) -> None:
+        """两个身份都为空 = 不知道该去停谁，保持既有语义：丢弃。"""
+        self.assertIsNone(JournalEntry.from_json({}))
+        self.assertIsNone(JournalEntry.from_json({"session_id": ""}))
+        self.assertIsNone(JournalEntry.from_json({"session_id": "   "}))
+        self.assertIsNone(JournalEntry.from_json({"session_id": "", "request_id": "  "}))
+        self.assertIsNone(JournalEntry.from_json({"session_id": 123, "request_id": None}))
+
+    def test_two_pending_entries_do_not_overwrite_each_other(self) -> None:
+        """两条并发启动的 pending 记录必须共存。
+
+        这是本次修复针对的真实缺陷：旧实现按 ``session_id`` 去重，而两条
+        pending 记录的 ``session_id`` 都是空串 —— 第二条会把第一条从
+        journal 里抹掉，于是那次启动彻底失去线索（窗口开了却永远没人回收）。
+        """
+        self.journal.add(make_entry("", request_id="T1", state="prepared"))
+        self.journal.add(make_entry("", request_id="T2", state="prepared"))
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 2, "两条 pending 记录互相覆盖了")
+        self.assertEqual(
+            sorted(e.request_id for e in loaded),
+            ["T1", "T2"],
+            f"实际内容：{[(e.session_id, e.request_id, e.state) for e in loaded]}",
+        )
+        # 两条都还没有 session_id —— 这正是"写前落盘"时的真实形态。
+        self.assertEqual([e.session_id for e in loaded], ["", ""])
+
+    def test_same_request_id_is_replaced_and_updated(self) -> None:
+        """同一个令牌只可能对应一次启动：重复 add 应当替换，而不是堆两条。
+
+        真实用法就是"pending 记录补充 session_id"这一步：令牌不变，
+        会话建出来之后把 id 回填进去，绝不能在 journal 里留下两条同令牌记录。
+        """
+        self.journal.add(make_entry("", request_id="T1", state="prepared", agent_window_id=0))
+        self.journal.add(make_entry("mnaa", request_id="T1", state="active", agent_window_id=777))
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].session_id, "mnaa")
+        self.assertEqual(loaded[0].state, "active")
+        self.assertEqual(loaded[0].agent_window_id, 777)
+
+    def test_v1_records_still_dedup_by_session_id(self) -> None:
+        """没有令牌的老记录仍按 session_id 去重 —— 老行为一点都不能变。"""
+        self.journal.add(make_entry("mnaa", 111))
+        self.journal.add(make_entry("mnaa", 222))
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].agent_window_id, 222)
+        self.assertEqual(loaded[0].request_id, "")
+
+    def test_token_bearing_and_tokenless_records_share_no_dedup_key(self) -> None:
+        """去重键优先取令牌，所以"有令牌"与"没令牌"的同 id 记录是两条键。
+
+        这是 ``_dedup_key`` 的**既定语义**，不是缺陷：两条记录的键
+        （``T1`` 与 ``mnaa``）不同，谁也不会覆盖谁。
+
+        钉住它是因为它对调用方有硬性要求（``SessionManager`` 必须照做）：
+        用令牌写下 pending 记录之后，回填 session_id 时**必须带上同一个令牌**，
+        或者显式调 ``remove_by_request`` 把 pending 那条收掉 ——
+        否则 journal 里会永久留下一条 session_id 为空的记录，
+        每次启动都要为它多发一次 ``session list``。
+        """
+        # 先按 v1 方式记一条（只有 session_id，没有令牌）。
+        self.journal.add(make_entry("mnaa", 111))
+        # 再按 v2 方式记同一个 session_id，但带令牌 —— 键不同，故不替换。
+        self.journal.add(make_entry("mnaa", 222, request_id="T1", state="active"))
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 2, "令牌与 session_id 是两个不同的去重键")
+        self.assertEqual(
+            sorted((e.session_id, e.request_id) for e in loaded),
+            [("mnaa", ""), ("mnaa", "T1")],
+        )
+
+    def test_reclaim_by_token_then_update_with_same_token_leaves_one_record(self) -> None:
+        """正确的回填流程：令牌落盘 → 拿到 id → **带同一令牌**回填 → 只剩一条。"""
+        self.journal.add(make_entry("", request_id="T1", state="prepared"))
+        self.journal.add(
+            make_entry("mnaa", 777, request_id="T1", state="active")
+        )
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].session_id, "mnaa")
+        self.assertEqual(loaded[0].request_id, "T1")
+        self.assertEqual(loaded[0].state, "active")
+
+    def test_cancelled_start_clears_pending_record_by_token(self) -> None:
+        """启动被取消后的正确收尾：按令牌把 pending 记录删掉，不留孤儿。"""
+        self.journal.add(make_entry("", request_id="T1", state="prepared"))
+        self.journal.add(make_entry("mnab", 222))
+
+        self.journal.remove_by_request("T1")
+
+        self.assertEqual([e.session_id for e in self.journal.load()], ["mnab"])
+
+    def test_entry_without_any_identity_does_not_wipe_others(self) -> None:
+        """去重键为空时必须直接追加，不能把别的记录一起过滤掉。"""
+        self.journal.add(make_entry("mnaa", 111))
+        self.journal.add(make_entry("", request_id="", state=""))
+        self.journal.add(make_entry("mnab", 222))
+
+        # 空身份记录读不回来（load 会丢它），但两条正常记录必须完好。
+        self.assertEqual([e.session_id for e in self.journal.load()], ["mnaa", "mnab"])
+        self.assertEqual([e.agent_window_id for e in self.journal.load()], [111, 222])
+
+    def test_remove_by_request_removes_only_that_token(self) -> None:
+        self.journal.add(make_entry("", request_id="T1", state="prepared"))
+        self.journal.add(make_entry("", request_id="T2", state="prepared"))
+        self.journal.add(make_entry("mnab", 222))
+
+        self.journal.remove_by_request("T1")
+
+        loaded = self.journal.load()
+        self.assertEqual(sorted(e.request_id for e in loaded), ["", "T2"])
+        self.assertEqual([e.session_id for e in loaded], ["", "mnab"])
+
+    def test_remove_by_request_blank_is_noop(self) -> None:
+        """空令牌什么都不删 —— 否则会把所有无令牌的 v1 老记录一起抹掉。"""
+        self.journal.add(make_entry("mnaa", 111))
+        self.journal.add(make_entry("mnab", 222))
+
+        self.journal.remove_by_request("")
+
+        self.assertEqual([e.session_id for e in self.journal.load()], ["mnaa", "mnab"])
+
+    def test_remove_by_request_does_not_rewrite_when_nothing_matched(self) -> None:
+        """没有匹配项时不该写文件 —— 少一次写就少一个损坏窗口。"""
+        self.journal.add(make_entry("", request_id="T1", state="prepared"))
+        before = self.path.read_text(encoding="utf-8")
+        before_mtime = self.path.stat().st_mtime_ns
+
+        self.journal.remove_by_request("T-nope")
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, before_mtime)
+
+    def test_add_checked_reports_success(self) -> None:
+        """正常路径返回 True，且记录确实落盘了。"""
+        self.assertTrue(self.journal.add_checked(make_entry("", request_id="T1")))
+        self.assertEqual([e.request_id for e in self.journal.load()], ["T1"])
+
+    def test_add_checked_reports_failure_without_raising(self) -> None:
+        """写不进去时返回 False，且绝不抛异常（父级是个文件）。"""
+        blocker = self.dir / "blocker"
+        blocker.write_text("我不是目录", encoding="utf-8")
+        journal = SessionJournal(blocker / "sessions.json")
+
+        try:
+            ok = journal.add_checked(make_entry("", request_id="T1", state="prepared"))
+        except BaseException as exc:  # noqa: BLE001
+            self.fail(f"add_checked 抛异常了：{exc!r}")
+
+        self.assertFalse(ok, "写失败必须返回 False —— 调用方靠它决定要不要发 start")
+        self.assertEqual(journal.load(), [])
+
+    def test_add_checked_reports_failure_when_path_is_a_directory(self) -> None:
+        """journal 路径本身是个目录 → 同样返回 False，不抛。"""
+        as_dir = self.dir / "iam-a-dir"
+        as_dir.mkdir()
+
+        self.assertFalse(SessionJournal(as_dir).add_checked(make_entry("mnaa")))
+
+    def test_add_checked_is_consistent_with_add(self) -> None:
+        """``add`` 就是 ``add_checked`` 的丢弃返回值版本：落盘结果必须一致。"""
+        self.assertIsNone(self.journal.add(make_entry("mnaa", 111)))
+        self.assertEqual([e.session_id for e in self.journal.load()], ["mnaa"])
+
+    def test_new_fields_survive_json_roundtrip(self) -> None:
+        """两个新字段必须原样往返，且真的写进文件（能被人工看到）。"""
+        entry = make_entry("mnaa", 321, request_id="T-round", state="active")
+        self.assertEqual(JournalEntry.from_json(entry.to_json()), entry)
+
+        self.journal.add(entry)
+        raw = self.read_raw()
+        self.assertEqual(raw["version"], 2)
+        self.assertEqual(raw["entries"][0]["request_id"], "T-round")
+        self.assertEqual(raw["entries"][0]["state"], "active")
+
+    def test_new_fields_are_whitespace_stripped_and_type_checked(self) -> None:
+        """新字段与老字段一样要 strip / 类型容错（手工编辑过的文件也得能读）。"""
+        entry = JournalEntry.from_json(
+            {"session_id": "  mnaa  ", "request_id": "  T1  ", "state": {"nope": 1}}
+        )
+        assert entry is not None
+        self.assertEqual(entry.request_id, "T1")
+        self.assertEqual(entry.state, "")
+
+    def test_pending_record_survives_a_process_restart(self) -> None:
+        """写前落盘的记录必须能被"下一个进程"原样读出来（本机制的全部意义）。"""
+        self.journal.add(make_entry("", request_id="T-restart", state="prepared"))
+
+        # 换一个 SessionJournal 实例读同一个文件 —— 模拟插件重启。
+        reloaded = SessionJournal(self.path).load()
+        self.assertEqual(len(reloaded), 1)
+        self.assertEqual(reloaded[0].request_id, "T-restart")
+        self.assertEqual(reloaded[0].state, "prepared")
+        self.assertEqual(reloaded[0].session_id, "")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

@@ -398,6 +398,35 @@ class TestBooleanFields(unittest.TestCase):
         self.assertIs(parse_settings({"enabled": 1}).enabled, True)
 
 
+class TestEnableRequestId(unittest.TestCase):
+    """``enable_request_id``（可恢复启动开关）：默认开启，认常见写法，垃圾值回退默认。
+
+    这一项默认必须是 ``True``：它是"启动回执丢失时仍能找回并关掉那个窗口"的保护，
+    默认关掉等于让升级用户静默失去这层保护，只剩"多两条命令"这个坏处。
+    """
+
+    def test_default_and_coercion(self) -> None:
+        # 默认开启：这一项缺失时不能变成"关掉保护"。
+        self.assertIs(parse_settings({}).enable_request_id, True)
+        self.assertIs(parse_settings(None).enable_request_id, True)
+        self.assertIs(cfg.DEFAULT_ENABLE_REQUEST_ID, True)
+
+        # 显式关闭的三种写法（布尔 / 字符串 / 数字）都要认。
+        for value in (False, "false", 0):
+            with self.subTest(value=repr(value)):
+                self.assertIs(parse_settings({"enable_request_id": value}).enable_request_id, False)
+
+        # 显式开启同理。
+        for value in (True, "true", 1):
+            with self.subTest(value=repr(value)):
+                self.assertIs(parse_settings({"enable_request_id": value}).enable_request_id, True)
+
+        # 认不出来的值一律回退默认（True），而不是擅自理解成 False。
+        for junk in ("maybe", "", "  ", None, [], {}):
+            with self.subTest(junk=repr(junk)):
+                self.assertIs(parse_settings({"enable_request_id": junk}).enable_request_id, True)
+
+
 class TestValidateSettings(unittest.TestCase):
     """validate_settings 报告"合法但值得提醒"的问题。"""
 

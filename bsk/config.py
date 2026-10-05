@@ -39,6 +39,7 @@ __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_SEC",
     "DEFAULT_ENABLED",
     "DEFAULT_ENABLE_EVALUATE",
+    "DEFAULT_ENABLE_REQUEST_ID",
     "DEFAULT_EVALUATE_REQUIRE_ADMIN",
     "DEFAULT_FULLPAGE_TIMEOUT_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
@@ -92,6 +93,18 @@ DEFAULT_LEGACY_TOOLS = True
 
 注意：``bsk_evaluate`` 不受本开关影响 —— 它有独立的
 ``enable_evaluate``，是高风险工具，语义不同。
+"""
+
+DEFAULT_ENABLE_REQUEST_ID = True
+"""是否启用 bsk 的「可恢复启动」（request_id 协议）。
+
+开启后，每次建立浏览器会话会在 `session start` 前后各多跑一条
+`session request` 命令（实测约 80ms），换来的是：**启动回执丢失时
+仍能凭令牌找回并关掉那个窗口**，不再留下永远清理不掉的浏览器窗口。
+
+关掉它就完全回到旧行为（少两条子进程调用，但失去上面那层保护）。
+留这个开关的用途是当排查手段：如果怀疑可恢复启动本身导致了问题，
+关掉它即可排除。
 """
 
 DEFAULT_BSK_PATH = "bsk"
@@ -667,6 +680,16 @@ class Settings:
     执行 JS —— 详见 :data:`DEFAULT_EVALUATE_REQUIRE_ADMIN`。
     """
 
+    enable_request_id: bool
+    """是否启用 bsk 的「可恢复启动」（request_id 协议）。默认 True。
+
+    开启后每次建立浏览器会话会多跑两条 ``session request`` 子进程命令
+    （prepare + claim，实测约 80ms），换来"启动回执丢失时仍能凭令牌
+    找回并关掉那个窗口"这层保护；关掉即完全回到旧行为。
+
+    详见 :data:`DEFAULT_ENABLE_REQUEST_ID`。
+    """
+
 
 def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
     """从 AstrBot 的原始配置 dict 构造 :class:`Settings`。
@@ -755,6 +778,9 @@ def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
         enable_evaluate=_as_bool(raw.get("enable_evaluate"), DEFAULT_ENABLE_EVALUATE),
         evaluate_require_admin=_as_bool(
             raw.get("evaluate_require_admin"), DEFAULT_EVALUATE_REQUIRE_ADMIN
+        ),
+        enable_request_id=_as_bool(
+            raw.get("enable_request_id"), DEFAULT_ENABLE_REQUEST_ID
         ),
     )
 
