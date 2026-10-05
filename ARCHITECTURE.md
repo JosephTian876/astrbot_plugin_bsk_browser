@@ -37,18 +37,23 @@
 
 ## 3. 分层架构
 
-**设计原则：框架耦合只允许出现在 `main.py` 一个文件里。`bsk/` 包是纯 Python，不 import astrbot，可脱离框架单测。**
+**设计原则：框架耦合只允许出现在 `main.py` 一个文件里。`bsk/` 包是纯 Python，既不 import astrbot，也不 import `logging`（内置日志模块），可脱离框架单测。**
+
+日志由 `main.py` 从 `astrbot.api` 取来后**注入**（`BskService(..., logger=...)` → `SessionManager` / `SessionJournal`），`bsk/` 侧只声明接口（`bsk/logger.py` 的 `LoggerLike`）并提供 `NULL_LOGGER` 兜底。这条约束有双重来源：插件市场审核要求 logger 必须来自 `astrbot.api`、不得使用内置 logging 模块；而本仓库的分层约束又不允许 `bsk/` 依赖框架。依赖注入是同时满足两者的唯一路径（审核原文亦明确许可该方式）。
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  main.py   ← 唯一的框架耦合层（必须叫 main.py，见 C1）      │
 │  · BskBrowserPlugin(Star)  插件类、配置读取、生命周期钩子   │
 │  · @filter.llm_tool 薄适配函数（必须在此，见 C2）           │
+│  · 从 astrbot.api 取 logger 与插件数据目录，向下注入         │
 │    职责仅：参数解包 → 调用 bsk/ 服务 → 转成框架返回值        │
 └───────────────────────┬──────────────────────────────────┘
                         │ 只依赖 bsk/ 包的公开 API
 ┌───────────────────────▼──────────────────────────────────┐
 │  bsk/   ← 纯逻辑层（零 astrbot 依赖，可单测）               │
+│  · logger.py    日志接口 LoggerLike + 空实现 NullLogger     │
+│  · paths.py     插件数据目录解析与降级（journal/截图共用）   │
 │  · models.py    数据模型（Session、Page、Shot、Result）     │
 │  · errors.py    bsk 退出码/错误码 → 分类异常 → 中文提示      │
 │  · config.py    原始 dict → 强类型 Settings（含校验与兜底）  │
@@ -60,10 +65,13 @@
 └──────────────────────────────────────────────────────────┘
 ```
 
+**数据落盘位置**：会话所有权 journal 与截图默认都落在**插件数据目录** `data/plugin_data/astrbot_plugin_bsk_browser/` 下（由 `bsk/paths.py` 统一解析，见 §4.7）。该目录由 `main.py` 通过 `StarTools.get_data_dir("astrbot_plugin_bsk_browser")` 取得后注入；取不到时逐级降级，最终退回系统临时目录，**任何一步都不抛异常**（它在插件加载路径上，抛异常等于插件加载失败）。
+
 **为什么这样分**：
 - `C2` 强制工具函数必须在 `main.py`。若把业务逻辑也写进去，`main.py` 会变成 1000+ 行巨石（当前骨架就是 44KB 单文件）。
 - 因此让 `main.py` 只做薄适配：每个工具函数 5-15 行，负责"取参数、调 service、包结果"。
 - 真正的逻辑在 `bsk/service.py` 及其依赖，不 import astrbot，所以可以直接 `pytest` 跑，不需要启动 AstrBot。
+- 同理 `bsk/` 也不 import 内置 `logging`：日志能力同样通过注入获得，未注入时走 `NULL_LOGGER`。这让"脱离框架单测"这条价值不被日志需求侵蚀 —— 单测里既不产生日志输出，也不需要搭建日志设施。
 
 ---
 
@@ -153,6 +161,60 @@ L1 page
 ### 4.6 `bsk/config.py`
 
 把 AstrBot 传来的原始 dict 转成强类型 `Settings`，对每一项做类型校验和兜底（配置可能被用户填成任何东西）。
+
+`Settings` 另有一个**注入项**（不是用户配置项）`data_dir`：插件数据目录，由 `main.py` 传入。
+空串表示"未注入"，此时 journal 与截图走临时目录降级。它**不**写进 `_conf_schema.json` ——
+用户不该也无法在配置页填它。`parse_settings(raw, *, data_dir="")` 以关键字参数接收。
+
+用户显式配置的 `screenshot_dir` / `journal_path` **优先级最高且不变**：填了就一律用用户填的，
+注入的 `data_dir` 不得覆盖它。
+
+### 4.7 `bsk/logger.py` 与 `bsk/paths.py`
+
+这两个模块是本次为过审新增的，都是纯标准库、零 astrbot 依赖。
+
+`bsk/logger.py` —— 日志接口的接缝：
+
+```python
+@runtime_checkable
+class LoggerLike(Protocol):          # debug/info/warning/error/exception
+    def info(self, msg: object, *args: Any, **kwargs: Any) -> None: ...
+
+class NullLogger:                    # 什么都不做，也永不抛异常
+    __slots__ = ()
+    ...
+
+NULL_LOGGER = NullLogger()           # 全局共用的兜底实例（无状态）
+```
+
+- 调用约定与标准库一致：**惰性 %-格式化**（`logger.info("会话 %s 已重建", key)`）。
+  不能改成 f-string —— 那样日志级别被关掉时仍会白做一次拼接与格式化。
+- `exception()` 必须在：`main.py` 的兜底分支用它，靠的是"记录当前异常"这一语义。
+- 未注入时调用点无条件走 `NULL_LOGGER`，而不是在几十处写 `is not None` 判断 ——
+  漏掉一处就是一个 `AttributeError`，且偏偏出现在最不该出问题的降级路径上。
+
+`bsk/paths.py` —— 落盘位置的统一解析：
+
+```python
+def resolve_data_dir(data_dir, logger=None) -> Path:      # 可用则用之，否则降级
+def default_journal_path(data_dir, logger=None) -> Path:  # <data_dir>/sessions.json
+def default_shot_dir(data_dir, logger=None) -> Path:      # <data_dir>/shots
+```
+
+降级顺序（**必须保留容错**，这是审核明确要求的）：
+
+1. `data_dir` 非空、可创建、可写 → 用它（正常路径，`data/plugin_data/astrbot_plugin_bsk_browser`）；
+2. 否则 → 退回系统临时目录下的 `<系统临时目录>/astrbot_bsk_browser`（journal 在其下，
+   截图在 `<系统临时目录>/astrbot_bsk_browser/shots`），记一条 warning；
+3. **任何一步都不抛异常** —— 它在插件加载路径上，抛异常等于插件起不来。
+
+第 2 条为什么不能删：`StarTools.get_data_dir()` 失败时会抛异常，而 journal 与截图
+都必须有个可写的落点，"数据目录拿不到"不该升级成"插件不可用"。降级只影响数据的
+存放位置（临时目录会被操作系统清理），不影响功能。
+
+`data_dir` 传非字符串（数字、`None`、列表……）或非法路径（含空字节、Windows 保留
+设备名）时同样按"未注入"降级，而不是抛 `TypeError`。返回的路径**总是绝对的**：
+相对路径会随工作目录漂移，而 journal 要跨进程读。
 
 ---
 
@@ -368,6 +430,8 @@ if not evaluation.ok:           # ← 不能省
 | `verify_wait_navigation_real.py` | 新增暴露的 `wait_for_navigation` 动作真实可用且只读 | ✅ |
 | `verify_release_ready.py` | 发布前自检（34 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
 
+logger 注入与数据落盘位置这两条改动另有专门的单元测试，见 §6.3。
+
 运行方式（用 AstrBot 自带解释器，因为插件就跑在它上面）：
 
 ```powershell
@@ -433,6 +497,18 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前
 | **全页截图耗时（关键数据，文档多处引用）** | 本机实测：短页面 `example.com` 视口截图 0.12s、全页截图 2.91s；长页面 Wikipedia 条目全页截图 11.72 / 11.11 / 10.91s（1820x11741，4.5MB） | ① 整页截图默认预算取 120s（约 10 倍余量），不是拍脑袋的 180s；② **"必须两处一起调大才能用整页截图"是错误说法** —— 实测只用了框架 120s 上限的约 1/10，默认配置下什么都不用改（该说法曾写在 README/ARCHITECTURE 里，已删除）；③ 真正要做的是钳制，别被框架从外面掐断（见 §5 D6） |
 | **框架超时是"每一步"的，不是"整个工具"的** | `astr_agent_tool_exec.py:691` 是 `await asyncio.wait_for(anext(wrapper), timeout=tool_call_timeout)` —— 包在每一次 `anext` 上 | async generator 若中途 yield，计时器会重置。`bsk_screenshot` 正是先 yield 图片再 yield 文本；但不要依赖这一点去绕过超时 —— 钳制仍是必需的，因为它同时保证了"超时由插件报中文"这件事 |
 
+### 6.3 logger 注入与数据落盘的守护测试
+
+这两项改动各有一个专门的测试文件。它们存在的理由都是"**表面行为相同、做错了看不出来**"：
+
+| 文件 | 针对的风险 | 关键断言 |
+|---|---|---|
+| `test_logger_injection.py` | "注入"与"被吞掉"在行为上无法区分 —— 若某处漏改、仍在调空实现，`NullLogger` 与真 logger 的表现完全一样 | 记录型假 logger 上**必须出现记录**（`test_injected_logger_actually_receives_records`）；未注入时全分支不抛异常；`bsk/` 零 `import logging`、零 `logging.getLogger`、零 `import astrbot`，且 `main.py` 亦无内置 logging（`ast` 扫描，非关键字搜索） |
+| `test_data_dir.py` | 落盘位置的断言极易写成"在临时目录里"——而测试自己就把 data_dir 造在临时目录下，那样写永远是绿的 | 降级目标钉到 `<系统临时目录>/astrbot_bsk_browser` 这一层；用假 runner 记录的 `--out` 实参验证截图真实落点；显式配置必须压过 `data_dir` |
+
+`test_journal.py::TestDefaultPath` 已按新语义改写：注入 `data_dir` 时落在其下，
+未注入时退回临时目录 —— **降级分支保留断言**，因为它是审核明确要求保留的行为。
+
 ---
 
 ## 7. 版本控制
@@ -468,6 +544,8 @@ astrbot_plugin_bsk_browser/
 ├── main.py                  # 框架适配层（唯一 import astrbot 的地方）
 ├── bsk/                     # 纯逻辑包
 │   ├── __init__.py
+│   ├── logger.py            #   日志接口 + NullLogger 兜底（零依赖）
+│   ├── paths.py             #   插件数据目录解析与降级（零依赖）
 │   ├── models.py
 │   ├── errors.py
 │   ├── config.py
@@ -485,4 +563,12 @@ astrbot_plugin_bsk_browser/
 ├── CHANGELOG.md
 ├── ARCHITECTURE.md          # 本文件
 └── .gitignore
+```
+
+**运行期数据**（不进版本库，位于 AstrBot 的数据目录下）：
+
+```
+data/plugin_data/astrbot_plugin_bsk_browser/
+├── sessions.json            # 会话所有权 journal（跨重启持久化）
+└── shots/                   # 截图（按会话分子目录，自动清理）
 ```

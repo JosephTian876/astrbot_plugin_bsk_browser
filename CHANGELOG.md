@@ -4,6 +4,33 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.1] - 2026-10-05
+
+修复插件市场 LLM Guard 审核拒绝的两项问题。本次发布不含功能变更。
+
+### 修复
+
+- **日志改用依赖注入，不再使用 Python 内置 logging 模块**：审核规则要求 logger 必须
+  来自 `astrbot.api`（`from astrbot.api import logger`），严禁使用内置 `logging` 模块；
+  而本仓库另有一条被静态测试强制的分层约束 —— `bsk/` 包不得依赖 AstrBot，否则就无法
+  脱离框架独立单测。两条要求正面冲突，解法是审核原文明确许可的第三条路：
+  `main.py`（唯一允许依赖框架的文件）从 `astrbot.api` 取 logger 后**注入**给 `bsk/`
+  各组件（`BskService` → `SessionManager` / `SessionJournal`），`bsk/` 侧只在新增的
+  `bsk/logger.py` 里声明接口（`LoggerLike` 协议）并提供 `NullLogger` 兜底。
+  `bsk/` 下因此既没有 `import astrbot`，也没有 `import logging`。未注入时
+  （单元测试、独立脚本）走 `NullLogger`：不产生任何输出，也永不抛异常
+
+### 变更
+
+- **会话所有权 journal 与截图迁移到插件数据目录**：此前两者都写在系统临时目录
+  （`<临时目录>\astrbot_bsk_browser\sessions.json` 与 `<临时目录>\astrbot_bsk_shots`）。
+  按审核规则，跨重启持久化的数据应存放在 `data/plugin_data/astrbot_plugin_bsk_browser`
+  下。现由新增的 `bsk/paths.py` 统一解析落盘位置，journal 与截图默认都落在该目录。
+  **保留降级容错**（审核明确要求）：数据目录拿不到或不可写时自动退回临时目录并记一条
+  警告，任何一步都不抛异常 —— 它在插件加载路径上，抛异常等于插件加载失败。
+  用户显式配置的 `screenshot_dir` / `journal_path` 优先级不变，仍然最高
+- 更换插件图标（1:1，512×512 PNG）
+
 ## [0.1.0] - 2026-10-03
 
 首个版本。把本机 `bsk` 命令行工具（腾讯 BrowserSkill）包装成 AstrBot 的
@@ -79,5 +106,6 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   清理永远返回 0
 - **权限提示与实现相反**：配置校验说白名单「不生效」，实际是白名单优先
 
+[0.1.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.1
 [0.1.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.0
 

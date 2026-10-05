@@ -24,5 +24,5 @@ desc: |
   本项目采用 MIT OR AGPL-3.0-or-later 双许可发布。
 author: KazusaUwU
 repo: https://github.com/JosephTian876/astrbot_plugin_bsk_browser
-version: 0.1.0
+version: 0.1.1
 astrbot_version: ">=4.16"
