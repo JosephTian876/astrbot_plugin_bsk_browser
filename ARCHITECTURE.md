@@ -85,7 +85,7 @@
 
 1. **它是被覆写进框架的载荷本身。** `main.py` 只是把 `TOOL_SCHEMAS` 的值 deepcopy 到已注册工具上（§5 D8）。如果把 schema 的构造写进 `main.py`，那 `main.py` 就从「薄适配层」变成「规格 + 适配混在一起」，C2 逼出来的分层立刻失效。
 2. **AstrBot 的 Schema 方言不是通用 JSON Schema，必须能独立验证。** 框架的类型白名单是 `{string, number, object, array, boolean}` —— **没有 `integer`**，因为 AstrBot 的 `spec_to_func` 走的是它自己的那套转换。所以本模块里所有整数语义的参数（`limit`、`max_depth`、`timeout_ms`、`width`…）一律声明成 `"number"`，整数性与范围改由 `validate` 在运行时检查。这类"方言"约束只有在能脱离框架反复跑单测时才好守。
-3. **per-action 校验天然是纯逻辑。** DSH 的结构是「公共 schema 只有 `action` 必填、其余参数是扁平并集，真正的必填/互斥/范围校验在 handler 里做」。本插件复刻了这个两层结构，但把第二层下沉成了纯函数 —— 于是 33 个 action 的校验分支可以用 `tests/test_tools.py`（56 个用例）直接覆盖，不需要启动 AstrBot、不需要真实浏览器。
+3. **per-action 校验天然是纯逻辑。** DSH 的结构是「公共 schema 只有 `action` 必填、其余参数是扁平并集，真正的必填/互斥/范围校验在 handler 里做」。本插件复刻了这个两层结构，但把第二层下沉成了纯函数 —— 于是 33 个 action 的校验分支可以用 `tests/test_tools.py`（77 个用例）直接覆盖，不需要启动 AstrBot、不需要真实浏览器。
 
 **为什么 `required` 只写 `action`**：AstrBot 的 `spec_to_func` 只构造 `{type: "object", properties}`，**不生成 `required`**。我们走的是「装饰器注册后覆写 `parameters`」这条路（§5 D8），覆写后的 schema 会被原样交给 provider，所以这里写的 `required: ["action"]` 是**真的会传给模型**的（DSH 侧同样如此）。其余参数的必填仍然只能靠 `validate` 在运行时报中文错 —— AstrBot 读不懂 per-action 的必填。
 
@@ -492,7 +492,7 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 
 **为什么默认必须是 `true`**：AstrBot 的插件配置是 merge 语义（缺失键插默认值、
 已有的非 `None` 值原样保留）且加载时立即写盘。默认 `true` → 老用户升级后一切照旧；
-默认 `false` → 等于**静默删掉** 8 个工具，正在用旧写法的提示词会毫无预兆地发现工具"没了"。
+默认 `false` → 等于**静默关掉** 7 个旧工具（`bsk_evaluate` 除外），正在用旧写法的提示词会毫无预兆地发现工具"没了"。
 
 **为什么直接设 `tool.active = False`，而不是调框架的 `deactivate_llm_tool_async`**：
 后者会把这个名字写进**持久化**的 `inactivated_llm_tools`（全局 SharedPreferences）。
@@ -518,7 +518,7 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 | `legacy_tools=true`（默认） | 14 | 19398 字符 |
 | `legacy_tools=false` | 7 | 15534 字符 |
 
-差 **3864 字符/轮**。注意关掉后是 **7 个而不是 6 个** —— 多出来的那个正是
+差 **3612 字符/轮**。注意关掉后是 **7 个而不是 6 个** —— 多出来的那个正是
 不受本项影响的 `bsk_evaluate`。
 
 ### D10：与 DSH（`dsh-plugin-browserskill`）的有意差异
@@ -548,7 +548,7 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制、6 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（714 个用例） |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制、6 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（735 个用例，`unittest` 口径） |
 | L2 契约测试 | `main.py` 能被真实 AstrBot import、14 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
 | L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与会话过期自动重建 | ✅ | ✅ | `verify_integration.py` |
 | L4 工具层端到端 | 直接 await `main.py` 里的工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py`（6 个旧工具：`bsk_open/read/act/screenshot/close/status`）、`verify_logs_tool.py`（`bsk_logs`）、`verify_evaluate_gate.py`（`bsk_evaluate` 的权限三分支）、`verify_new_tools_real.py`（6 个新工具、33 个 action，34 项） |
@@ -583,7 +583,7 @@ logger 注入与数据落盘位置这两条改动另有专门的单元测试，�
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd <插件目录>                                 # 即本仓库根目录
-& $py -m unittest discover -s tests        # L1（714 个）
+& $py -m unittest discover -s tests        # L1（735 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）

@@ -508,6 +508,18 @@ class BskBrowserPlugin(Star):
 
             tool.parameters = copy.deepcopy(schema)
 
+            # 描述也一并覆写：`bsk/tools.py` 是工具规格的唯一事实源，
+            # 描述当然也该来自那里（它被写在模块头声明为事实源的一部分）。
+            # 不覆写的话，模型看到的是 docstring，而 docstring 是给人读的
+            # 长文（含换行、含 Markdown 加粗），既不与描述表同步、
+            # 又比描述更长 —— 每轮对话都要为这点差异多付 token。
+            #
+            # 缺失时**保留 docstring 的描述**，绝不把 description 清空：
+            # 描述为空会让模型完全不知道该工具做什么，比描述略长严重得多。
+            description = tools_mod.TOOL_DESCRIPTIONS.get(name)
+            if description:
+                tool.description = description
+
             # 运行时探针：覆写后回读一次，确认 enum 真的写进去了。
             # 这是防"框架换了实现、赋值变成只读或被重建"这类静默失效 ——
             # 那种情况下工具仍然可用（描述文字里有 action 列表），
