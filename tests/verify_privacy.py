@@ -7,7 +7,7 @@ GitHub 上公开的不只是当前文件，还有全部提交历史。
 
 ## 扫描什么
 针对这台机器的实际情况定制：
-- 用户名 UwU / JosephTian876 / KazusaUwU（注意：作者名是有意公开的）
+- 用户名 UwU / JosephTian876（注意：作者名与 GitHub 用户名一致，是有意公开的）
 - 家目录路径 C:\\Users\\UwU
 - 桌面/百度同步盘路径（图标来源就取自那里）
 - QQ 号形态的数字串
@@ -177,8 +177,10 @@ SENSITIVE_PATTERNS: list[tuple[str, str, str]] = [
 # 注意：这里只放"本来就该公开"的东西，不能拿它当"降噪开关" ——
 # 把常见命中塞进来会让扫描器变成睁眼瞎。
 INTENTIONAL = [
-    (r"KazusaUwU", "作者名（metadata.yaml 的 author，有意公开）"),
-    (r"JosephTian876", "GitHub 用户名（仓库地址的一部分）"),
+    (
+        r"JosephTian876",
+        "作者名与 GitHub 用户名（metadata.yaml 的 author + 仓库地址，有意公开）",
+    ),
     (r"josephtian876@gmail\.com", "git 提交邮箱（提交历史固有，公开可见）"),
     (r"yourname", "占位符"),
     (r"<你>|<用户名>|<your", "文档里的占位符写法"),
@@ -438,7 +440,7 @@ def main() -> int:
         print("  - 已扫描当前版本库的 ", len(files), " 个文件", sep="")
         if with_history:
             print("  - 已扫描全部 ", len(revs), " 个提交的全部历史内容", sep="")
-        print("  - 作者名 KazusaUwU 与仓库地址 JosephTian876 属于有意公开的信息，")
+        print("  - 作者名 JosephTian876 与仓库地址属于有意公开的信息，")
         print("    不算泄露（它们是 metadata.yaml 里给用户看的）")
         return 0
 
