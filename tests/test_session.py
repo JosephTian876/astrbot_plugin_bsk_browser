@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 # 让测试能 import 到项目的 bsk 包（与 test_runner.py 保持一致）。
@@ -54,12 +55,35 @@ def make_session_id(n: int) -> str:
     return "mn" + letters[(n // 26) % 26] + letters[n % 26]
 
 
+_REQUEST_HELP_TEXT = """Inspect, claim, or cancel a recoverable start request
+
+Usage: bsk.exe session request [OPTIONS] <REQUEST_ID>
+
+Arguments:
+  <REQUEST_ID>
+
+Options:
+      --cancel
+      --json        Emit machine-readable JSON output (when meaningful)
+      --prepare
+      --quiet       Suppress informational output
+      --claim
+      --verbose...
+  -h, --help        Print help
+"""
+"""``bsk session request --help`` 的真实输出（实测原文，截去 -v 的说明）。
+
+能力探测靠它里面的 ``--prepare`` 判定"支持可恢复启动"，所以这里必须逐字保留。
+"""
+
+
 @dataclass
 class _Ok:
     """一次成功返回。``delay`` 用来模拟慢命令（竞态测试用）。"""
 
     data: Any = None
     delay: float = 0.0
+    stdout: str = ""
 
 
 @dataclass
@@ -73,9 +97,9 @@ class _Fail:
     stderr: str = ""
 
 
-def ok(data: Any = None, *, delay: float = 0.0) -> _Ok:
+def ok(data: Any = None, *, delay: float = 0.0, stdout: str = "") -> _Ok:
     """构造一个成功结果。"""
-    return _Ok(data=data, delay=delay)
+    return _Ok(data=data, delay=delay, stdout=stdout)
 
 
 def fail(
@@ -126,6 +150,22 @@ class FakeRunner:
         # 而不是靠 sleep 一个魔数去赌调度顺序。
         self.command_started = asyncio.Event()
 
+        # --- 可恢复启动（request_id 协议）支持 ---
+        #
+        # 与真实 bsk 对齐（实测语义）：
+        #   session request <令牌> --help     → 退出 0，输出含 --prepare
+        #   --prepare                         → {"state": "prepared", "session": None}
+        #   --claim                           → {"state": "active", ...}
+        #   --cancel                          → {"state": "closed", "cleanup_error": None}
+        #   裸查询                            → {"state": <跟踪到的状态或 "unknown">}
+        #   start --request-id X              → 把 X 记为 "ready"
+        self.request_protocol = True
+        """False 时模拟老 bsk：``session request`` 子命令被以非零码拒绝。"""
+        self.request_states: dict[str, str] = {}
+        """令牌 → 当前状态（模拟 daemon 侧的记账）。"""
+        self.before_call: Callable[[list[str]], None] | None = None
+        """调用前钩子：用来断言"写前落盘发生在 start 之前"这类顺序性质。"""
+
     # --- 编程接口 ---
 
     async def wait_until_in_flight(self, timeout: float = 2.0) -> None:
@@ -135,8 +175,42 @@ class FakeRunner:
         await asyncio.sleep(0)
 
     def queue(self, command: str, *outcomes: Any) -> None:
-        """给某个命令追加一串结果（按顺序消费，用完后回到"默认成功"）。"""
+        """给某个命令追加一串结果（按顺序消费，用完后回到"默认成功"）。
+
+        ``session request`` 有四条子命令，它们的 ``_command_of`` 归一结果相同，
+        所以额外支持**更精确的键**来单独瞄准其中一条（优先级高于泛化的
+        ``"session request"``）::
+
+            queue("session request --prepare", fail(...))
+            queue("session request --claim",   fail(...))
+            queue("session request --cancel",  ok({...}))
+            queue("session request --help",    fail(...))   # 能力探测
+
+        泛化的 ``"session request"`` 依然是"四条里最先跑到的那条"。
+        """
         self.script.setdefault(command, []).extend(outcomes)
+
+    @staticmethod
+    def _script_keys(call: list[str]) -> list[str]:
+        """一条调用按优先级排列的排队键（越靠前越精确）。"""
+        command = FakeRunner._command_of(call)
+        if command != "session request":
+            return [command]
+        if "--help" in call:
+            return ["session request --help", command]
+        for flag in ("--prepare", "--claim", "--cancel"):
+            if flag in call:
+                # 形如 "session request --prepare"。
+                return [f"{command} {flag}", command]
+        return [command]
+
+    def _next_outcome(self, call: list[str]) -> Any:
+        """取这条调用该消费的结果：精确键优先，其次泛化键，最后默认成功。"""
+        for key in self._script_keys(call):
+            queued = self.script.get(key)
+            if queued:
+                return queued.pop(0)
+        return _Ok()
 
     def calls_for(self, command: str) -> list[list[str]]:
         """取出某个命令的所有调用参数。"""
@@ -162,6 +236,21 @@ class FakeRunner:
     def session_id_for(self, call: list[str]) -> str:
         """从参数里取 ``--session`` 的值（stop 除外，它是位置参数）。"""
         return self._value_after(call, "--session")
+
+    def request_id_for(self, call: list[str]) -> str:
+        """从参数里取 ``--request-id`` 的值。"""
+        return self._value_after(call, "--request-id")
+
+    def request_token_of(self, call: list[str]) -> str:
+        """从 ``session request <令牌> ...`` 里抠出令牌。"""
+        if len(call) > 2 and call[0] == "session" and call[1] == "request":
+            if not call[2].startswith("-"):
+                return call[2]
+        return ""
+
+    def calls_for_request(self, flag: str) -> list[list[str]]:
+        """取出带某个开关（``--prepare`` / ``--claim`` / ``--cancel``）的请求调用。"""
+        return [c for c in self.calls_for("session request") if flag in c]
 
     # --- 内部 ---
 
@@ -215,12 +304,27 @@ class FakeRunner:
         call = list(args)
         self.calls.append(call)
         self.timeouts.append(timeout)
+        if self.before_call is not None:
+            # 在"命令真的发出去"之前回调，让测试能断言此刻的磁盘/内存状态
+            # （例如"写前落盘是否已经发生"）。
+            self.before_call(call)
         command = self._command_of(call)
         if command == "session start":
             self.start_count += 1
 
-        queued = self.script.get(command)
-        outcome: Any = queued.pop(0) if queued else _Ok()
+        # 老 bsk 的模拟：session request 子命令整个被以非零退出码拒绝。
+        # 能力探测（--help）与四条协议命令都走这一条。
+        if command == "session request" and not self.request_protocol:
+            raise errors.classify(
+                exit_code=errors.EXIT_USER_ERROR,
+                code="invalid_params",
+                message="unrecognized subcommand 'request'",
+                hint="",
+                reason="",
+                stderr="error: unrecognized subcommand 'request'",
+            )
+
+        outcome: Any = self._next_outcome(call)
 
         if isinstance(outcome, _Fail):
             # 走真实分类逻辑，保证抛出的正是 session.py 期待的那个子类。
@@ -254,19 +358,57 @@ class FakeRunner:
                 self._active_session_ids.discard(session_id)
 
         data = outcome.data
-        if command == "session start" and data is None:
-            data = self._start_payload()
-        elif data is None and command == "observe":
-            data = {
-                "text": '@vom 1\nL1 page\n  RootWebArea "Example Domain"',
-                "ref_count": 0,
-                "tab_id": 1,
-                "truncated": False,
-            }
-        return BskResult(ok=True, exit_code=0, data=data, elapsed=0.0)
+        stdout = outcome.stdout
+        if command == "session request" and "--help" in call and not stdout:
+            # 能力探测：真实 bsk 输出的是人类可读的帮助文本（零副作用）。
+            stdout = _REQUEST_HELP_TEXT
+        if data is None and not (command == "session request" and "--help" in call):
+            # 排队结果优先（既有 queue() 语义）：只有没排队时才走协议默认应答。
+            if command == "session request":
+                data = self._request_payload(call)
+            elif command == "session start":
+                data = self._start_payload(call)
+            elif command == "observe":
+                data = {
+                    "text": '@vom 1\nL1 page\n  RootWebArea "Example Domain"',
+                    "ref_count": 0,
+                    "tab_id": 1,
+                    "truncated": False,
+                }
+        return BskResult(
+            ok=True, exit_code=0, data=data, stdout=stdout, elapsed=0.0
+        )
 
-    def _start_payload(self) -> dict[str, Any]:
+
+    def _request_payload(self, call: list[str]) -> dict[str, Any]:
+        """构造 ``session request`` 的默认应答，并把状态记进 ``request_states``。"""
+        token = self.request_token_of(call)
+        if "--prepare" in call:
+            self.request_states[token] = "prepared"
+            return {"state": "prepared", "session": None, "cleanup_error": None,
+                    "request_id": token}
+        if "--claim" in call:
+            self.request_states[token] = "active"
+            return {"state": "active", "session": {"session_id": "mnaa"},
+                    "cleanup_error": None, "request_id": token}
+        if "--cancel" in call:
+            self.request_states[token] = "closed"
+            return {"state": "closed", "session": None, "cleanup_error": None,
+                    "request_id": token}
+        # 裸查询：daemon 明确回答"没见过"就是 "unknown"（实测 exit 0）。
+        return {
+            "state": self.request_states.get(token, "unknown"),
+            "session": None,
+            "cleanup_error": None,
+            "request_id": token,
+        }
+
+    def _start_payload(self, call: list[str] | None = None) -> dict[str, Any]:
         """构造 ``session start --json`` 的返回。"""
+        request_id = self._value_after(call, "--request-id") if call else ""
+        if request_id:
+            # 实测语义：start 受理这次令牌后，它的状态变成 ready（窗口正在建）。
+            self.request_states[request_id] = "ready"
         return {
             "session_id": self._next_session_id(),
             "browser_instance_id": "c900a3da",
@@ -2411,6 +2553,638 @@ class TestReleaseAllStopRetry(SessionTestCase):
         stop_calls = self.runner.calls_for("session stop")
         self.assertEqual(len(stop_calls), STOP_MAX_ATTEMPTS)
         self.assertEqual(stop_calls, [["session", "stop", "mnaa"]] * STOP_MAX_ATTEMPTS)
+
+
+# ----------------------------------------------------------------------
+# 可恢复启动（request_id 协议）
+#
+# 要修的缺陷：``session start`` 超时会让窗口成为永久孤儿 ——
+#     fresh = await self._start(...)   ← 超时在这里抛
+#     self._journal_add(fresh)         ← 永远执行不到
+# 窗口可能已经开出来了，但 journal 里没有任何记录，recover_orphans 够不着它。
+#
+# 修法：发出 start 之前先把令牌落盘，并让 daemon 认下它。
+# ----------------------------------------------------------------------
+
+
+class TestRecoverableStart(SessionTestCase):
+    """令牌的生成、透传与调用顺序。"""
+
+    async def test_request_id_is_passed_to_start_and_is_well_formed(self) -> None:
+        """``--request-id`` 必须出现在 argv 里，且格式能被 REQUEST_TOKEN_RE 认下。"""
+        from bsk.session import REQUEST_TOKEN_RE
+
+        manager = self.make_manager()
+        await manager.acquire("umo-1")
+
+        start_calls = self.runner.calls_for("session start")
+        self.assertEqual(len(start_calls), 1)
+        token = self.runner.request_id_for(start_calls[0])
+        self.assertTrue(token, f"start 没带 --request-id：{start_calls[0]}")
+        self.assertRegex(token, REQUEST_TOKEN_RE)
+
+        # 令牌里的到期时间必须是 Unix 毫秒（写成秒会立刻过期）。
+        expires_ms = int(token.split(":")[0])
+        self.assertGreater(expires_ms, 1_700_000_000_000)
+        self.assertGreater(expires_ms / 1000.0, time.time())
+
+    async def test_two_starts_never_reuse_a_token(self) -> None:
+        """每次启动都必须新生成令牌 —— 复用会让 cancel 关掉用户正在用的窗口。"""
+        manager = self.make_manager()
+        await manager.acquire("umo-a")
+        await manager.acquire("umo-b")
+
+        tokens = [
+            self.runner.request_id_for(c)
+            for c in self.runner.calls_for("session start")
+        ]
+        self.assertEqual(len(tokens), 2)
+        self.assertNotEqual(tokens[0], tokens[1])
+
+    async def test_call_order_is_prepare_start_claim(self) -> None:
+        """顺序必须是 prepare → start → claim：prepare 失败时绝不能已经发了 start。"""
+        manager = self.make_manager()
+        order: list[str] = []
+
+        def hook(call: list[str]) -> None:
+            if call[:2] == ["session", "start"]:
+                order.append("start")
+            elif "--prepare" in call:
+                order.append("prepare")
+            elif "--claim" in call:
+                order.append("claim")
+            elif "--cancel" in call:
+                order.append("cancel")
+
+        self.runner.before_call = hook
+        await manager.acquire("umo-1")
+
+        self.assertEqual(order, ["prepare", "start", "claim"])
+
+    async def test_claim_uses_same_token_as_start(self) -> None:
+        """prepare / start / claim 三步必须是**同一个**令牌，否则等于没绑定。"""
+        manager = self.make_manager()
+        await manager.acquire("umo-1")
+
+        prepared = self.runner.request_token_of(
+            self.runner.calls_for_request("--prepare")[0]
+        )
+        started = self.runner.request_id_for(self.runner.calls_for("session start")[0])
+        claimed = self.runner.request_token_of(
+            self.runner.calls_for_request("--claim")[0]
+        )
+        self.assertEqual(prepared, started)
+        self.assertEqual(started, claimed)
+
+    async def test_probe_runs_once_per_manager(self) -> None:
+        """能力探测每进程只做一次，不能每次建会话都多付一个子进程。"""
+        manager = self.make_manager()
+        await manager.acquire("umo-a")
+        await manager.acquire("umo-b")
+
+        probes = [c for c in self.runner.calls_for("session request") if "--help" in c]
+        self.assertEqual(len(probes), 1, f"探测了 {len(probes)} 次：{probes}")
+
+    async def test_probe_failure_falls_back_to_plain_start(self) -> None:
+        """老 bsk（session request 不可用）→ argv 不含 --request-id，但会话照常建立。"""
+        self.runner.request_protocol = False
+        manager = self.make_manager()
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        self.assertEqual(self.runner.start_count, 1)
+        argv = self.runner.calls_for("session start")[0]
+        self.assertNotIn("--request-id", argv)
+        self.assertEqual(self.runner.calls_for_request("--prepare"), [])
+        self.assertEqual(
+            manager.stats()["counters"]["request_protocol_unsupported"], 1
+        )
+
+    async def test_disabled_by_config_falls_back_to_plain_start(self) -> None:
+        """``enable_request_id=False`` → 完全回到旧行为，连探测都不做。"""
+        manager = self.make_manager(make_settings(enable_request_id=False))
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        self.assertNotIn("--request-id", self.runner.calls_for("session start")[0])
+        self.assertEqual(self.runner.calls_for("session request"), [])
+        self.assertEqual(manager.stats()["counters"]["request_protocol_disabled"], 1)
+
+    async def test_cancelled_start_is_not_retried(self) -> None:
+        """T6：cancelled（exit=2）是"已被抑制"，绝不重试、也不回退成普通 start。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session start",
+            fail("cancelled", exit_code=errors.EXIT_PROTOCOL,
+                 message="start request cancelled"),
+        )
+
+        with self.assertRaises(errors.BskStartCancelled) as ctx:
+            await manager.acquire("umo-1")
+
+        self.assertFalse(ctx.exception.retryable)
+        self.assertEqual(self.runner.start_count, 1, "cancelled 之后不该再试一次")
+        # 每一次 start 都必须带令牌：回退成不带令牌的普通 start 会绕开取消，
+        # 开出一个没有任何所有权凭据保护的窗口 —— 那正是本次要修的 bug。
+        for call in self.runner.calls_for("session start"):
+            self.assertIn("--request-id", call, f"不许回退成普通 start：{call}")
+        self.assertEqual(manager.stats()["counters"]["request_cancelled"], 1)
+
+    async def test_prepare_failure_never_reaches_start(self) -> None:
+        """prepare 失败 → start 一次都没被调用（此刻窗口一定不存在）。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session request --prepare", fail("invalid_params", message="bad token")
+        )
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        self.assertEqual(self.runner.start_count, 0)
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+
+    async def test_start_failure_cancels_by_token_and_never_stops_session(self) -> None:
+        """start 超时（回执丢失）→ 必须凭令牌 cancel 一次；session stop 零次。
+
+        这正是本次要修的缺陷：旧的失败路径什么都留不下，窗口成了永久孤儿。
+        """
+        manager = self.make_manager()
+        self.runner.queue(
+            "session start", fail("", exit_code=errors.EXIT_TIMEOUT, message="timeout")
+        )
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        cancels = self.runner.calls_for_request("--cancel")
+        self.assertEqual(len(cancels), 1, f"应恰好 cancel 一次：{self.runner.calls}")
+        token = self.runner.request_token_of(cancels[0])
+        self.assertEqual(
+            token, self.runner.request_id_for(self.runner.calls_for("session start")[0])
+        )
+        # 我们没有 session_id，`session stop` 根本无从谈起。
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+        self.assertEqual(manager.stats()["counters"]["request_start_failed"], 1)
+
+    async def test_cancel_not_confirmed_keeps_journal_record(self) -> None:
+        """cancel 没被确认（cleanup_error 非空）→ 记录必须保留给下次启动。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session start", fail("", exit_code=errors.EXIT_TIMEOUT)
+        )
+        self.runner.queue(
+            "session request --cancel",
+            ok({"state": "cancelling", "cleanup_error": "cleanup timed out"}),
+        )
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        # 没有 journal 时这条断言退化成"不崩"，真正的验证在
+        # TestRecoverableStartJournal.test_unconfirmed_cancel_keeps_record。
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), 1)
+
+    async def test_claim_failure_cancels_and_raises(self) -> None:
+        """claim 失败 → 补偿 cancel + 抛出（绝不留下一个没人认领的窗口）。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session request --claim",
+            fail("", exit_code=errors.EXIT_PROTOCOL, message="boom"),
+        )
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        self.assertEqual(len(self.runner.calls_for_request("--claim")), 1)
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), 1)
+        self.assertEqual(manager.stats()["counters"]["request_claim_failed"], 1)
+
+    async def test_claim_cancelled_is_translated(self) -> None:
+        """claim 收到 cancelled（令牌已被别人取消）→ 同样是 BskStartCancelled。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session request --claim",
+            # 实测：对 prepared 状态调 --claim 会返回 cancelled（exit 2）。
+            fail("cancelled", exit_code=errors.EXIT_PROTOCOL,
+                 message="start request cannot be claimed"),
+        )
+
+        with self.assertRaises(errors.BskStartCancelled):
+            await manager.acquire("umo-1")
+
+        self.assertEqual(self.runner.start_count, 1)
+
+    async def test_orphan_token_lookup_does_not_trigger_session_rebuild(self) -> None:
+        """令牌查不到（not_found）绝不能变成 BskSessionGone —— 那会去重建一个不该存在的会话。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session request --prepare",
+            fail("not_found", message="start request not found"),
+        )
+
+        with self.assertRaises(BskError) as ctx:
+            await manager.acquire("umo-1")
+
+        self.assertEqual(ctx.exception.code, "request_not_found")
+        self.assertNotIsInstance(ctx.exception, BskSessionGone)
+        self.assertEqual(self.runner.start_count, 0)
+
+    async def test_request_bad_payload_is_protocol_error(self) -> None:
+        """prepare 收到非 JSON 对象 → BskProtocolError，且不继续发 start。"""
+        manager = self.make_manager()
+        self.runner.queue("session request --prepare", ok(["not", "a", "dict"]))
+
+        with self.assertRaises(BskError) as ctx:
+            await manager.acquire("umo-1")
+
+        self.assertEqual(ctx.exception.code, "request_bad_payload")
+        self.assertEqual(self.runner.start_count, 0)
+
+    async def test_probe_rejects_help_without_prepare_flag(self) -> None:
+        """探测的判据是输出里有没有 ``--prepare``：没有就是"不支持"。"""
+        manager = self.make_manager()
+        self.runner.queue(
+            "session request --help", ok(None, stdout="Usage: bsk session request\n")
+        )
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        self.assertNotIn("--request-id", self.runner.calls_for("session start")[0])
+
+
+class _WriteAheadFailingJournal:
+    """``add_checked`` 恒失败的 journal —— 模拟"数据目录不可写"。
+
+    其余方法都转发给真 journal，这样"降级之后仍走旧路径落盘"这件事也能被验证。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def load(self) -> Any:
+        return self._inner.load()
+
+    def add(self, entry: Any) -> None:
+        self._inner.add(entry)
+
+    def add_checked(self, entry: Any) -> bool:
+        return False
+
+    def remove(self, session_id: str) -> None:
+        self._inner.remove(session_id)
+
+    def remove_by_request(self, request_id: str) -> None:
+        self._inner.remove_by_request(request_id)
+
+    def clear(self) -> None:
+        self._inner.clear()
+
+
+class TestRecoverableStartJournal(TestJournalIntegration):
+    """写前落盘：令牌必须**先于**任何浏览器副作用落到磁盘上。"""
+
+    async def test_token_is_persisted_before_start_is_issued(self) -> None:
+        """★ 核心不变式：发出 start 的那一刻，令牌已经躺在 journal 里了。"""
+        manager = self.make_journal_manager()
+        seen: list[list[Any]] = []
+
+        def hook(call: list[str]) -> None:
+            if call[:2] == ["session", "start"]:
+                seen.append(self.journal.load())
+
+        self.runner.before_call = hook
+        await manager.acquire("umo-1")
+
+        self.assertEqual(len(seen), 1, "start 只该发一次")
+        pending = seen[0]
+        self.assertEqual(len(pending), 1, f"start 之前 journal 里应有令牌：{pending}")
+        self.assertTrue(pending[0].request_id, "记录里必须是令牌")
+        self.assertEqual(pending[0].state, "prepared")
+        self.assertEqual(pending[0].session_id, "")  # 此刻还不知道 session_id
+
+    async def test_pending_record_is_replaced_by_active_record(self) -> None:
+        """成功后同一条记录（按令牌去重）应升级成带 session_id 的 active 记录。"""
+        manager = self.make_journal_manager()
+        session = await manager.acquire("umo-1")
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1, f"不该留下两条记录：{loaded}")
+        self.assertEqual(loaded[0].session_id, session.session_id)
+        self.assertTrue(loaded[0].request_id)
+        self.assertEqual(loaded[0].state, "active")
+
+    async def test_concurrent_starts_keep_both_pending_records(self) -> None:
+        """★ 两条并发启动的 pending 记录都必须活着。
+
+        这是 v2 记录按令牌去重的原因：两条 pending 的 session_id 都是空串，
+        按 session_id 去重会让它们互相覆盖 —— 于是其中一次启动的窗口在
+        "回执丢失"时彻底失去线索。
+        """
+        manager = self.make_journal_manager()
+        counts: list[int] = []
+
+        def hook(call: list[str]) -> None:
+            if call[:2] == ["session", "start"]:
+                counts.append(len(self.journal.load()))
+
+        self.runner.before_call = hook
+        await asyncio.gather(manager.acquire("umo-a"), manager.acquire("umo-b"))
+
+        self.assertEqual(len(counts), 2, f"应有两次 start：{counts}")
+        self.assertEqual(max(counts), 2, f"每次 start 时都该看到两条 pending：{counts}")
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 2, f"两条记录都该在：{loaded}")
+        tokens = [e.request_id for e in loaded]
+        self.assertEqual(len(set(tokens)), 2, f"令牌必须互不相同：{tokens}")
+        self.assertTrue(all(tokens), f"两条记录都该带令牌：{loaded}")
+        self.assertEqual(
+            sorted(e.session_id for e in loaded), ["mnaa", "mnab"]
+        )
+
+    async def test_prepare_failure_leaves_no_journal_record(self) -> None:
+        """prepare 失败 → 补偿 cancel 之后记录必须清干净，不能留下幽灵令牌。"""
+        manager = self.make_journal_manager()
+        self.runner.queue("session request --prepare", fail("invalid_params"))
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        self.assertEqual(self.runner.start_count, 0)
+        self.assertEqual(self.journal.load(), [])
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), 1)
+
+    async def test_confirmed_start_failure_removes_record(self) -> None:
+        """start 超时但 cancel 确认窗口不在 → 记录删掉（否则每次启动都白跑一轮）。"""
+        manager = self.make_journal_manager()
+        self.runner.queue("session start", fail("", exit_code=errors.EXIT_TIMEOUT))
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), 1)
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_unconfirmed_cancel_keeps_record(self) -> None:
+        """cancel 未被确认（cleanup_error 非空）→ **保留记录**，留给下次启动重试。"""
+        manager = self.make_journal_manager()
+        self.runner.queue("session start", fail("", exit_code=errors.EXIT_TIMEOUT))
+        self.runner.queue(
+            "session request --cancel",
+            ok({"state": "cancelling", "cleanup_error": "cleanup timed out"}),
+        )
+
+        with self.assertRaises(BskError):
+            await manager.acquire("umo-1")
+
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1, f"未确认关闭就必须保留记录：{loaded}")
+        self.assertTrue(loaded[0].request_id)
+
+    async def test_write_ahead_failure_degrades_to_plain_start(self) -> None:
+        """★ 写前落盘失败 → **降级**（不带令牌走普通启动），而不是拒绝启动。
+
+        守的不变式是「绝不带 --request-id 启动却没有持久令牌」：既然写不进去，
+        就不带令牌走普通启动（= 旧行为）。拒绝启动会让"数据目录不可写"这种
+        环境问题把整个浏览器功能瘫痪。
+        """
+        manager = self.make_journal_manager(
+            journal=_WriteAheadFailingJournal(self.journal)
+        )
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        self.assertEqual(self.runner.start_count, 1, "会话必须照常建立")
+        argv = self.runner.calls_for("session start")[0]
+        self.assertNotIn("--request-id", argv, f"写不进去就不许带令牌：{argv}")
+        # 连 prepare 都不该发：令牌没落盘，认下它也没有意义。
+        self.assertEqual(self.runner.calls_for_request("--prepare"), [])
+        self.assertEqual(self.runner.calls_for_request("--claim"), [])
+        self.assertEqual(
+            manager.stats()["counters"]["request_write_ahead_failed"], 1
+        )
+        # 降级之后旧路径仍然落盘（带 session_id，没有令牌）。
+        loaded = self.journal.load()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].session_id, session.session_id)
+        self.assertEqual(loaded[0].request_id, "")
+
+    async def test_journal_without_add_checked_degrades_instead_of_crashing(self) -> None:
+        """duck-typed journal 没有 add_checked → 同样降级，绝不抛异常。"""
+
+        class NoCheckedJournal:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def load(self) -> Any:
+                return self._inner.load()
+
+            def add(self, entry: Any) -> None:
+                self._inner.add(entry)
+
+            def remove(self, session_id: str) -> None:
+                self._inner.remove(session_id)
+
+            def remove_by_request(self, request_id: str) -> None:
+                self._inner.remove_by_request(request_id)
+
+            def clear(self) -> None:
+                self._inner.clear()
+
+        manager = self.make_journal_manager(journal=NoCheckedJournal(self.journal))
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        self.assertNotIn(
+            "--request-id", self.runner.calls_for("session start")[0]
+        )
+        self.assertEqual(
+            manager.stats()["counters"]["request_write_ahead_failed"], 1
+        )
+
+    async def test_illegal_token_is_rejected_by_write_ahead(self) -> None:
+        """格式非法的令牌不许写进 journal（那说明插件有 bug，宁可降级）。"""
+        manager = self.make_journal_manager()
+
+        self.assertFalse(manager._journal_add_pending("garbage"))
+        self.assertFalse(manager._journal_add_pending(""))
+        self.assertFalse(manager._journal_add_pending("1791240198465:NOT-A-UUID"))
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_no_journal_still_uses_request_id(self) -> None:
+        """没有 journal 时不该拒绝启动：记录本来就没处放，跨进程恢复本就不存在。"""
+        manager = self.make_manager()
+        manager._journal = None
+
+        session = await manager.acquire("umo-1")
+
+        self.assertTrue(session.is_valid())
+        token = self.runner.request_id_for(self.runner.calls_for("session start")[0])
+        self.assertTrue(token)
+
+
+class TestRecoverOrphansByRequest(TestJournalIntegration):
+    """``recover_orphans`` 的令牌优先轮：老路径结构上覆盖不到的那一类记录。"""
+
+    def make_pending_record(self, token: str, state: str = "ready") -> Any:
+        """塞一条"只有令牌、没有 session_id"的记录（= 上次 start 回执丢了）。"""
+        entry = self._JournalEntry(
+            session_id="",
+            browser_instance_id="",
+            agent_window_id=0,
+            created_at=self._time.time(),
+            pid=self._os.getpid(),
+            request_id=token,
+            state=state,
+        )
+        self.journal.add(entry)
+        return entry
+
+    async def test_live_request_is_cancelled_and_not_stopped_by_session(self) -> None:
+        """★ 只有令牌的记录（session_id 为空）→ 凭令牌 cancel，且不发 session stop。
+
+        这种记录靠 session_id 比对永远匹配不上 —— 它正是"start 超时"留下的形态。
+        """
+        token = "1791240198465:95861217-0000-4000-8000-000000000001"
+        self.make_pending_record(token, state="ready")
+        self.runner.request_states[token] = "ready"
+        manager = self.make_journal_manager()
+
+        recovered = await manager.recover_orphans()
+
+        self.assertEqual(recovered, 1, "令牌轮应该把它算进清理数")
+        cancels = self.runner.calls_for_request("--cancel")
+        self.assertEqual(len(cancels), 1, f"应 cancel 一次：{self.runner.calls}")
+        self.assertEqual(self.runner.request_token_of(cancels[0]), token)
+        self.assertEqual(
+            self.runner.calls_for("session stop"), [], "没有 session_id 就无从 stop"
+        )
+        self.assertEqual(self.journal.load(), [])
+        self.assertEqual(
+            manager.stats()["counters"]["request_orphans_cancelled"], 1
+        )
+
+    async def test_unknown_state_falls_through_to_legacy_path(self) -> None:
+        """state="unknown"：daemon 说没见过这个请求 → 交给老路径（这里无可停，跳过）。"""
+        token = "1791240198465:95861217-0000-4000-8000-000000000002"
+        self.make_pending_record(token, state="")
+        # 不播种 request_states → 假 runner 会回 "unknown"
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)
+
+        self.assertEqual(self.runner.calls_for_request("--cancel"), [])
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_query_failure_issues_no_cancel_and_does_not_raise(self) -> None:
+        """问不到（daemon 没跑/超时）→ 不发 cancel、不抛异常。
+
+        ⚠️ 这里同时钉住了对骨架一处**含糊**的裁决。``_recover_by_request``
+        在"问不到"时把记录留在 ``remaining`` 里（不当终态删掉），而
+        ``recover_orphans`` 结尾那句**无条件**的 ``_journal_clear()`` 是既有契约
+        （"这些记录属于已经退出的进程，留着只会让每次启动重复做无用功"），
+        骨架明确要求它的位置与行为都不变。
+
+        两处的合理解读是："保留"= **保留给本轮的老路径再匹配一次**
+        （对带 session_id 的记录确实有意义），而不是"跨进程保留"。
+        净效果：只有令牌、没有 session_id 的记录本轮无人能停，随后被
+        ``_journal_clear()`` 清掉。若日后裁决改成"未决记录必须跨进程保留"，
+        本用例的第三条断言应当随之反转。
+        """
+        token = "1791240198465:95861217-0000-4000-8000-000000000003"
+        self.make_pending_record(token, state="ready")
+        self.runner.queue(
+            "session request --help", ok(None, stdout=_REQUEST_HELP_TEXT)
+        )
+        self.runner.queue(
+            "session request", fail("", exit_code=errors.EXIT_TIMEOUT)
+        )
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)
+
+        # 没问着状态就绝不能去 cancel（那可能关掉一个陌生的窗口）。
+        self.assertEqual(self.runner.calls_for_request("--cancel"), [])
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+        # 记录最终被既有的无条件 _journal_clear() 清掉（见上面的裁决说明）。
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_terminal_state_drops_record_without_cancel(self) -> None:
+        """终态墓碑（closed）→ 窗口确定不在，直接删记录，不必再 cancel。"""
+        token = "1791240198465:95861217-0000-4000-8000-000000000004"
+        self.make_pending_record(token, state="closed")
+        self.runner.request_states[token] = "closed"
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 0)
+
+        self.assertEqual(self.runner.calls_for_request("--cancel"), [])
+        self.assertEqual(self.journal.load(), [])
+
+    async def test_old_bsk_skips_the_token_round(self) -> None:
+        """老 bsk：整轮跳过令牌回收，但老路径必须原样工作（会话照停）。
+
+        同时留下一条只有令牌的记录：老 bsk 下它**连问都不该问**（探测已判否），
+        更不能去 cancel —— 老 bsk 根本不认识这个子命令。
+        """
+        token = "1791240198465:95861217-0000-4000-8000-000000000005"
+        self.make_pending_record(token, state="ready")
+        self.make_record("abcd", 111)  # 老式记录：有 session_id，靠老路径停
+        self.runner.request_protocol = False
+        self.runner.queue(
+            "session list", ok([{"session_id": "abcd", "agent_window_id": 111}])
+        )
+        manager = self.make_journal_manager(journal=self.journal)
+
+        # 老路径照常工作：那条带 session_id 的记录被停掉。
+        self.assertEqual(await manager.recover_orphans(), 1)
+        self.assertEqual(
+            self.runner.calls_for("session stop"), [["session", "stop", "abcd"]]
+        )
+        # 令牌轮整个跳过：除了那次能力探测，没有别的 session request 调用。
+        requests = self.runner.calls_for("session request")
+        self.assertTrue(all("--help" in c for c in requests),
+                        f"老 bsk 下不该发协议命令：{requests}")
+        self.assertEqual(self.runner.calls_for_request("--cancel"), [])
+
+    async def test_same_token_cancelled_only_once_across_rounds(self) -> None:
+        """cancel 确认后记录被删，下次启动不该再 cancel 一遍。"""
+        token = "1791240198465:95861217-0000-4000-8000-000000000006"
+        self.make_pending_record(token, state="ready")
+        self.runner.request_states[token] = "ready"
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 1)
+        before = len(self.runner.calls_for_request("--cancel"))
+        self.assertEqual(await manager.recover_orphans(), 0)
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), before)
+
+    async def test_active_record_cancels_window_and_skips_session_stop(self) -> None:
+        """已认领（active）的遗留请求：cancel 同样能关掉它，不必再按 id 停一次。"""
+        token = "1791240198465:95861217-0000-4000-8000-000000000007"
+        entry = self._JournalEntry(
+            session_id="abcd",
+            browser_instance_id="c900a3da",
+            agent_window_id=111,
+            created_at=self._time.time(),
+            pid=self._os.getpid(),
+            request_id=token,
+            state="active",
+        )
+        self.journal.add(entry)
+        self.runner.request_states[token] = "active"
+        manager = self.make_journal_manager()
+
+        self.assertEqual(await manager.recover_orphans(), 1)
+        self.assertEqual(len(self.runner.calls_for_request("--cancel")), 1)
+        self.assertEqual(self.runner.calls_for("session stop"), [])
+        self.assertEqual(self.journal.load(), [])
 
 
 if __name__ == "__main__":  # pragma: no cover

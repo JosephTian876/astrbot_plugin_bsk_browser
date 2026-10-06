@@ -55,12 +55,15 @@ import asyncio
 import contextlib
 import inspect
 import os
+import re
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .errors import (
+    CODE_CANCELLED,
     EXIT_TIMEOUT,
     OUTCOME_UNKNOWN_REASONS,
     BskBrowserAmbiguous,
@@ -70,8 +73,10 @@ from .errors import (
     BskProtocolError,
     BskSessionBusy,
     BskSessionGone,
+    BskStartCancelled,
     BskTimeout,
     BskVersionError,
+    is_cancelled_error,
 )
 from .journal import JournalEntry, SessionJournal, now_seconds
 from .logger import NULL_LOGGER, LoggerLike
@@ -89,11 +94,24 @@ __all__ = [
     "BUSY_RETRY_DELAY_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
     "DEFAULT_MAX_SESSIONS",
+    "LIVE_REQUEST_STATES",
+    "REQUEST_PROBE_TIMEOUT_SEC",
+    "REQUEST_PROTOCOL_TIMEOUT_SEC",
+    "REQUEST_STATE_ACTIVE",
+    "REQUEST_STATE_CANCELLING",
+    "REQUEST_STATE_CLOSED",
+    "REQUEST_STATE_PREPARED",
+    "REQUEST_STATE_READY",
+    "REQUEST_TOKEN_RE",
+    "REQUEST_TOKEN_TTL_MARGIN_SEC",
+    "REQUEST_TOKEN_TTL_MAX_SEC",
+    "REQUEST_TOKEN_TTL_SEC",
     "STOP_MAX_ATTEMPTS",
     "STOP_RETRY_BUDGET_SEC",
     "STOP_RETRY_DELAY_SEC",
     "STOP_TIMEOUT_SEC",
     "STOP_TOTAL_BUDGET_SEC",
+    "TERMINAL_REQUEST_STATES",
 ]
 
 
@@ -284,6 +302,83 @@ RECOVER_LIST_TIMEOUT_SEC = 5.0
 实测这条命令 0.02-0.03 秒返回，5 秒是 100 倍余量；而它跑在插件启动路径上，
 不能让用户对着一个卡住的 daemon 干等（超时也只是退化成"清掉记录"）。
 """
+
+
+# --- 可恢复启动（request_id 协议）---
+#
+# 要修的缺陷（实测确认）：``session start`` 超时会让窗口成为永久孤儿。
+#
+#     fresh = await self._start(...)     # ← 超时在这里抛异常
+#     self._journal_add(fresh)           # ← 永远执行不到
+#
+# 窗口可能已经开出来了，但调用方拿不到 session_id，于是 journal 里没有任何
+# 记录，``recover_orphans()`` 也够不着它 —— 用户桌面上留下一个既关不掉、
+# 也清理不掉的浏览器窗口。
+#
+# 对策：在**发出 start 之前**先落盘一个令牌，再让 daemon 认下这个令牌；
+# 之后无论 start 的回执是超时、断连还是别的什么，都能凭令牌把那次启动
+# 造出来的会话找回来（cancel 掉）。
+#
+# 实测（本机 bsk 0.3.2，真实 daemon）确认的四条语义：
+#
+# 1. ``session request <令牌> --help`` → exit 0，输出含 ``--prepare``；
+# 2. ``--prepare`` → ``{"state": "prepared", "session": null, ...}``，**不开窗口**；
+# 3. 未 prepare 过的令牌查询 → ``{"state": "unknown"}``，exit 0；
+# 4. ``--cancel`` → ``{"state": "closed", "cleanup_error": null}``；
+#    对不存在的令牌 ``--claim`` → exit 1 + ``code="not_found"``。
+
+REQUEST_TOKEN_TTL_SEC = 300.0
+"""令牌有效期下限（秒）。实测只需覆盖 3 次往返（每次约 40ms），5 分钟有 100 倍余量。"""
+
+REQUEST_TOKEN_TTL_MAX_SEC = 540.0
+"""令牌有效期上限（秒）。bsk 只接受 10 分钟内的墓碑，留 1 分钟余量。"""
+
+REQUEST_TOKEN_TTL_MARGIN_SEC = 60.0
+"""有效期 = max(下限, 2 × 启动超时 + 这个余量)，再钳到上限。"""
+
+REQUEST_PROBE_TIMEOUT_SEC = 10.0
+"""能力探测（``session request --help``）的超时。实测 40~160ms，10 秒是防呆。"""
+
+REQUEST_PROTOCOL_TIMEOUT_SEC = 30.0
+"""prepare / claim / cancel / query 各自的超时。它们不建窗口、不导航，只改 daemon 侧记账。"""
+
+REQUEST_STATE_PREPARED = "prepared"
+"""令牌已预约，窗口还没建出来（实测 ``--prepare`` 返回 ``session: null``）。"""
+
+REQUEST_STATE_READY = "ready"
+"""bsk 已受理这次启动，窗口正在建。"""
+
+REQUEST_STATE_ACTIVE = "active"
+"""窗口已建出来并被认领（``--claim`` 之后的状态）。"""
+
+REQUEST_STATE_CLOSED = "closed"
+"""窗口确定不在了（``--cancel`` 成功后的墓碑）。"""
+
+REQUEST_STATE_CANCELLING = "cancelling"
+"""取消正在进行中，窗口可能还在。"""
+
+LIVE_REQUEST_STATES = frozenset({
+    REQUEST_STATE_PREPARED, REQUEST_STATE_READY, REQUEST_STATE_ACTIVE, REQUEST_STATE_CANCELLING,
+})
+"""这些状态意味着「daemon 那边可能真有个窗口」，值得去 cancel。"""
+
+TERMINAL_REQUEST_STATES = frozenset({REQUEST_STATE_CLOSED, "failed"})
+"""终态墓碑：窗口确定不在了，记录可以直接删。"""
+
+REQUEST_TOKEN_RE = re.compile(r"^\d+:[0-9a-f-]{36}$")
+"""令牌格式（实测）：``<到期-unix-毫秒>:<UUID>``。"""
+
+
+def _cancelled_from(exc: BaseException) -> BskStartCancelled:
+    """把一次 ``code="cancelled"`` 的失败翻译成 BskStartCancelled。"""
+    return BskStartCancelled(
+        f"可恢复启动被取消：{exc}",
+        friendly=("这次浏览器启动已被取消（bsk 回复 cancelled），不会重试、"
+                  "也不会改用普通方式重开。如果这不是你预期的，请稍后重新发起一次。"),
+        code=CODE_CANCELLED,
+        exit_code=getattr(exc, "exit_code", -1),
+        reason=getattr(exc, "reason", ""),
+    )
 
 RELEASE_WAIT_SEC = 5.0
 """释放会话前最多等多久让 in-flight 命令结束。超过就强行 stop（宁可命令失败，
@@ -548,6 +643,18 @@ class SessionManager:
             self._command_timeout = DEFAULT_COMMAND_TIMEOUT_SEC
         self._start_timeout = max(START_TIMEOUT_FLOOR_SEC, self._command_timeout)
 
+        # 可恢复启动（request_id 协议）。两个字段一起决定"这次要不要带令牌建会话"：
+        #
+        #   _enable_request_id：用户配置。关掉它 = 完全回到旧行为（少两条命令）。
+        #   _request_protocol：能力探测结果，**每进程只探一次**（None = 还没探）。
+        #
+        # 拆成两个是有意的：配置关掉与 bsk 不支持都会退回旧行为，但原因不同，
+        # 日志与计数器也必须能区分开（排查"为什么没有可恢复启动"时全靠它）。
+        self._enable_request_id = bool(
+            _setting(settings, "enable_request_id", True)
+        )
+        self._request_protocol: bool | None = None
+
         self._entries: dict[str, _Entry] = {}
         self._registry_lock = asyncio.Lock()
         """只保护 ``_entries`` 字典的增删（内部不含长 await），
@@ -578,6 +685,23 @@ class SessionManager:
             "stop_retries": 0,
             "stop_recovered": 0,
             "stop_retry_budget_skips": 0,
+            # --- 可恢复启动的可观测性（见 _start_into / _recover_by_request）---
+            #
+            # request_protocol_unsupported：bsk 不支持 session request（老版本）。
+            # request_protocol_disabled：用户把 enable_request_id 关掉了。
+            #     上面两个都只是"退回旧行为"，不是错误。
+            # request_write_ahead_failed：令牌写不进 journal → 这次不带令牌启动。
+            # request_start_failed：带着令牌的 start 失败了（回执丢失的高危时刻）。
+            # request_cancelled：start 被 bsk 回复 cancelled（刻意抑制，不重试）。
+            # request_claim_failed：start 成功但 claim 失败。
+            # request_orphans_cancelled：recover_orphans 里靠令牌回收掉的遗留请求。
+            "request_protocol_unsupported": 0,
+            "request_protocol_disabled": 0,
+            "request_write_ahead_failed": 0,
+            "request_start_failed": 0,
+            "request_cancelled": 0,
+            "request_claim_failed": 0,
+            "request_orphans_cancelled": 0,
         }
         self._recent_stop_errors: list[str] = []
 
@@ -849,6 +973,11 @@ class SessionManager:
         if not recorded:
             return 0
 
+        # --- 第一轮：按令牌回收（老路径结构上覆盖不到的那一类）---
+        # 必须在 _list_live_sessions() 之前：只有令牌、没有 session_id 的记录
+        # 靠下面的 session_id 比对永远匹配不上。
+        recorded, token_stopped = await self._recover_by_request(recorded)
+
         # --- 问 daemon 现在有哪些会话 ---
         try:
             live = await self._list_live_sessions()
@@ -859,10 +988,10 @@ class SessionManager:
 
         if live is None:
             self._journal_clear()
-            return 0
+            return token_stopped
 
         # --- 逐条比对，只停自己的 ---
-        stopped = 0
+        stopped = token_stopped
         skipped = 0
         for entry in recorded:
             matches = live.get(entry.session_id)
@@ -893,6 +1022,64 @@ class SessionManager:
         # 留着只会让每次启动都重复做同一轮无用功。
         self._journal_clear()
         return stopped
+
+    async def _recover_by_request(
+        self, recorded: list[JournalEntry]
+    ) -> tuple[list[JournalEntry], int]:
+        """按令牌回收上一轮留下的请求，返回（仍需走老路径的记录，已停掉的数量）。
+
+        覆盖老路径**结构上覆盖不到**的那一类：上次进程连 session_id 都没收到
+        （journal 里只有令牌、session_id 为空）—— 那种记录靠 session_id 比对
+        永远匹配不上，只能凭令牌去问 daemon。
+
+        每个分支的取舍：
+
+        - 问不到（``None``）→ 保留：daemon 没跑/超时/输出不是 JSON 都只是
+          "我们不知道"，不知道就不能删记录；
+        - 活着（``LIVE_REQUEST_STATES``）→ 去 cancel。**只有确认关掉了**
+          （``_cancel_request`` 返回 True）才删记录并计数；没确认就保留，
+          留给下次启动重试；
+        - 终态（``TERMINAL_REQUEST_STATES``）→ 窗口确定不在，直接删记录；
+        - ``"unknown"`` → 交给老路径（daemon 说没见过这个请求，但记录里可能
+          还有 session_id 那条线索可用）。
+
+        绝不抛异常：它跑在插件启动路径上。
+        """
+        tokens = [e.request_id for e in recorded if e.request_id]
+        if not tokens:
+            return recorded, 0
+        # 老 bsk 整轮跳过。探测本身每进程只做一次（结果被缓存），
+        # 所以这里不会给启动路径增加额外的子进程开销。
+        if not await self._request_protocol_supported():
+            return recorded, 0
+
+        remaining: list[JournalEntry] = []
+        stopped = 0
+        for entry in recorded:
+            token = entry.request_id
+            if not token:
+                remaining.append(entry)
+                continue
+            state = await self._query_request(token)
+            if state is None:
+                # 问不到 ≠ 不存在 → 保守，留给下次（也交给老路径再试一次）。
+                remaining.append(entry)
+                continue
+            if state in LIVE_REQUEST_STATES:
+                if await self._cancel_request(token):
+                    self._journal_remove_by_request(token)
+                    stopped += 1
+                    self._counters["request_orphans_cancelled"] += 1
+                else:
+                    remaining.append(entry)  # 未确认 → 保留
+                continue
+            if state in TERMINAL_REQUEST_STATES:
+                self._journal_remove_by_request(token)  # 窗口确定不在
+                continue
+            remaining.append(entry)  # unknown → 交给老路径
+        if stopped:
+            self._logger.info("按启动令牌回收了 %d 个遗留的浏览器启动请求", stopped)
+        return remaining, stopped
 
     async def _list_live_sessions(self) -> dict[str, set[int]]:
         """``bsk session list --json`` → ``{session_id: {agent_window_id, ...}}``。
@@ -1066,18 +1253,78 @@ class SessionManager:
         """
         previous_id = entry.session.session_id
         entry.session.session_id = ""
-        fresh = await self._start(start_args=start_args)
+
+        # --- 可恢复启动：写前落盘 → prepare → start --request-id → claim ---
+        #
+        # 顺序不能换。核心不变式是「**绝不带着 --request-id 发出 start，却没有
+        # 持久化的令牌**」：令牌是 start 回执丢失后唯一能把窗口找回来的东西，
+        # 落盘晚一步就等于没落。所以落盘失败时不带令牌走普通启动（= 旧行为），
+        # 而不是拒绝启动。
+        token = ""
+        if await self._request_protocol_supported():
+            token = self._new_request_token()
+            if not self._journal_add_pending(token):
+                # 裁决（见 DECISION-write-ahead-failure.md）：降级，不拒绝。
+                #   要守的不变式是「绝不带 --request-id 启动却没有持久令牌」——
+                #   既然写不进去，就不带令牌走普通启动（= 今天的行为，逐字节相同）。
+                #   拒绝启动会让"数据目录不可写"这种环境问题把整个浏览器功能瘫痪，
+                #   而既有测试 TestJournalFailureIsHarmless 明确要求会话必须照常建立。
+                self._counters["request_write_ahead_failed"] += 1
+                self._logger.warning(
+                    "启动令牌写不进 journal，这次会话将不带可恢复启动（退回旧行为）：%s",
+                    token,
+                )
+                token = ""
+            else:
+                try:
+                    await self._prepare_request(token)
+                except BaseException:
+                    # 还没发 start —— 窗口一定不存在（实测 prepare 返回 session: null）。
+                    await self._cancel_request(token)
+                    self._journal_remove_by_request(token)
+                    raise
+
+        try:
+            fresh = await self._start(start_args=start_args, request_id=token)
+        except BaseException:
+            # 必须是 BaseException（含 CancelledError）。此刻 start 的结果
+            #   **未知** —— 可能什么都没建，也可能窗口已经开出来而回执丢了。
+            #   令牌是唯一能把那个窗口找回来的东西。
+            if token:
+                self._counters["request_start_failed"] += 1
+                if await self._cancel_request(token):
+                    # 已确认窗口不在 → 记录可以删。没确认就**保留**（见下）。
+                    self._journal_remove_by_request(token)
+            raise
+
         # 立刻落盘 —— 这是整个崩溃恢复机制的起点。
         #   必须在这里（而不是等 acquire 返回后）写：从 start 成功到调用方拿到
         #   会话之间有任何一处崩溃，那个会话就已经无人知晓了。
         #   注意这条记录此时还不属于任何槽位，所以即使下面发现 entry 已被
         #   摘除，也要先把记录清掉再抛异常。
-        self._journal_add(fresh)
+        self._journal_add(
+            fresh,
+            request_id=token,
+            state=(REQUEST_STATE_PREPARED if token else ""),
+        )
         if previous_id and previous_id != fresh.session_id:
             # 这是一次"带旧 id 的重建"（``not_found`` 触发的路径不会去 stop
             # 旧会话，所以那个 id 的 journal 记录还在）。把它删掉：bsk 已经确认
             # 旧会话不存在了，留着只会让下次启动拿它去比对，白多一轮无用功。
             self._journal_remove(previous_id)
+
+        if token:
+            try:
+                await self._claim_request(token)
+            except BaseException:
+                self._counters["request_claim_failed"] += 1
+                if await self._cancel_request(token):
+                    self._journal_remove_by_request(token)
+                raise
+            # claim 成功：把 state 更新为 active（此时才真正"认领"）。
+            #   这次写失败只记日志：窗口已存在、且我们有 session_id，
+            #   旧的 v1 兜底路径仍然覆盖得住它。
+            self._journal_add(fresh, request_id=token, state=REQUEST_STATE_ACTIVE)
 
         if entry.closed:
             # 极端竞态：槽位在 start 期间被 release/reap 摘走（start 慢于
@@ -1117,16 +1364,22 @@ class SessionManager:
             await self._stop_entry(entry)
         return await self._start_into(entry, is_rebuild=True)
 
-    async def _start(self, *, start_args: Sequence[str] = ()) -> BskSession:
+    async def _start(
+        self, *, start_args: Sequence[str] = (), request_id: str = ""
+    ) -> BskSession:
         """执行 ``session start`` 并解析出会话。
 
         Args:
             start_args: 追加到命令末尾的额外参数（``--width``/``--height`` 等）。
                 正常路径传空元组；只有"显式要求带尺寸建会话"的
                 :meth:`acquire` 会一路传到这里。
+            request_id: 可恢复启动令牌。非空时追加 ``--request-id``，让 daemon
+                把这次启动与令牌绑定 —— 这正是"回执丢了也能找回窗口"的依据。
+                空串（默认）时命令行与旧实现逐字节相同。
 
         Raises:
             BskError: 启动失败，或返回里没有 session_id（协议异常）。
+            BskStartCancelled: 这次启动已被取消（``code="cancelled"``）。
         """
         args = ["session", "start", "--no-focus", "--json"]
         browser_id = await self._resolve_browser_instance()
@@ -1137,8 +1390,20 @@ class SessionManager:
             # 放在最后：位置无关（clap 不介意），但让"固定参数 → 自动选出的
             # 浏览器 → 调用方额外要求的参数"这个顺序在日志/报错里一眼可读。
             args += [str(item) for item in start_args]
+        if request_id:
+            # 排在 start_args 之后：它由本模块自己生成并保管，不是调用方参数。
+            args += ["--request-id", request_id]
 
-        result = await self._runner.run_or_raise(args, timeout=self._start_timeout)
+        try:
+            result = await self._runner.run_or_raise(args, timeout=self._start_timeout)
+        except BskError as exc:
+            # T6：cancelled 是"已按调用方的要求抑制"的成功语义，必须显式识别。
+            #   重试会被同一条墓碑再次拒绝；回退到不带 --request-id 的普通 start
+            #   则会绕开取消，开出一个没有任何所有权凭据保护的窗口。
+            if is_cancelled_error(exc):
+                self._counters["request_cancelled"] += 1
+                raise _cancelled_from(exc) from exc
+            raise
         session = BskSession.from_json(result.data)
         if not session.is_valid():
             raise BskProtocolError(
@@ -1153,6 +1418,209 @@ class SessionManager:
             session.browser_instance_id or browser_id or "默认",
         )
         return session
+
+    # ------------------------------------------------------------------
+    # 内部：可恢复启动（request_id 协议）
+    #
+    # 协议本身只有四条命令，且都不开窗口、不导航，只改 daemon 侧的记账：
+    #
+    #     prepare  预约令牌（返回 session: null）
+    #     start --request-id <令牌>   真正的启动，窗口在这里才出现
+    #     claim    认领：此后不再被 daemon 的到期回收关掉
+    #     cancel   立墓碑并关掉可能的窗口
+    #
+    # 分工见 ``_start_into``；本节的每个方法都刻意把失败语义写清楚 ——
+    # 它们在"start 回执已经丢了"这种最需要确定性的时刻被调用。
+    # ------------------------------------------------------------------
+
+    def _new_request_token(self) -> str:
+        """生成 bsk 可恢复启动令牌：``<到期-unix-毫秒>:<UUID>``。
+
+        格式由 bsk 决定（实测 ``1791240198465:95861217-...``），两处细节都不能错：
+        到期时间**必须是 Unix 毫秒**（写成秒会立刻过期）；
+        UUID 用随机值 —— **每次启动都必须新生成，绝不复用**（复用会让第二次 start
+        返回第一次的会话，随后的 cancel 会关掉用户正在用的窗口）。
+        """
+        ttl = min(
+            REQUEST_TOKEN_TTL_MAX_SEC,
+            max(REQUEST_TOKEN_TTL_SEC, 2 * self._start_timeout + REQUEST_TOKEN_TTL_MARGIN_SEC),
+        )
+        return f"{int((time.time() + ttl) * 1000)}:{uuid.uuid4()}"
+
+    async def _request_protocol_supported(self) -> bool:
+        """本次运行是否支持 bsk 的可恢复启动。**每进程只探测一次**。
+
+        探测用 ``bsk session request --help``：零副作用、不碰 daemon 状态，
+        老 bsk 会以非零退出码拒绝这个子命令 —— 那就是"不支持"。
+        **绝不能因为探测失败就让插件报错**：bsk 没装、版本老、临时抽风，
+        都只是"退回旧行为"，旧行为本来就是今天的行为。
+        """
+        if not self._enable_request_id:
+            self._counters["request_protocol_disabled"] += 1
+            self._logger.info(
+                "配置里关闭了可恢复启动（enable_request_id=false），"
+                "会话将按旧方式建立（不带启动令牌）"
+            )
+            return False
+        if self._request_protocol is None:
+            self._request_protocol = await self._probe_request_protocol()
+            if self._request_protocol:
+                self._logger.debug("bsk 支持可恢复启动（session request --prepare 可用）")
+            else:
+                self._counters["request_protocol_unsupported"] += 1
+                self._logger.warning(
+                    "当前 bsk 不支持可恢复启动（session request 子命令不可用），"
+                    "本次运行退回旧行为：浏览器会话照常建立，但启动回执丢失时"
+                    "无法凭令牌找回窗口。把 bsk 升级到最新版即可恢复这层保护。"
+                )
+        return self._request_protocol
+
+    async def _probe_request_protocol(self) -> bool:
+        """真正跑一次能力探测。任何失败都只是"不支持"，绝不抛异常。"""
+        try:
+            result = await self._runner.run_or_raise(
+                ["session", "request", "--help"],
+                timeout=REQUEST_PROBE_TIMEOUT_SEC,
+                expect_json=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - 老 bsk 会以非零码拒绝，bsk 没装也会抛
+            self._logger.debug("bsk 不支持 session request（能力探测失败）：%r", exc)
+            return False
+        return "--prepare" in (result.stdout or "")
+
+    async def _request_command(
+        self, args: list[str], *, request_id: str
+    ) -> dict[str, Any]:
+        """跑一条 ``session request`` 命令并解析 JSON。失败抛 BskError。"""
+        try:
+            result = await self._runner.run_or_raise(
+                args, timeout=REQUEST_PROTOCOL_TIMEOUT_SEC
+            )
+        except BskSessionGone as exc:
+            # 令牌不存在（实测退出码 1）。绝不能让 BskSessionGone 冒到 execute() 的
+            # 重建逻辑里 —— 那会去重建一个本不该存在的会话。
+            raise BskError(
+                f"启动令牌不存在或已过期：{request_id}（{exc}）",
+                friendly=(
+                    "这次可恢复启动的令牌在后台服务里查不到（可能已过期或已被清理）。"
+                    "请重新发起一次浏览器操作。"
+                ),
+                code="request_not_found",
+                exit_code=getattr(exc, "exit_code", -1),
+                reason=getattr(exc, "reason", ""),
+            ) from exc
+        except BskError as exc:
+            if is_cancelled_error(exc):
+                # 统一的翻译点：cancelled 在四条命令里含义一致（已被抑制）。
+                raise _cancelled_from(exc) from exc
+            raise
+        data = result.data
+        if not isinstance(data, dict):
+            raise BskProtocolError(
+                f"session request 未返回 JSON 对象：{(result.stdout or '')[:200]}",
+                friendly=(
+                    "bsk 命令行与后台服务版本不匹配，无法使用可恢复启动。"
+                    "请把 bsk 与本插件都升级到最新版。"
+                ),
+                code="request_bad_payload",
+                exit_code=result.exit_code,
+            )
+        return data
+
+    async def _prepare_request(self, request_id: str) -> None:
+        """``session request <令牌> --prepare``：在 daemon 里预约一次启动。
+
+        这一步**不开任何窗口**（实测返回 ``session: null``），它的价值是让 daemon
+        先认下令牌 —— 之后 start 的回执即使丢了，也能凭令牌反查出那次启动造出的会话。
+        """
+        data = await self._request_command(
+            ["session", "request", request_id, "--prepare", "--json"],
+            request_id=request_id,
+        )
+        state = _as_str(data.get("state"))
+        if state != REQUEST_STATE_PREPARED:
+            raise BskError(
+                f"session request --prepare 返回了意外的状态：{state or '(空)'}",
+                friendly=(
+                    "bsk 命令行与后台服务版本不匹配，无法准备可恢复启动。"
+                    "请把 bsk 与本插件都升级到最新版。"
+                ),
+                code="request_prepare_failed",
+            )
+
+    async def _claim_request(self, request_id: str) -> None:
+        """``--claim``：把这次启动**认领**下来，从此它不再被 daemon 的到期回收关掉。"""
+        data = await self._request_command(
+            ["session", "request", request_id, "--claim", "--json"],
+            request_id=request_id,
+        )
+        state = _as_str(data.get("state"))
+        if state != REQUEST_STATE_ACTIVE:
+            raise BskError(
+                f"session request --claim 返回了意外的状态：{state or '(空)'}",
+                friendly=(
+                    "bsk 命令行与后台服务版本不匹配，无法确认这次浏览器启动的所有权。"
+                    "请把 bsk 与本插件都升级到最新版。"
+                ),
+                code="request_claim_failed",
+            )
+
+    async def _cancel_request(self, request_id: str) -> bool:
+        """``--cancel``：立墓碑并关掉可能的窗口。**绝不抛异常**（清理路径铁律）。
+
+        Returns:
+            True 表示**已确认窗口不在**（``state == "closed"`` 且 ``cleanup_error`` 为空）；
+            False 表示没确认 —— 调用方**必须保留 journal 记录**，留给下次启动重试。
+        """
+        if not request_id:
+            return False
+        try:
+            data = await self._request_command(
+                ["session", "request", request_id, "--cancel", "--json"],
+                request_id=request_id,
+            )
+        except BaseException as exc:  # noqa: BLE001 - 含 CancelledError，这是刻意的
+            # 它只从错误路径调用，调用方会原样重抛原始异常；这里吞掉一切是为了
+            # 保证"补偿动作本身"永远不会把真正的失败原因盖掉。
+            self._logger.warning(
+                "取消启动请求 %s 失败，保留 journal 记录待下次启动重试：%r",
+                request_id,
+                exc,
+            )
+            return False
+        state = _as_str(data.get("state"))
+        cleanup_error = data.get("cleanup_error")
+        if state == REQUEST_STATE_CLOSED and not cleanup_error:
+            self._logger.debug("启动请求 %s 已取消（确认窗口不在）", request_id)
+            return True
+        self._logger.warning(
+            "启动请求 %s 未确认已关闭（state=%s, cleanup_error=%r），"
+            "保留 journal 记录待下次启动重试",
+            request_id,
+            state or "(空)",
+            cleanup_error,
+        )
+        return False
+
+    async def _query_request(self, request_id: str) -> str | None:
+        """查令牌当前状态。**问不到返回 None**（绝不抛）。
+
+        ``None`` 与 ``"unknown"`` 是两回事：
+        - ``"unknown"``：daemon 明确回答"没见过这个请求"（实测 exit 0）；
+        - ``None``：我们没问着（daemon 没跑、超时、输出不是 JSON）。
+        前者的信息是确定的，后者必须保守（保留记录）。
+        """
+        if not request_id:
+            return None
+        try:
+            data = await self._request_command(
+                ["session", "request", request_id, "--json"], request_id=request_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 启动路径上跑的，不该吞取消
+            self._logger.debug("查询启动请求 %s 状态失败：%r", request_id, exc)
+            return None
+        state = _as_str(data.get("state"))
+        return state or None
 
     async def _resolve_browser_instance(self) -> str:
         """决定 ``session start`` 要指定哪个浏览器。
@@ -1566,8 +2034,21 @@ class SessionManager:
     # 让浏览器操作失败。
     # ------------------------------------------------------------------
 
-    def _journal_add(self, session: BskSession) -> None:
-        """把一个刚建成的会话记进 journal。任何失败都只记 debug 日志。"""
+    def _journal_add(
+        self, session: BskSession, *, request_id: str = "", state: str = ""
+    ) -> None:
+        """把一个刚建成的会话记进 journal。任何失败都只记 debug 日志。
+
+        Args:
+            session: 刚建成的会话（``session_id`` 为空时是空操作）。
+            request_id: 可恢复启动令牌（v2）。空串表示这次是普通启动。
+            state: 这条记录处于哪一步（v2）。空串表示"没有状态概念"。
+
+        Note:
+            刻意用 ``add`` 而不是 ``add_checked``：走到这里窗口**已经存在**了，
+            写失败也已无可挽回（我们手里已有 session_id，旧的比对路径覆盖得住）。
+            需要"写不进去就不发 start"的调用点用 :meth:`_journal_add_pending`。
+        """
         if self._journal is None or not session.session_id:
             return
         try:
@@ -1579,10 +2060,65 @@ class SessionManager:
                     # 墙钟，不是 monotonic：这条记录要跨进程读。
                     created_at=now_seconds(),
                     pid=os.getpid(),
+                    request_id=request_id,
+                    state=state,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - 只影响可恢复性，不影响本次会话
             self._logger.debug("写会话 journal 失败（忽略）：%r", exc)
+
+    def _journal_add_pending(self, request_id: str) -> bool:
+        """**写前落盘**：在发出任何浏览器副作用之前，先把令牌记下来。
+
+        Returns:
+            True 表示"可以继续"：要么已确实落盘，要么**根本没有 journal**
+            （那种配置下记录本来就没处放，跨进程恢复本来就不存在，
+            不该因此拒绝启动）。False 表示**有 journal 但写失败**。
+        """
+        if not REQUEST_TOKEN_RE.match(request_id or ""):
+            self._logger.warning(
+                "拒绝把格式非法的启动令牌写进 journal：%r（这通常意味着插件有 bug）",
+                request_id,
+            )
+            return False
+        if self._journal is None:
+            self._logger.debug(
+                "没有配置 journal，启动令牌 %s 无处落盘（跨进程恢复本就不存在）",
+                request_id,
+            )
+            return True
+        try:
+            ok = bool(
+                self._journal.add_checked(
+                    JournalEntry(
+                        # 这一步还不知道 session_id，只有令牌 —— 这正是 v2 记录
+                        # 存在的意义（journal 的 _dedup_key 优先用令牌去重，
+                        # 所以两条并发启动的 pending 记录不会互相覆盖）。
+                        session_id="",
+                        browser_instance_id="",
+                        agent_window_id=0,
+                        created_at=now_seconds(),
+                        pid=os.getpid(),
+                        request_id=request_id,
+                        state=REQUEST_STATE_PREPARED,
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - duck-typed journal 可能没有 add_checked
+            self._logger.warning("写启动令牌到 journal 失败：%r", exc)
+            return False
+        if not ok:
+            self._logger.debug("journal.add_checked 报告写入失败：%s", request_id)
+        return ok
+
+    def _journal_remove_by_request(self, request_id: str) -> None:
+        """按令牌删记录。空串 no-op；任何异常只记 debug（清理路径绝不抛）。"""
+        if self._journal is None or not request_id:
+            return
+        try:
+            self._journal.remove_by_request(request_id)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("按令牌清理 journal 记录失败（忽略）：%r", exc)
 
     def _journal_remove(self, session_id: str) -> None:
         """会话已被正常停掉，从 journal 里移除它的记录。"""
