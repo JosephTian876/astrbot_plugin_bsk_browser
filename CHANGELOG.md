@@ -4,7 +4,7 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0] - 2026-10-06
+## [0.3.0] - 2026-10-07
 
 对齐腾讯 BrowserSkill 的 DSH 插件形态：把工具按能力拆成 8 个多动作主工具（合计 57 个 action），
 把最大的那个改成按需加载，给旧工具分了两级开关，并补上可恢复启动。
@@ -147,6 +147,43 @@
 - **`bsk_evaluate`（执行任意 JS）是本插件独有的**：DSH 不暴露它，因此新工具里
   没有对应替代。风险由独立开关（`enable_evaluate`）与强制管理员双重门控
 
+## [0.2.0] - 2026-10-06
+
+对齐腾讯 BrowserSkill 的 DSH 插件形态：新增 6 个多动作主工具（合计 33 个 action），
+旧版 8 个单动作工具全部保留、由 `legacy_tools` 开关控制。
+
+这一版是**首个进插件市场的版本**（0.1.1 只修了审核拒绝项，未提交市场）。
+当时的形态是「6 个主工具 + 8 个旧工具」，`bsk_inspect` 自带 24 个调试子动作，
+工具块约 18914 字符/轮。
+
+### 新增
+
+- **6 个多动作主工具（共 33 个 action）**，参数名与 action 名均与参考实现一致：
+  `bsk_session`（3）、`bsk_page`（5）、`bsk_inspect`（7，含 debug 的 24 个子动作）、
+  `bsk_interact`（9）、`bsk_tabs`（6）、`bsk_assist`（3）
+- **`legacy_tools` 配置项（默认 `true`）**：控制是否同时注册旧版 8 个工具
+- **架构图** `docs/architecture.{html,png,json}`，并在 README 顶部嵌入
+
+### 修复
+
+本版移植过程中用真机实测逐条核对了参考实现的行为，因此下面的多数条目不是新代码
+自带的缺陷，而是**照抄推理、没有实测**留下的错误 —— 单测全绿时它们依然存在：
+
+- **`scroll-to` 完全不可用**：action 键名在下划线与连字符之间不一致，掉进了错误分支
+- **`tab_id` 在 8/10 个 action 上被静默丢弃**：模型指定了标签页，命令却打在另一个标签上
+- **`completion_criteria` 三层键名不一致**，导致 `request-help` 完全失效
+- **`debug` 的 `replay` / `rule_*` 在"上次结果不确定"时仍会执行**（安全分级错误）
+- **`debug_action=wait` 超时倒挂**：合法的 60 秒等待会被自己的 60 秒外层超时掐死
+- **`observe` 的 `cursor` / `max_depth` / `max_tokens` / `tab_id` 被丢弃**
+- **`console` 的 Unix 毫秒时间戳让渲染抛 `OSError`**
+- **截图落点出现重复的 `shots` 层级**
+- 若干文档事实错误（工具数、用例数、自检项数）
+
+### 变更
+
+- `bsk_session` 的 `request_id` 参数在 0.1.x 曾被移除（不支持的能力不暴露），
+  本版仍未加回 —— 它在 0.3.0 里以另一种形态落地（见该版"新增"）
+
 ## [0.1.1] - 2026-10-05
 
 修复插件市场 LLM Guard 审核拒绝的两项问题。本次发布不含功能变更。
@@ -249,6 +286,7 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   清理永远返回 0
 - **权限提示与实现相反**：配置校验说白名单「不生效」，实际是白名单优先
 
+[0.3.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.2.0
 [0.1.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.1
 [0.1.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.0

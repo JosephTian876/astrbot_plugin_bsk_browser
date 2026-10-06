@@ -43,5 +43,5 @@ desc: |
   本项目采用 MIT OR AGPL-3.0-or-later 双许可发布。
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_bsk_browser
-version: 0.2.0
+version: 0.3.0
 astrbot_version: ">=4.16"

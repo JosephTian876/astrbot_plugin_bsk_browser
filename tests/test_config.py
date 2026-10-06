@@ -751,7 +751,7 @@ class TestMetadataFile(unittest.TestCase):
     def test_version_is_semver_like(self) -> None:
         # 刻意钉死具体版本号：市场端对 metadata.yaml 的 version 与已提交版本记录
         # 做精确相等校验，改版本必须是有意识的动作，不能让任何 x.y.z 静默通过。
-        self.assertEqual(self.meta["version"], "0.2.0")
+        self.assertEqual(self.meta["version"], "0.3.0")
 
 
 if __name__ == "__main__":
