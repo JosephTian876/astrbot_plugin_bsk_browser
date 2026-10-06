@@ -44,6 +44,7 @@ __all__ = [
     "DEFAULT_FULLPAGE_TIMEOUT_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
     "DEFAULT_JOURNAL_PATH",
+    "DEFAULT_LEGACY_FRINGE_TOOLS",
     "DEFAULT_LEGACY_TOOLS",
     "DEFAULT_MAX_PAGE_CHARS",
     "DEFAULT_MAX_SESSIONS",
@@ -93,6 +94,34 @@ DEFAULT_LEGACY_TOOLS = True
 
 注意：``bsk_evaluate`` 不受本开关影响 —— 它有独立的
 ``enable_evaluate``，是高风险工具，语义不同。
+
+本项关掉时会把**全部** 8 个旧工具停掉，包括常用且没有替代品的
+``bsk_status`` / ``bsk_close`` / ``bsk_screenshot`` / ``bsk_logs``。
+只想去掉那 3 个"有新工具等价替代"的罕见工具，请保持本项开启，
+改关 :data:`DEFAULT_LEGACY_FRINGE_TOOLS`。
+"""
+
+DEFAULT_LEGACY_FRINGE_TOOLS = False
+"""是否同时注册旧版工具里的「罕见」那三个（``bsk_open``/``bsk_read``/``bsk_act``）。
+
+**只在 ``legacy_tools=true`` 时才有意义**：``legacy_tools=false`` 会把 8 个旧工具
+全部停掉，那时本项填什么都不影响结果。
+
+默认 **False**，即默认不注册这三个。理由是它们各自都有等价的新工具
+（``bsk_open`` → ``bsk_page``/``bsk_session``、``bsk_read`` → ``bsk_inspect``、
+``bsk_act`` → ``bsk_interact``），而且它们的 docstring 早已写明
+"兼容保留，新用法请优先用新工具"。所以关掉它们不会失去任何能力，
+只是让仍在用旧写法的 prompt 失效 —— 需要那三个名字的用户把它改成 True 即可。
+
+代价/收益：关掉后每轮对话少带 3 份工具说明（实测 anthropic 路径约 1818 字符，
+见 README 的实测表），模型不再能调用 ``bsk_open`` / ``bsk_read`` / ``bsk_act``。
+
+与 ``legacy_tools`` 的分工：后者管的是"旧工具整体要不要"，本项管的是
+"旧工具里最没用的那一小撮要不要"。常用且**没有替代品**的 4 个
+（``bsk_status`` 诊断、``bsk_close`` 关会话、``bsk_screenshot`` 唯一能发图的截图、
+``bsk_logs`` 读日志）刻意归在常驻组，只要 ``legacy_tools=true`` 就一定注册。
+
+不受本项影响：``bsk_evaluate``（有独立的 ``enable_evaluate``）。
 """
 
 DEFAULT_ENABLE_REQUEST_ID = True
@@ -601,6 +630,9 @@ class Settings:
 
     默认 ``True``（向后兼容）。关掉后只注册 6 个多动作工具，
     可省下约 3612 字符的 prompt —— 代价是模型不能再调用旧工具名。
+    但它会**连带停掉**常用的 ``bsk_status`` / ``bsk_close`` /
+    ``bsk_screenshot`` / ``bsk_logs``，只想去掉罕见的那三个请改关
+    :attr:`legacy_fringe_tools`。
 
     不受本项影响：``bsk_evaluate``（有独立的 ``enable_evaluate``）。
     """
@@ -688,6 +720,20 @@ class Settings:
     找回并关掉那个窗口"这层保护；关掉即完全回到旧行为。
 
     详见 :data:`DEFAULT_ENABLE_REQUEST_ID`。
+    """
+
+    legacy_fringe_tools: bool
+    """是否同时注册旧版工具里的「罕见」那三个。
+    （``bsk_open`` / ``bsk_read`` / ``bsk_act``，默认 ``False``。）
+
+    **只在 :attr:`legacy_tools` 为 True 时才有意义** —— 后者关掉会把 8 个旧工具
+    全部停掉，本项填什么都不影响结果。
+
+    这三个都有等价的新工具，默认不注册可省约 1818 字符的 prompt。
+    常用且无替代品的 4 个（``bsk_status`` / ``bsk_close`` / ``bsk_screenshot`` /
+    ``bsk_logs``）归常驻组，不受本项影响；``bsk_evaluate`` 有独立开关，同样不受影响。
+
+    详见 :data:`DEFAULT_LEGACY_FRINGE_TOOLS`。
     """
 
 
@@ -781,6 +827,12 @@ def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
         ),
         enable_request_id=_as_bool(
             raw.get("enable_request_id"), DEFAULT_ENABLE_REQUEST_ID
+        ),
+        # 默认 False 意味着"用户没填这一项"与"用户明确关掉"是同一个结果：
+        # 那三个罕见旧工具的等价替代早就有了，新装/升级的用户不该默认背上
+        # 这份 prompt 开销。它与 legacy_tools 的组合语义由 main.py 落地。
+        legacy_fringe_tools=_as_bool(
+            raw.get("legacy_fringe_tools"), DEFAULT_LEGACY_FRINGE_TOOLS
         ),
     )
 

@@ -68,12 +68,36 @@ LOGS_LABELS: dict[str, str] = {
     "network": "网络请求",
 }
 
-# 8 个旧工具的名字。``legacy_tools=false`` 时它们会被停用（见
-# ``_deactivate_legacy_tools``），顺序与 main.py 里定义的先后一致。
+# 8 个旧工具的名字，按用途分成两组。``legacy_tools=false`` 时两组一起停用
+# （见 ``_deactivate_legacy_tools``）；``legacy_tools=true`` 且
+# ``legacy_fringe_tools=false`` 时只停用 fringe 那一组。
 #
-# ``bsk_evaluate`` 在名单里，但停用时会被跳过：它是**独立的高危开关**
-# （``enable_evaluate``），把它绑到 ``legacy_tools`` 上会让用户误以为
-# "关掉旧工具"就等于"关掉执行脚本"，而实际上它是被另一项控制的。
+# 分组依据是"有没有等价的新工具"，以及"日常用不用得上"：
+#
+# - core：常用且**没有**等价替代的 4 个。``bsk_status`` 是本插件唯一的诊断入口；
+#   ``bsk_close`` 关会话；``bsk_screenshot`` 是**唯一能把图片直接发给用户**的截图
+#   （``bsk_inspect`` 的 screenshot 返回的是文件路径，模型看不到图）；
+#   ``bsk_logs`` 读控制台/网络日志。
+# - fringe：都有等价新工具，只是名字不同（``bsk_open`` → ``bsk_page``/``bsk_session``、
+#   ``bsk_read`` → ``bsk_inspect``、``bsk_act`` → ``bsk_interact``），所以默认不注册，
+#   省下约 1818 字符的固定 prompt 开销；仍在用旧名字的用户可以打开配置项找回它们。
+#
+# ``bsk_evaluate`` 在两个元组的**并集**里，但停用时会被跳过：它是**独立的高危开关**
+# （``enable_evaluate``），把它绑到 ``legacy_tools``/``legacy_fringe_tools`` 上会让
+# 用户误以为"关掉旧工具"就等于"关掉执行脚本"，而实际上它是被另一项控制的。
+LEGACY_CORE_TOOL_NAMES: tuple[str, ...] = (
+    "bsk_screenshot",
+    "bsk_close",
+    "bsk_status",
+    "bsk_logs",
+)
+
+LEGACY_FRINGE_TOOL_NAMES: tuple[str, ...] = (
+    "bsk_open",
+    "bsk_read",
+    "bsk_act",
+)
+
 LEGACY_TOOL_NAMES: tuple[str, ...] = (
     "bsk_open",
     "bsk_read",
@@ -84,12 +108,23 @@ LEGACY_TOOL_NAMES: tuple[str, ...] = (
     "bsk_evaluate",
     "bsk_logs",
 )
+"""8 个旧工具的完整名单（= core + fringe + ``bsk_evaluate``），顺序与定义先后一致。
 
-# 6 个新工具的名字（schema 来自 ``bsk/tools.py`` 的 ``TOOL_SCHEMAS``）。
+保留它是为了不破坏既有引用（文档、其它检查脚本按这 8 个名字核对注册数）。
+运行时真正用来决定停用哪一组的是 :data:`LEGACY_CORE_TOOL_NAMES` 与
+:data:`LEGACY_FRINGE_TOOL_NAMES`。
+"""
+
+# 7 个新工具的名字（schema 来自 ``bsk/tools.py`` 的 ``TOOL_SCHEMAS``）。
+#
+# ``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的：调试参数有 24 个、约 3652 字符，
+# 而日常读页面（observe/snapshot/html/screenshot/console/network）用不到它们。
+# 拆开后每轮对话只为用得上的那一半付 token。
 NEW_TOOL_NAMES: tuple[str, ...] = (
     "bsk_session",
     "bsk_page",
     "bsk_inspect",
+    "bsk_debug",
     "bsk_interact",
     "bsk_tabs",
     "bsk_assist",
@@ -102,6 +137,7 @@ _ACTION_LABEL: dict[str, str] = {
     "bsk_session": "管理浏览器会话",
     "bsk_page": "页面导航",
     "bsk_inspect": "读取页面",
+    "bsk_debug": "调试与流量控制",
     "bsk_interact": "页面交互",
     "bsk_tabs": "管理标签页",
     "bsk_assist": "窗口与设备设置",
@@ -453,11 +489,21 @@ class BskBrowserPlugin(Star):
         # 在构造时对 parameters 做的是**快照**，不是实时视图。
         self._apply_tool_schemas()
 
-        # 按配置决定那 8 个旧工具是否还注册。默认 true：老用户升级无感
-        # —— 若默认 false，等于**静默删掉** 8 个工具，正在用旧写法的用户
-        # 会在毫无预兆的情况下发现工具"没了"。
+        # 旧工具分两级开关：
+        #
+        # - ``legacy_tools=false``：8 个旧工具全部停用（只剩 6 个新工具 +
+        #   ``bsk_evaluate`` 若它自己的开关也开着）。默认 true：老用户升级无感
+        #   —— 若默认 false，等于**静默删掉** 8 个工具。
+        # - ``legacy_tools=true`` 且 ``legacy_fringe_tools=false``（后者的默认值）：
+        #   只停用有等价新工具的那 3 个（``bsk_open``/``bsk_read``/``bsk_act``），
+        #   常用且无替代品的 4 个继续注册。这样用户不必"全开或全关"。
+        #
+        # ``bsk_evaluate`` 不进任何一组，它只由 ``enable_evaluate`` 决定 —— 见
+        # ``_deactivate_legacy_tools`` 里的跳过分支。
         if not self.settings.legacy_tools:
             self._deactivate_legacy_tools()
+        elif not self.settings.legacy_fringe_tools:
+            self._deactivate_legacy_tools(fringe_only=True)
 
         astrbot_logger.info(
             "[bsk_browser] 已加载。bsk 路径=%s，最大会话=%d，仅管理员=%s",
@@ -537,8 +583,14 @@ class BskBrowserPlugin(Star):
                     name,
                 )
 
-    def _deactivate_legacy_tools(self) -> None:
-        """按配置停用 8 个旧工具（``bsk_evaluate`` 除外，它有自己的开关）。
+    def _deactivate_legacy_tools(self, *, fringe_only: bool = False) -> None:
+        """停用旧工具（``bsk_evaluate`` 除外，它有自己的开关）。
+
+        Args:
+            fringe_only: ``False``（默认）停用**全部** 8 个旧工具
+                （``legacy_tools=false`` 走这条）；``True`` 只停用 fringe 那一组
+                的 3 个（``legacy_tools=true`` 且 ``legacy_fringe_tools=false``
+                走这条），core 那 4 个保持注册。
 
         为什么直接设 ``tool.active = False`` 而不是调框架的
         ``deactivate_llm_tool_async``：后者会把这个名字写进**持久化**的
@@ -558,7 +610,8 @@ class BskBrowserPlugin(Star):
         """
         from astrbot.core.provider.register import llm_tools
 
-        for name in LEGACY_TOOL_NAMES:
+        names = LEGACY_FRINGE_TOOL_NAMES if fringe_only else LEGACY_TOOL_NAMES
+        for name in names:
             if name == "bsk_evaluate":
                 # 它有自己的开关（enable_evaluate）且是独立的高危工具，
                 # 不该跟着"旧工具"一起被关掉，见 LEGACY_TOOL_NAMES 的注释。
@@ -771,18 +824,18 @@ class BskBrowserPlugin(Star):
         return message
 
     # ------------------------------------------------------------------
-    # 六个新工具：统一入口 _dispatch
+    # 七个新工具：统一入口 _dispatch
     # ------------------------------------------------------------------
 
     async def _dispatch(self, tool: str, event: AstrMessageEvent, raw: dict) -> str:
-        """6 个新工具的统一入口：权限门 → 参数校验 → 分派 → 包装结果。
+        """7 个新工具的统一入口：权限门 → 参数校验 → 分派 → 包装结果。
 
-        这 6 个工具的全部 handler 都只是 ``return await self._dispatch(...)``
+        这 7 个工具的全部 handler 都只是 ``return await self._dispatch(...)``
         —— 逻辑只有这一份。它们与旧工具共用同一套权限门（:meth:`_denied`，
         含 ``enabled`` / 白名单 / ``admin_only`` 三态）与同一个 ``service``。
 
         Args:
-            tool: 6 个工具名之一（``bsk_session`` … ``bsk_assist``）。
+            tool: 7 个工具名之一（``bsk_session`` … ``bsk_assist``）。
             event: 消息事件，用于权限判定。
             raw: 框架按形参名注入的原始 kwargs（**未经任何处理**）。
 
@@ -835,7 +888,7 @@ class BskBrowserPlugin(Star):
         """把校验过的参数按工具名路由到 ``service`` 的对应方法并渲染结果。
 
         Args:
-            tool: 6 个工具名之一。
+            tool: 7 个工具名之一。
             event: 用于算会话键。
             args: :func:`bsk.tools.validate` 的输出（已含规范化的 ``action``）。
 
@@ -853,7 +906,7 @@ class BskBrowserPlugin(Star):
         #    session_id；认不出来会报"不属于本插件"，不会静默打到别的会话。
         # 2. 没传 → 用本对话的会话键（既有行为，向后兼容）。
         #
-        # 为什么必须在这一层做：6 个工具的 schema 里都有 session 字段
+        # 为什么必须在这一层做：7 个工具的 schema 里都有 session 字段
         # （对齐 DSH 的参数并集），服务层每个方法的第一个参数也正是会话标识。
         # 早先只传 self._key(event)，于是模型显式指定的 session 被**静默丢弃**
         # —— 多会话场景下命令打在另一个会话上，模型无从察觉。
@@ -868,6 +921,8 @@ class BskBrowserPlugin(Star):
             return await self._run_page(key, action, args)
         if tool == "bsk_inspect":
             return await self._run_inspect(key, action, args)
+        if tool == "bsk_debug":
+            return await self._run_debug(key, args)
         if tool == "bsk_interact":
             return await self._run_interact(key, action, args)
         if tool == "bsk_tabs":
@@ -1043,8 +1098,11 @@ class BskBrowserPlugin(Star):
     # --- bsk_inspect ---------------------------------------------------
 
     async def _run_inspect(self, key: str, action: str, args: dict) -> str:
-        """bsk_inspect 的 7 个分支（observe / snapshot / html / screenshot /
-        console / network / debug）。"""
+        """bsk_inspect 的 6 个分支（observe / snapshot / html / screenshot /
+        console / network）。
+
+        ``debug`` 已拆成独立的 :meth:`_run_debug`（工具 ``bsk_debug``）。
+        """
         if action == "observe":
             return await self._run_observe(key, args)
 
@@ -1092,12 +1150,28 @@ class BskBrowserPlugin(Star):
         if action == "network":
             return await self._run_logs(key, "network", args, include_stack=False)
 
+        # 走不到这里：validate 只放行 TOOL_ACTIONS["bsk_inspect"] 的六个 action，
+        # 上面已经把六个全部分派完（debug 已拆成独立工具 bsk_debug）。
+        raise AssertionError(f"bsk_inspect 未处理的 action：{action!r}")
+
+    # --- bsk_debug -----------------------------------------------------
+
+    async def _run_debug(self, key: str, args: dict) -> str:
+        """``bsk_debug`` 的唯一分支：把调试参数转给 ``service.debug``。
+
+        这里是**整条 debug 路径的唯一实现** —— ``bsk_inspect`` 不再有 debug 分支，
+        所以不存在"两个工具各走一套逻辑"的风险。
+
+        子动作取自 ``action``：校验层已保证它与 ``debug_action`` 一致
+        （不一致会直接报错），两者本就是同一个值。
+        """
+        debug_action = str(args["action"])
         # debug：bsk 的原始 JSON 直通（TOOL-SPEC §2 的硬要求：不重映射字段）。
         # 这里只做一件事 —— 把非 JSON 的返回值也变成字符串。
         result = await self.service.debug(
-            key, args["debug_action"], **self._debug_opts(args)
+            key, debug_action, **self._debug_opts(args)
         )
-        return self._render_debug(args["debug_action"], result)
+        return self._render_debug(debug_action, result)
 
     @staticmethod
     def _debug_opts(args: dict) -> dict:
@@ -1106,8 +1180,9 @@ class BskBrowserPlugin(Star):
         这里有两处**必须**处理的形参冲突，都属于"Python 形参绑定"的硬约束
         （不是设计选择），弄错就是 ``TypeError`` 或静默丢参：
 
-        1. ``action`` 要去掉 —— 它是 ``bsk_inspect`` 的工具级 action，
-           对 ``service.debug`` 没有意义。
+        1. ``action`` 要去掉 —— 子动作已经作为 ``debug_action`` 位置参数传进
+           ``service.debug`` 了；``action`` 再留在 ``opts`` 里会被
+           DEBUG_VALUE_FLAGS 静默忽略（表里没有这一项），也就是**不报错也不生效**。
         2. ``debug_action`` 要去掉 —— ``service.debug`` 的签名是
            ``debug(self, key, debug_action, **opts)``，``debug_action`` 已经是
            **位置参数**；如果它还留在 ``opts`` 里，调用就变成
@@ -1118,7 +1193,7 @@ class BskBrowserPlugin(Star):
 
         ``tab_id`` 则**必须留着**：``service.debug`` 内部是
         ``opts.pop("tab_id", None)`` 取它的，也就是说 ``tab_id`` 走的就是
-        ``opts`` 这条路。把它滤掉会让 ``bsk_inspect(action="debug", tab_id=N)``
+        ``opts`` 这条路。把它滤掉会让 ``bsk_debug(tab_id=N)``
         静默打在别的标签上（校验层明明收下了它）——正是 REVIEW-ROUND2 的
         P0-1 那一类错误。
         """
@@ -1593,15 +1668,29 @@ class BskBrowserPlugin(Star):
 
     @filter.llm_tool("bsk_inspect")
     async def bsk_inspect(self, event: AstrMessageEvent, **kwargs):
-        """读取页面状态，必要时开始抓包调试。
+        """读取页面状态：正文、快照、HTML、截图、控制台与网络日志。
 
-        action 取 observe / snapshot / html / screenshot / console / network / debug。
+        action 取 observe / snapshot / html / screenshot / console / network。
         读页面**优先用 observe**（最常用，给出正文与 @eN 元素编号）；
         snapshot 是无游标的静态可达性树；html 取原始 HTML（有字节上限）；
         screenshot 只回文字描述、**不会把图片发给用户**；console / network 支持
-        since 游标增量读；debug 用 debug_action 控制抓包与网络规则。
+        since 游标增量读。
+        要抓包、看接口返回、控制请求流量，请改用 bsk_debug。
         """
         return await self._dispatch("bsk_inspect", event, kwargs)
+
+    @filter.llm_tool("bsk_debug")
+    async def bsk_debug(self, event: AstrMessageEvent, **kwargs):
+        """调试与网络流量控制：抓包、分析请求、导出证据、拦截或重放请求。
+
+        什么时候用：要查接口返回、慢请求、重复请求，或要拦截/改写/伪造请求时。
+        共 24 个 action（performance / aggregate / duplicates / requests /
+        request / export / rules / rule_add / replay / start / status 等），
+        由 action 指定子动作。典型顺序：先 start 开抓包，再访问页面，读结果。
+        replay 会重发请求，rule_add/rule_enable 能改写或伪造真实请求，
+        可能改动服务端数据。
+        """
+        return await self._dispatch("bsk_debug", event, kwargs)
 
     @filter.llm_tool("bsk_interact")
     async def bsk_interact(self, event: AstrMessageEvent, **kwargs):

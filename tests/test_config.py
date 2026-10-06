@@ -427,6 +427,51 @@ class TestEnableRequestId(unittest.TestCase):
                 self.assertIs(parse_settings({"enable_request_id": junk}).enable_request_id, True)
 
 
+class TestLegacyFringeTools(unittest.TestCase):
+    """``legacy_fringe_tools``（罕见旧工具开关）：默认关闭，认常见写法，垃圾值回退默认。
+
+    这一项默认必须是 ``False``：它控制的 ``bsk_open`` / ``bsk_read`` / ``bsk_act``
+    都有等价的新工具，默认注册等于让每个用户每轮对话都白付一份 prompt 开销。
+    """
+
+    def test_default_is_false(self) -> None:
+        # 默认关闭：这一项缺失时不能变成"把三个罕见旧工具也注册上"。
+        self.assertIs(parse_settings({}).legacy_fringe_tools, False)
+        self.assertIs(parse_settings(None).legacy_fringe_tools, False)
+        self.assertIs(cfg.DEFAULT_LEGACY_FRINGE_TOOLS, False)
+
+    def test_explicit_values(self) -> None:
+        # 显式开启的三种写法（布尔 / 字符串 / 数字）都要认。
+        for value in (True, "true", 1):
+            with self.subTest(value=repr(value)):
+                self.assertIs(
+                    parse_settings({"legacy_fringe_tools": value}).legacy_fringe_tools,
+                    True,
+                )
+        # 显式关闭同理。
+        for value in (False, "false", 0):
+            with self.subTest(value=repr(value)):
+                self.assertIs(
+                    parse_settings({"legacy_fringe_tools": value}).legacy_fringe_tools,
+                    False,
+                )
+
+    def test_unrecognized_falls_back_to_default(self) -> None:
+        # 认不出来的值一律回退默认（False），而不是擅自理解成 True。
+        for junk in ("maybe", "", "  ", None, [], {}):
+            with self.subTest(junk=repr(junk)):
+                self.assertIs(
+                    parse_settings({"legacy_fringe_tools": junk}).legacy_fringe_tools,
+                    False,
+                )
+
+    def test_independent_from_legacy_tools(self) -> None:
+        """两个开关各自独立解析；真正的组合语义由 main.py 落地。"""
+        s = parse_settings({"legacy_tools": False, "legacy_fringe_tools": True})
+        self.assertIs(s.legacy_tools, False)
+        self.assertIs(s.legacy_fringe_tools, True)
+
+
 class TestValidateSettings(unittest.TestCase):
     """validate_settings 报告"合法但值得提醒"的问题。"""
 

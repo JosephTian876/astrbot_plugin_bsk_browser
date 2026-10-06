@@ -1,4 +1,4 @@
-"""六个多动作工具的规格与参数校验（纯标准库、纯函数）。
+"""七个多动作工具的规格与参数校验（纯标准库、纯函数）。
 
 本模块是**工具规格的唯一事实源**：
 
@@ -69,6 +69,38 @@ class BskToolError(Exception):
 # 枚举（唯一事实源）
 # ---------------------------------------------------------------------------
 
+DEBUG_ACTIONS: tuple[str, ...] = (
+    "performance",
+    "aggregate",
+    "duplicates",
+    "capabilities",
+    "activity",
+    "wait",
+    "pin",
+    "unpin",
+    "start",
+    "stop",
+    "status",
+    "requests",
+    "request",
+    "operations",
+    "operation",
+    "console",
+    "pages",
+    "export",
+    "rules",
+    "rule_add",
+    "rule_enable",
+    "rule_disable",
+    "rule_remove",
+    "replay",
+)
+"""``bsk_debug`` 的 24 个 action（顺序与 DSH 一致）。
+
+刻意定义在 :data:`TOOL_ACTIONS` **之前**：``bsk_debug`` 的 action 元组就是它，
+引用必须能成立，否则只能事后改字典（那就不是"唯一事实源"了）。
+"""
+
 TOOL_ACTIONS: dict[str, tuple[str, ...]] = {
     "bsk_session": ("start", "stop", "list"),
     "bsk_page": ("navigate", "back", "forward", "reload", "wait"),
@@ -79,8 +111,8 @@ TOOL_ACTIONS: dict[str, tuple[str, ...]] = {
         "screenshot",
         "console",
         "network",
-        "debug",
     ),
+    "bsk_debug": DEBUG_ACTIONS,
     "bsk_interact": (
         "click",
         "hover",
@@ -122,34 +154,6 @@ TABS_SCOPE_VALUES: tuple[str, ...] = ("user", "agent", "all")
 """``bsk_tabs(scope=...)`` 的取值，默认 ``all``。"""
 
 CLICK_BUTTON_VALUES: tuple[str, ...] = ("left", "middle", "right")
-
-DEBUG_ACTIONS: tuple[str, ...] = (
-    "performance",
-    "aggregate",
-    "duplicates",
-    "capabilities",
-    "activity",
-    "wait",
-    "pin",
-    "unpin",
-    "start",
-    "stop",
-    "status",
-    "requests",
-    "request",
-    "operations",
-    "operation",
-    "console",
-    "pages",
-    "export",
-    "rules",
-    "rule_add",
-    "rule_enable",
-    "rule_disable",
-    "rule_remove",
-    "replay",
-)
-"""``bsk_inspect(action="debug")`` 的 24 个 debugAction（顺序与 DSH 一致）。"""
 
 DEBUG_PART_VALUES: tuple[str, ...] = ("metadata", "request", "response", "headers", "timing")
 DEBUG_STATE_VALUES: tuple[str, ...] = (
@@ -471,9 +475,51 @@ _DEVICE_PROP = _p("string", "设备预设名。", enum=DEVICE_PRESETS)
 _WIDTH_PROP = _p("number", "宽度（CSS 像素）。resize 时为 100..7680，且必须与 height 同时给。")
 _HEIGHT_PROP = _p("number", "高度（CSS 像素）。resize 时为 100..7680，且必须与 width 同时给。")
 
+# ``bsk_debug`` 独占的 24 个参数（``debug_action`` 也在内）。
+#
+# 为什么单独抽一张表：``bsk_inspect`` 与 ``bsk_debug`` 是**互斥**的两套参数 ——
+# 日常读页面不需要那 3652 字符的调试参数说明，用到调试时才带 ``bsk_debug``。
+# 抽表是为了让"哪些参数属于 debug"只有一处定义，两个 schema 都从这里取，
+# 也就不可能出现"拆分后某个参数两边都在/两边都没有"。
+_DEBUG_ONLY_PROPS: dict[str, Any] = {
+    "debug_action": _p(
+        "string",
+        "要执行的调试子动作的别名（与 action 同义，两者给一致的值即可，"
+        "一般只填 action 就够了）。取值 "
+        + " / ".join(DEBUG_ACTIONS)
+        + "。都要先 start 抓包，再去访问页面，最后读结果。"
+        "rule_add/rule_enable 能拦截、改写或伪造真实请求；"
+        "replay 会重新发送一次请求，可能改动服务端数据。",
+        enum=DEBUG_ACTIONS,
+    ),
+    "id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["id"]),
+    "rule": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["rule"]),
+    "replay": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["replay"]),
+    "slow_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["slow_ms"]),
+    "window_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["window_ms"]),
+    "include_controlled": _p("boolean", _DEBUG_PROPERTY_DESCRIPTIONS["include_controlled"]),
+    "budget": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["budget"]),
+    "url": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["url"]),
+    "method": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["method"]),
+    "resource_type": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["resource_type"]),
+    "status": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["status"]),
+    "state": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["state"], enum=DEBUG_STATE_VALUES),
+    "kind": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["kind"], enum=DEBUG_KIND_VALUES),
+    "fields": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["fields"]),
+    "wait_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["wait_ms"]),
+    "command_id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["command_id"]),
+    "output": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["output"]),
+    "run_id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["run_id"]),
+    "name": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["name"]),
+    "part": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["part"], enum=DEBUG_PART_VALUES),
+    "offset": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["offset"]),
+    "max_chars": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["max_chars"]),
+    "pointer": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["pointer"]),
+}
+
 
 # ---------------------------------------------------------------------------
-# 六个工具的完整 schema
+# 七个工具的完整 schema
 # ---------------------------------------------------------------------------
 
 def _schema(tool: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -532,15 +578,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
         {
             "session": _SESSION_PROP,
             "tab_id": _TAB_ID_PROP,
-            "debug_action": _p(
-                "string",
-                "debug 必填：要执行的调试子动作，取值 "
-                + " / ".join(DEBUG_ACTIONS)
-                + "。都要先 start 抓包，再去访问页面，最后读结果。"
-                "rule_add/rule_enable 能拦截、改写或伪造真实请求；"
-                "replay 会重新发送一次请求，可能改动服务端数据。",
-                enum=DEBUG_ACTIONS,
-            ),
             "cursor": _p(
                 "string",
                 "observe：继续取被省略的内容。翻页后上一页的 ref 会失效。"
@@ -555,38 +592,32 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "since": _p(
                 "number",
                 "console/network：增量游标，按 ID 去重，>=0。"
-                "debug 里 performance/aggregate/duplicates 不接受 since，请改用 offset。",
+                "要按 offset 翻页的抓包分析请用 bsk_debug。",
             ),
-            "limit": _p("number", "console/network：最多返回多少条，必须大于 0；debug 列表类为 1..100。"),
+            "limit": _p("number", "console/network：最多返回多少条，必须大于 0。"),
             "max_text_chars": _p("number", "console/network：每条文本最多多少字符，必须大于 0。"),
             "include_stack": _p("boolean", "console：是否附带结构化调用栈。"),
-            "include_controlled": _p(
-                "boolean",
-                "debug：仅 aggregate/duplicates 可用，把规则命中与重放流量也算进分析。",
-            ),
-            "id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["id"]),
-            "rule": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["rule"]),
-            "replay": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["replay"]),
-            "slow_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["slow_ms"]),
-            "window_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["window_ms"]),
-            "budget": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["budget"]),
-            "url": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["url"]),
-            "method": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["method"]),
-            "resource_type": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["resource_type"]),
-            "status": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["status"]),
-            "state": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["state"], enum=DEBUG_STATE_VALUES),
-            "kind": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["kind"], enum=DEBUG_KIND_VALUES),
-            "fields": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["fields"]),
-            "wait_ms": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["wait_ms"]),
-            "command_id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["command_id"]),
-            "output": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["output"]),
-            "run_id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["run_id"]),
-            "name": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["name"]),
-            "part": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["part"], enum=DEBUG_PART_VALUES),
-            "offset": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["offset"]),
-            "max_chars": _p("number", _DEBUG_PROPERTY_DESCRIPTIONS["max_chars"]),
-            "pointer": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["pointer"]),
             "ref": _p("string", _HTML_REF_PROP["description"] + " screenshot 也用它裁剪截图。"),
+        },
+    ),
+    "bsk_debug": _schema(
+        "bsk_debug",
+        {
+            "session": _SESSION_PROP,
+            "tab_id": _TAB_ID_PROP,
+            # since / limit 是**跨工具共用**的：bsk_inspect 的 console/network 与
+            # bsk_debug 的 console/pages 都靠它俩增量翻页（service.py 的
+            # DEBUG_VALUE_FLAGS 里有它们，_validate_debug 也按 _DEBUG_RANGES 校验）。
+            # 所以它们**不能**只挂在 bsk_inspect 上 —— 那会让 debug 的
+            # console/pages 失去游标能力，且 _validate_debug 里「since 禁用于
+            # performance/aggregate/duplicates」那条规则永远无法触发。
+            "since": _p(
+                "number",
+                "console/pages：增量游标，按 ID 去重，>=0。"
+                "performance/aggregate/duplicates 不接受 since，请改用 offset。",
+            ),
+            "limit": _p("number", "列表类 action：最多返回多少条，范围 1..100。"),
+            **_DEBUG_ONLY_PROPS,
         },
     ),
     "bsk_interact": _schema(
@@ -680,7 +711,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     ),
 }
-"""工具名 → 完整 JSON Schema（键与 :data:`TOOL_SCHEMAS` 一致，恰好 6 个）。
+"""工具名 → 完整 JSON Schema（键与 :data:`TOOL_SCHEMAS` 一致，恰好 7 个）。
 
 每个 schema 都是 ``{"type": "object", "required": ["action"], "properties": {...}}``，
 properties 是该工具**全部 action 参数的并集**。
@@ -703,12 +734,21 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "页面明显变化后要重新 observe，再复用 ref。"
     ),
     "bsk_inspect": (
-        "读取页面状态，并按需开启任务范围内的调试。action 取 observe / snapshot / html / "
-        "screenshot / console / network / debug。优先 observe，其次 snapshot，再考虑有上限的 "
-        "html；要看视觉效果用 screenshot。console/network 支持 since/limit/max_text_chars 游标。"
-        "debug 配 debug_action 可以开始/结束抓包、读取或导出证据，也能显式控制网络流量："
-        "rule_add/rule_enable 能拦截、改写或伪造真实请求，replay 会重新发送一次请求并可能改动"
-        "服务端数据。要抓证据请先开抓包，再去访问页面。"
+        "读取页面状态。action 取 observe / snapshot / html / screenshot / console / "
+        "network。优先 observe，其次 snapshot，再考虑有上限的 html；要看视觉效果用 "
+        "screenshot。console/network 支持 since/limit/max_text_chars 游标增量读。"
+        "需要抓包、网络规则、重放等调试能力时改用 bsk_debug。"
+    ),
+    "bsk_debug": (
+        "调试与网络流量控制：抓包、分析、导出证据，以及显式控制请求。"
+        "什么时候用它：要查接口返回、慢请求、重复请求，或要拦截/改写/伪造请求时。"
+        "action 取 performance / aggregate / duplicates / capabilities / activity / "
+        "wait / pin / unpin / start / stop / status / requests / request / operations / "
+        "operation / console / pages / export / rules / rule_add / rule_enable / "
+        "rule_disable / rule_remove / replay。action 就是子动作本身。"
+        "典型顺序：先 start 开抓包，再去访问页面，最后读结果。"
+        "rule_add/rule_enable 能拦截、改写或伪造真实请求；"
+        "replay 会带着用户的 cookie 重新发送一次请求，可能改动服务端数据。"
     ),
     "bsk_interact": (
         "与当前标签页交互。action 取 click / hover / wheel / scroll-to / focus / blur / fill / "
@@ -1193,6 +1233,15 @@ def _validate_inspect(ctx: _Ctx) -> dict:
     action = ctx.action
     tab_id = _check_tab_id(ctx)
 
+    # ``debug`` 已拆成独立的 ``bsk_debug`` 工具。模型如果还按旧习惯往这里传
+    # ``debug_action``，必须明确告诉它换工具 —— 只说"不认识这个参数"会让它
+    # 以为参数名写错了，然后一直重试同一个工具。
+    if ctx.given("debug_action"):
+        ctx.fail(
+            f"{ctx.where()} 不接受 debug_action：调试已拆成独立的 bsk_debug 工具，"
+            "请改用 bsk_debug（把 action 设为原来的 debug_action 取值）。"
+        )
+
     if action in ("observe", "snapshot"):
         if ctx.given("ref"):
             ctx.fail(
@@ -1248,8 +1297,9 @@ def _validate_inspect(ctx: _Ctx) -> dict:
         return {"ref": ref, "tab_id": tab_id}
 
     if action == "console":
-        # console 与 debug 共用 max_text_chars，但 debug 才用 max_chars/max_depth/max_tokens。
-        # 这里显式拒绝调试参数：它们会被静默忽略，让模型以为过滤生效了。
+        # console 只吃 since/limit/max_text_chars/include_stack。下面这些键已经
+        # 不在 bsk_inspect 的 schema 里（check_known 也会拦），但这里的消息能说清
+        # "该去哪个工具"，比"不认识参数"有用得多。
         for key in ("ref", "max_chars", "max_depth", "max_tokens", "offset", "budget",
                     "pointer", "run_id", "id", "rule", "replay", "slow_ms", "window_ms",
                     "part", "state", "kind", "fields", "wait_ms", "command_id", "output",
@@ -1257,7 +1307,7 @@ def _validate_inspect(ctx: _Ctx) -> dict:
                     "include_controlled", "debug_action"):
             if ctx.given(key):
                 ctx.fail(
-                    f"{ctx.where()} 不接受 {key}：它属于 debug 或 observe/snapshot，"
+                    f"{ctx.where()} 不接受 {key}：它属于 bsk_debug 或 observe/snapshot，"
                     "console 只支持 since / limit / max_text_chars / include_stack。"
                 )
         _check_log_controls(ctx)
@@ -1279,7 +1329,7 @@ def _validate_inspect(ctx: _Ctx) -> dict:
                     "include_controlled", "debug_action", "include_stack"):
             if ctx.given(key):
                 ctx.fail(
-                    f"{ctx.where()} 不接受 {key}：它属于 debug 或 console，"
+                    f"{ctx.where()} 不接受 {key}：它属于 bsk_debug 或 console，"
                     "network 只支持 since / limit / max_text_chars。"
                 )
         _check_log_controls(ctx)
@@ -1292,31 +1342,47 @@ def _validate_inspect(ctx: _Ctx) -> dict:
             "tab_id": tab_id,
         }
 
-    # debug
-    for key in ("cursor", "ref", "max_depth", "max_tokens", "max_bytes"):
-        if ctx.given(key):
-            ctx.fail(
-                f"{ctx.where()} 不接受 {key}；debug 有自己的一套参数，"
-                "请对照 debug_action 的说明传参。"
-            )
-    out = _validate_debug(ctx)
-    out["tab_id"] = tab_id
-    return out
+    # 走不到这里：action 必须是 TOOL_ACTIONS["bsk_inspect"] 里的六个之一，
+    # 而上面五个分支已经覆盖全部（debug 已拆成独立的 bsk_debug 工具）。
+    # 用 raise 而不是 ctx.fail：这一行同时是"函数不会返回 None"的类型保证。
+    raise BskToolError(
+        f"{ctx.where()} 不是 bsk_inspect 支持的操作；"
+        "可选值：" + " / ".join(TOOL_ACTIONS["bsk_inspect"]) + "。"
+    )
 
 
 def _validate_debug(ctx: _Ctx) -> dict:
-    """``bsk_inspect(action="debug")`` 的 24 个 action 的规则，逐条对照 DSH。"""
-    ctx.require("debug_action")
+    """``bsk_debug`` 的 24 个 action 的规则，逐条对照 DSH。
+
+    为什么整条 debug 规则链原封不动地留在这里、只是换了个入口：这些条件规则
+    （id 必填、pointer↔part、slow_ms 仅 aggregate、since 禁用于分析类、
+    rule_add↔rule、<=81920 字符……）是过去几轮实测逐条钉下来的，拆工具时
+    放松任何一条都等于把已修好的缺陷放回去。
+    """
+    # 调试子动作有两个入口，取到同一个值：
+    #
+    # - ``action``：``bsk_debug`` 的工具级 action（schema 的 enum 就是那 24 个）；
+    # - ``debug_action``：拆分前 ``bsk_inspect(action="debug")`` 的写法。保留它作
+    #   别名，是为了让已经从旧描述里学会 "debug_action" 的对话/提示词不会因为
+    #   工具拆分而整条失败 —— 但它**不再必填**，唯一的事实源是 ``action``。
+    #
+    # 两个都给且不一致时报错，不静默取其一：那会让模型以为另一个生效了。
+    if ctx.has("debug_action") and ctx.debug_action() != ctx.action:
+        ctx.fail(
+            f"{ctx.where()} 同时给了 action={ctx.action!r} 与 "
+            f"debug_action={ctx.debug_action()!r}，两者不一致；"
+            "它们是同一个东西（要执行的调试子动作），请只给 action。"
+        )
+    tab_id = _check_tab_id(ctx)
+    debug_action = ctx.action
     # ``__model__`` 是框架保留名，不是可用取值。tool 级的 action 已经显式拒绝它，
-    # 这里必须同样拒绝：否则模型可以通过 debug_action 绕过同一道检查，
-    # 两个入口的行为就会不一致。
+    # 这里再兜一道：``debug_action`` 绕过同一个名字时行为必须一致。
     if ctx.debug_action() == "__model__":
         ctx.fail(
-            f"{ctx.where()} 的 debug_action 不能是 __model__（那只是框架的内部提示符，"
+            f"{ctx.where()} 的调试子动作不能是 __model__（那只是框架的内部提示符，"
             "不是可执行操作）；可选值：" + " / ".join(DEBUG_ACTIONS) + "。"
         )
     ctx.as_enum("debug_action", DEBUG_ACTIONS)
-    debug_action = ctx.debug_action()
 
     # --- 范围（先查范围，再查条件规则：范围错时先说范围）---
     values: dict[str, int | None] = {}
@@ -1324,10 +1390,12 @@ def _validate_debug(ctx: _Ctx) -> dict:
         values[key] = ctx.as_int(key, minimum=low, maximum=high)
 
     # --- 条件规则 ---
+    # 下面每条的前半段都是 ``ctx.where()``（形如 "bsk_debug 的 action=replay"），
+    # 所以正文里只说参数名的约束，不再重复一遍 action=xxx，避免报错读起来像绕口令。
     if debug_action in ID_REQUIRED_DEBUG_ACTIONS and not ctx.has("id"):
         ctx.fail(
-            f"{ctx.where()} 的 debug_action={debug_action} 必须带 id；"
-            "request/operation/rule 的 ID 来自对应的列表类 debug_action，"
+            f"{ctx.where()} 必须带 id；"
+            "request/operation/rule 的 ID 来自对应的列表类 action，"
             "pin/unpin 与 replay 也需要它来定位对象。"
         )
     if ctx.has("id"):
@@ -1345,22 +1413,22 @@ def _validate_debug(ctx: _Ctx) -> dict:
 
     if ctx.has("slow_ms") and debug_action != "aggregate":
         ctx.fail(
-            f"{ctx.where()} 的 slow_ms 只能用于 debug_action=aggregate，"
+            f"{ctx.where()} 的 slow_ms 只能用于 action=aggregate，"
             f"当前是 {debug_action}；慢请求阈值只在聚合分析里有意义。"
         )
     if ctx.has("window_ms") and debug_action != "duplicates":
         ctx.fail(
-            f"{ctx.where()} 的 window_ms 只能用于 debug_action=duplicates，"
+            f"{ctx.where()} 的 window_ms 只能用于 action=duplicates，"
             f"当前是 {debug_action}。"
         )
     if ctx.has("include_controlled") and debug_action not in CONTROLLED_ONLY_DEBUG_ACTIONS:
         ctx.fail(
-            f"{ctx.where()} 的 include_controlled 只能用于 debug_action=aggregate 或 "
+            f"{ctx.where()} 的 include_controlled 只能用于 action=aggregate 或 "
             f"duplicates，当前是 {debug_action}。"
         )
     if ctx.has("since") and debug_action in NO_SINCE_DEBUG_ACTIONS:
         ctx.fail(
-            f"{ctx.where()} 的 debug_action={debug_action} 不接受 since，"
+            f"{ctx.where()} 不接受 since，"
             "它用 offset 翻页；请把 since 换成 offset。"
         )
 
@@ -1368,13 +1436,13 @@ def _validate_debug(ctx: _Ctx) -> dict:
     has_replay = ctx.has("replay")
     if (debug_action == "rule_add") != has_rule:
         ctx.fail(
-            f"{ctx.where()} 的 rule 与 debug_action=rule_add 必须成对出现："
-            "rule_add 必须带 rule（规则 JSON），其他 debug_action 不要带 rule。"
+            f"{ctx.where()} 的 rule 与 rule_add 必须成对出现："
+            "action=rule_add 必须带 rule（规则 JSON），其他 action 不要带 rule。"
         )
     if (debug_action == "replay") != has_replay:
         ctx.fail(
-            f"{ctx.where()} 的 replay 与 debug_action=replay 必须成对出现："
-            "replay 必须带 replay（请求 JSON），其他 debug_action 不要带 replay。"
+            f"{ctx.where()} 的 replay 与 replay 动作必须成对出现："
+            "action=replay 必须带 replay（请求 JSON），其他 action 不要带 replay。"
         )
 
     for key, label in (("rule", "rule_add 的规则"), ("replay", "replay 的请求")):
@@ -1401,7 +1469,7 @@ def _validate_debug(ctx: _Ctx) -> dict:
 
     ctx.check_known()
 
-    out: dict[str, Any] = {"debug_action": debug_action}
+    out: dict[str, Any] = {"debug_action": debug_action, "tab_id": tab_id}
     for key, value in values.items():
         if value is not None:
             out[key] = value
@@ -1898,6 +1966,7 @@ _VALIDATORS = {
     "bsk_session": _validate_session,
     "bsk_page": _validate_page,
     "bsk_inspect": _validate_inspect,
+    "bsk_debug": _validate_debug,
     "bsk_interact": _validate_interact,
     "bsk_tabs": _validate_tabs,
     "bsk_assist": _validate_assist,
@@ -1913,7 +1982,7 @@ def validate(tool_name: str, args: dict) -> dict:
     """校验并归一化某个工具的参数。
 
     Args:
-        tool_name: 六个工具名之一。
+        tool_name: 七个工具名之一。
         args: 已经过 :func:`normalize_args` 的参数（必须含 ``action``）。
 
     Returns:
@@ -1938,9 +2007,10 @@ def validate(tool_name: str, args: dict) -> dict:
             f"{tool_name} 的参数必须是对象，收到的是 {type(args).__name__}（{args!r}）。"
         )
 
-    # ``debug_action`` 不是工具级的 action，但同样接受下划线写法；
+    # ``debug_action`` 是拆分前 ``bsk_inspect(action="debug")` 的旧写法，在
+    # ``bsk_debug`` 上保留为 ``action`` 的别名；同样接受下划线写法。
     # 先归一，后续的条件规则才敢直接和 DEBUG_ACTIONS 里的字面值比。
-    if tool_name == "bsk_inspect":
+    if tool_name == "bsk_debug":
         raw_debug = args.get("debug_action")
         if isinstance(raw_debug, str):
             raw_debug = raw_debug.strip().lower().replace("-", "_")
@@ -1963,6 +2033,15 @@ def validate(tool_name: str, args: dict) -> dict:
 
     canonical = _ACTION_ALIASES.get(ctx.action, ctx.action)
     if canonical not in TOOL_ACTIONS[tool_name]:
+        # 旧写法 ``bsk_inspect(action="debug")`` 单独给一条指向新工具的提示。
+        # 泛泛地说"取值不对"会让模型以为名字写错了，然后反复重试同一个工具；
+        # 明确告诉它"调试已经搬到 bsk_debug"，它下一次调用就能成功。
+        if canonical == "debug":
+            raise BskToolError(
+                f"{tool_name} 的 action 不再接受 debug：调试已拆成独立的 bsk_debug 工具，"
+                "请改用 bsk_debug（把 action 设为原来的 debug_action 取值，例如 "
+                "bsk_debug 的 action=\"capabilities\"）。"
+            )
         raise BskToolError(
             f"{tool_name} 的 action 必须是 "
             + "/".join(TOOL_ACTIONS[tool_name])

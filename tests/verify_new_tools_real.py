@@ -1,8 +1,11 @@
-"""真机实测：6 个新工具（33 个 action）在真实 AstrBot + 真实浏览器上跑通。
+"""真机实测：7 个新工具（56 个 action）在真实 AstrBot + 真实浏览器上跑通。
 
 这是本次移植的核心验收 —— 走 AstrBot 真实工具执行器，驱动真实浏览器，
-覆盖 6 个工具的每个 action（只对被判定为只读的 action 做真实操作，
+覆盖 7 个工具的每个 action（只对被判定为只读的 action 做真实操作，
 写类动作只验证到"命令发出且被正确接受"这一层，避免改动用户页面）。
+
+``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的调试工具（24 个 action），
+所以这里单独测它，``bsk_inspect`` 只剩 6 个读页面的 action。
 
 运行：
     & 'D:\\AstrBot\\backend\\python\\python.exe' tests/verify_new_tools_real.py
@@ -80,7 +83,7 @@ async def main() -> int:
     from astrbot_test_doubles import FakeEvent
 
     print("=" * 74)
-    print("真机实测：6 个新工具（33 个 action）")
+    print("真机实测：7 个新工具（56 个 action）")
     print("=" * 74)
 
     module = __import__(
@@ -107,13 +110,14 @@ async def main() -> int:
         "bsk_session",
         "bsk_page",
         "bsk_inspect",
+        "bsk_debug",
         "bsk_interact",
         "bsk_tabs",
         "bsk_assist",
     )
-    print("\n--- 1. 6 个新工具已注册 ---")
+    print("\n--- 1. 7 个新工具已注册 ---")
     missing = [n for n in NEW if n not in bound]
-    record("6 个新工具全部注册", not missing, f"缺少：{missing}")
+    record("7 个新工具全部注册", not missing, f"缺少：{missing}")
 
     ev = FakeEvent(is_admin=True, umo="aiocqhttp:group:realnew", sender_id="1")
 
@@ -170,13 +174,39 @@ async def main() -> int:
         r.replace("\n", " ")[:110],
     )
 
-    r = await call_tool(
-        bound["bsk_inspect"], ev, action="debug", debug_action="capabilities"
+    # debug 已拆成独立工具：bsk_inspect 必须明确拒绝旧的 debug 写法。
+    r = await call_tool(bound["bsk_inspect"], ev, action="observe", debug_action="capabilities")
+    record(
+        "inspect 拒绝旧 debug_action 并指向 bsk_debug",
+        "bsk_debug" in r,
+        r.replace("\n", " ")[:130],
     )
-    record("inspect.debug(capabilities)", bool(r.strip()), r.replace("\n", " ")[:110])
 
-    r = await call_tool(bound["bsk_inspect"], ev, action="debug", debug_action="status")
-    record("inspect.debug(status)", bool(r.strip()), r.replace("\n", " ")[:110])
+    # ------------------------------------------------------------------
+    print("\n--- 4b. bsk_debug（从 bsk_inspect 拆出的调试工具）---")
+    r = await call_tool(bound["bsk_debug"], ev, action="capabilities")
+    record("debug.capabilities", bool(r.strip()), r.replace("\n", " ")[:110])
+
+    r = await call_tool(bound["bsk_debug"], ev, action="status")
+    record("debug.status", bool(r.strip()), r.replace("\n", " ")[:110])
+
+    r = await call_tool(bound["bsk_debug"], ev, action="activity")
+    record("debug.activity", "未预期" not in r, r.replace("\n", " ")[:110])
+
+    # 条件规则必须在真机路径上也生效（不是只有单测里生效）。
+    r = await call_tool(bound["bsk_debug"], ev, action="requests", slow_ms=1000)
+    record(
+        "debug 的 slow_ms 仅 aggregate（其余 action 被拒）",
+        "aggregate" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    r = await call_tool(bound["bsk_debug"], ev, action="request")
+    record(
+        "debug 的 request 缺 id 被拒",
+        "id" in r,
+        r.replace("\n", " ")[:130],
+    )
 
     # ------------------------------------------------------------------
     print("\n--- 5. bsk_interact ---")
