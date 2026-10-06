@@ -6,7 +6,7 @@
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/JosephTian876/astrbot_plugin_bsk_browser",
-      "revision": "cddaedf790f33fe7247184ba0ee17894a522d47d"
+      "revision": "9f7a9739bc95da80d9b853ba33274bbbe5990da1"
     },
     "views": [
       {
@@ -17,9 +17,9 @@
       },
       {
         "id": "two-groups",
-        "label": "两组工具",
+        "label": "主工具与旧工具",
         "focus": ["llm", "main", "tools", "legacy"],
-        "note": "6 个多动作工具共用一套 schema 与校验；8 个旧工具保留原样，由 legacy_tools 开关控制。"
+        "note": "8 个主工具共用一套 schema 与校验；旧工具分 core / fringe 两组，各由一项配置决定是否注册。"
       },
       {
         "id": "persistence",
@@ -42,29 +42,29 @@
       "id": "main",
       "type": "frontend",
       "label": "main.py",
-      "sublabel": "2080 行 · 唯一依赖 AstrBot",
+      "sublabel": "2308 行 · 唯一依赖 AstrBot",
       "pos": [250, 320],
       "size": [160, 64],
-      "tag": "14 个 handler"
+      "tag": "16 个 handler"
     },
     {
       "id": "legacy",
       "type": "backend",
-      "label": "8 个旧工具",
-      "sublabel": "bsk_open / bsk_read / …",
+      "label": "8 个旧工具 · 两组",
+      "sublabel": "core 4 常驻 / fringe 3 关",
       "pos": [40, 140],
       "size": [150, 64],
-      "tag": "legacy_tools 开关"
+      "tag": "legacy_tools 两级"
     },
     {
       "id": "tools",
       "type": "backend",
       "label": "bsk/tools.py",
-      "sublabel": "2028 行 · 规格唯一事实源",
+      "sublabel": "2132 行 · 规格唯一事实源",
       "pos": [250, 140],
       "size": [160, 64],
-      "tag": "6 工具 / 33 action",
-      "sources": [{ "path": "bsk/tools.py", "line": 1, "label": "TOOL_SCHEMAS" }]
+      "tag": "8 工具 / 57 action",
+      "sources": [{ "path": "bsk/tools.py", "line": 552, "label": "TOOL_SCHEMAS" }]
     },
     {
       "id": "service",
@@ -79,7 +79,7 @@
       "id": "session",
       "type": "backend",
       "label": "bsk/session.py",
-      "sublabel": "1603 行 · 会话与并发",
+      "sublabel": "2139 行 · 会话与并发",
       "pos": [720, 320],
       "size": [160, 64],
       "tag": "acquire(start_args=)"
@@ -130,7 +130,7 @@
       "id": "journal",
       "type": "database",
       "label": "bsk/journal.py",
-      "sublabel": "333 行 · 会话台账",
+      "sublabel": "450 行 · 会话台账",
       "pos": [490, 640],
       "size": [150, 60]
     },
@@ -175,30 +175,35 @@
   ],
   "cards": [
     {
-      "dot": "cyan",
-      "title": "分层",
-      "items": [
-        "main.py 是唯一 import astrbot 的文件，只做参数解包与结果渲染",
-        "bsk/ 包零框架依赖，可脱离 AstrBot 单独单测",
-        "工具规格集中在 bsk/tools.py，schema 与校验同源"
-      ]
-    },
-    {
       "dot": "emerald",
       "title": "调用链",
       "items": [
-        "6 个多动作工具共 33 个 action，action 名与参数名对齐 BrowserSkill",
-        "参数先过 tools.py 校验，再进 service 拼命令行",
-        "会话并发由 session.py 的 acquire 串行化，同一 key 严格排队"
+        "8 个主工具共 57 个 action",
+        "action 名与参数名对齐 BrowserSkill",
+        "参数先过 tools.py 校验，再进 service",
+        "会话并发由 acquire 串行化，同一 key 排队",
+        "建会话前落盘令牌，start 带 --request-id"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "按需加载",
+      "items": [
+        "bsk_load_tools 常驻（schema 仅 181 字符）",
+        "调用后把 bsk_debug 加进当轮 req.func_tool",
+        "同一轮下一步即可见，下一条消息自动失效",
+        "bsk_debug 默认不注册，省 4937 字符/轮"
       ]
     },
     {
       "dot": "amber",
       "title": "与 AstrBot 的边界",
       "items": [
-        "logger 由 main.py 注入，bsk/ 不碰标准库 logging",
-        "落盘位置全部收在 paths.py，data_dir 不可用时降级到临时目录",
-        "旧工具行为零变化，由 legacy_tools 开关控制是否注册"
+        "main.py 是唯一 import astrbot 的文件",
+        "logger 由 main.py 注入，bsk/ 不碰它",
+        "落盘位置收在 paths.py，data_dir 不可用则降级",
+        "旧工具分两组：core 4 常驻，fringe 3 默认关",
+        "默认 12 个工具进列表，工具块约 -29%"
       ]
     }
   ]

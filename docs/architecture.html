@@ -4840,8 +4840,8 @@
       </div>
     </div>
 
-    <script id="archify-guided-views-data" type="application/json">[{"id":"tool-call","label":"一次工具调用","focus":["llm","main","tools","service","session","runner","bskcli","browser"],"note":"从模型发起调用到真实浏览器执行：参数先过 tools.py 校验，再由 service 拼成 bsk 命令行。"},{"id":"two-groups","label":"两组工具","focus":["llm","main","tools","legacy"],"note":"6 个多动作工具共用一套 schema 与校验；8 个旧工具保留原样，由 legacy_tools 开关控制。"},{"id":"persistence","label":"落盘与解耦","focus":["main","service","paths","journal","shots","plugindata","logger"],"note":"bsk 包不依赖 AstrBot 也不碰日志模块，落盘位置全部收在 paths.py。"}]</script>
-    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/JosephTian876/astrbot_plugin_bsk_browser","revision":"cddaedf790f33fe7247184ba0ee17894a522d47d","shortRevision":"cddaedf"},"referenceCount":1,"nodes":{"tools":[{"path":"bsk/tools.py","line":1,"label":"TOOL_SCHEMAS","href":"https://github.com/JosephTian876/astrbot_plugin_bsk_browser/blob/cddaedf790f33fe7247184ba0ee17894a522d47d/bsk/tools.py#L1"}]}}</script>
+    <script id="archify-guided-views-data" type="application/json">[{"id":"tool-call","label":"一次工具调用","focus":["llm","main","tools","service","session","runner","bskcli","browser"],"note":"从模型发起调用到真实浏览器执行：参数先过 tools.py 校验，再由 service 拼成 bsk 命令行。"},{"id":"two-groups","label":"主工具与旧工具","focus":["llm","main","tools","legacy"],"note":"8 个主工具共用一套 schema 与校验；旧工具分 core / fringe 两组，各由一项配置决定是否注册。"},{"id":"persistence","label":"落盘与解耦","focus":["main","service","paths","journal","shots","plugindata","logger"],"note":"bsk 包不依赖 AstrBot 也不碰日志模块，落盘位置全部收在 paths.py。"}]</script>
+    <script id="archify-source-evidence-data" type="application/json">{"schemaVersion":1,"verified":true,"repository":{"url":"https://github.com/JosephTian876/astrbot_plugin_bsk_browser","revision":"9f7a9739bc95da80d9b853ba33274bbbe5990da1","shortRevision":"9f7a973"},"referenceCount":1,"nodes":{"tools":[{"path":"bsk/tools.py","line":552,"label":"TOOL_SCHEMAS","href":"https://github.com/JosephTian876/astrbot_plugin_bsk_browser/blob/9f7a9739bc95da80d9b853ba33274bbbe5990da1/bsk/tools.py#L552"}]}}</script>
     <div class="guided-views no-print" id="guided-views" hidden aria-label="Guided diagram views">
       <button id="guided-view-prev" type="button" aria-label="Previous guided view" title="Previous guided view ([)">&#8592;</button>
       <div class="guided-view-copy">
@@ -4940,8 +4940,8 @@
         <text data-detail="context" x="105" y="366" class="t-muted" font-size="9" text-anchor="middle">决定调哪个工具</text>
         </g>
 
-        <g id="node-main" data-node-id="main" data-node-label="main.py" tabindex="0" role="button" aria-label="Focus main.py, 2080 行 · 唯一依赖 AstrBot, Architecture component" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="2080 行 · 唯一依赖 AstrBot" data-node-tag="14 个 handler" data-node-context="Architecture component">
-          <title>main.py · 2080 行 · 唯一依赖 AstrBot · Architecture component · 14 个 handler</title>
+        <g id="node-main" data-node-id="main" data-node-label="main.py" tabindex="0" role="button" aria-label="Focus main.py, 2308 行 · 唯一依赖 AstrBot, Architecture component" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="2308 行 · 唯一依赖 AstrBot" data-node-tag="16 个 handler" data-node-context="Architecture component">
+          <title>main.py · 2308 行 · 唯一依赖 AstrBot · Architecture component · 16 个 handler</title>
           <rect x="250" y="320" width="160" height="64" rx="6" class="c-mask"/>
           <rect x="250" y="320" width="160" height="64" rx="6" class="c-frontend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" transform="translate(256 326) scale(0.6875)">
@@ -4951,32 +4951,32 @@
             <circle cx="6.3" cy="4.8" r=".7" class="sigil-fill"/>
           </g>
           <text data-detail-anchor x="330" y="350" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">main.py</text>
-        <text data-detail="context" x="330" y="366" class="t-muted" font-size="9" text-anchor="middle">2080 行 · 唯一依赖 AstrBot</text>
-        <text data-detail="fine" x="330" y="376" class="t-frontend" font-size="7" text-anchor="middle">14 个 handler</text>
+        <text data-detail="context" x="330" y="366" class="t-muted" font-size="9" text-anchor="middle">2308 行 · 唯一依赖 AstrBot</text>
+        <text data-detail="fine" x="330" y="376" class="t-frontend" font-size="7" text-anchor="middle">16 个 handler</text>
         </g>
 
-        <g id="node-legacy" data-node-id="legacy" data-node-label="8 个旧工具" tabindex="0" role="button" aria-label="Focus 8 个旧工具, bsk_open / bsk_read / …, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="bsk_open / bsk_read / …" data-node-tag="legacy_tools 开关" data-node-context="Architecture component">
-          <title>8 个旧工具 · bsk_open / bsk_read / … · Architecture component · legacy_tools 开关</title>
+        <g id="node-legacy" data-node-id="legacy" data-node-label="8 个旧工具 · 两组" tabindex="0" role="button" aria-label="Focus 8 个旧工具 · 两组, core 4 常驻 / fringe 3 关, Architecture component" aria-pressed="false" data-node-kind="backend" data-node-sublabel="core 4 常驻 / fringe 3 关" data-node-tag="legacy_tools 两级" data-node-context="Architecture component">
+          <title>8 个旧工具 · 两组 · core 4 常驻 / fringe 3 关 · Architecture component · legacy_tools 两级</title>
           <rect x="40" y="140" width="150" height="64" rx="6" class="c-mask"/>
           <rect x="40" y="140" width="150" height="64" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(46 146) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
-          <text data-detail-anchor x="115" y="170" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">8 个旧工具</text>
-        <text data-detail="context" x="115" y="186" class="t-muted" font-size="9" text-anchor="middle">bsk_open / bsk_read / …</text>
-        <text data-detail="fine" x="115" y="196" class="t-backend" font-size="7" text-anchor="middle">legacy_tools 开关</text>
+          <text data-detail-anchor x="115" y="170" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">8 个旧工具 · 两组</text>
+        <text data-detail="context" x="115" y="186" class="t-muted" font-size="9" text-anchor="middle">core 4 常驻 / fringe 3 关</text>
+        <text data-detail="fine" x="115" y="196" class="t-backend" font-size="7" text-anchor="middle">legacy_tools 两级</text>
         </g>
 
-        <g id="node-tools" data-node-id="tools" data-node-label="bsk/tools.py" tabindex="0" role="button" aria-label="Focus bsk/tools.py, 2028 行 · 规格唯一事实源, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="backend" data-node-sublabel="2028 行 · 规格唯一事实源" data-node-tag="6 工具 / 33 action" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
-          <title>bsk/tools.py · 2028 行 · 规格唯一事实源 · bsk/ 包：不 import astrbot、不 import logging · 6 工具 / 33 action</title>
+        <g id="node-tools" data-node-id="tools" data-node-label="bsk/tools.py" tabindex="0" role="button" aria-label="Focus bsk/tools.py, 2132 行 · 规格唯一事实源, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="backend" data-node-sublabel="2132 行 · 规格唯一事实源" data-node-tag="8 工具 / 57 action" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
+          <title>bsk/tools.py · 2132 行 · 规格唯一事实源 · bsk/ 包：不 import astrbot、不 import logging · 8 工具 / 57 action</title>
           <rect x="250" y="140" width="160" height="64" rx="6" class="c-mask"/>
           <rect x="250" y="140" width="160" height="64" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(256 146) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-detail-anchor x="330" y="170" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">bsk/tools.py</text>
-        <text data-detail="context" x="330" y="186" class="t-muted" font-size="9" text-anchor="middle">2028 行 · 规格唯一事实源</text>
-        <text data-detail="fine" x="330" y="196" class="t-backend" font-size="7" text-anchor="middle">6 工具 / 33 action</text>
+        <text data-detail="context" x="330" y="186" class="t-muted" font-size="9" text-anchor="middle">2132 行 · 规格唯一事实源</text>
+        <text data-detail="fine" x="330" y="196" class="t-backend" font-size="7" text-anchor="middle">8 工具 / 57 action</text>
         </g>
 
         <g id="node-service" data-node-id="service" data-node-label="bsk/service.py" tabindex="0" role="button" aria-label="Focus bsk/service.py, 3374 行 · 参数 → 命令行, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="backend" data-node-sublabel="3374 行 · 参数 → 命令行" data-node-tag="唯一实现" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
@@ -4991,15 +4991,15 @@
         <text data-detail="fine" x="570" y="376" class="t-backend" font-size="7" text-anchor="middle">唯一实现</text>
         </g>
 
-        <g id="node-session" data-node-id="session" data-node-label="bsk/session.py" tabindex="0" role="button" aria-label="Focus bsk/session.py, 1603 行 · 会话与并发, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="backend" data-node-sublabel="1603 行 · 会话与并发" data-node-tag="acquire(start_args=)" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
-          <title>bsk/session.py · 1603 行 · 会话与并发 · bsk/ 包：不 import astrbot、不 import logging · acquire(start_args=)</title>
+        <g id="node-session" data-node-id="session" data-node-label="bsk/session.py" tabindex="0" role="button" aria-label="Focus bsk/session.py, 2139 行 · 会话与并发, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="backend" data-node-sublabel="2139 行 · 会话与并发" data-node-tag="acquire(start_args=)" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
+          <title>bsk/session.py · 2139 行 · 会话与并发 · bsk/ 包：不 import astrbot、不 import logging · acquire(start_args=)</title>
           <rect x="720" y="320" width="160" height="64" rx="6" class="c-mask"/>
           <rect x="720" y="320" width="160" height="64" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(726 326) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-detail-anchor x="800" y="350" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">bsk/session.py</text>
-        <text data-detail="context" x="800" y="366" class="t-muted" font-size="9" text-anchor="middle">1603 行 · 会话与并发</text>
+        <text data-detail="context" x="800" y="366" class="t-muted" font-size="9" text-anchor="middle">2139 行 · 会话与并发</text>
         <text data-detail="fine" x="800" y="376" class="t-backend" font-size="7" text-anchor="middle">acquire(start_args=)</text>
         </g>
 
@@ -5062,8 +5062,8 @@
         <text data-detail="context" x="325" y="564" class="t-muted" font-size="9" text-anchor="middle">198 行 · 落盘位置</text>
         </g>
 
-        <g id="node-journal" data-node-id="journal" data-node-label="bsk/journal.py" tabindex="0" role="button" aria-label="Focus bsk/journal.py, 333 行 · 会话台账, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="database" data-node-sublabel="333 行 · 会话台账" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
-          <title>bsk/journal.py · 333 行 · 会话台账 · bsk/ 包：不 import astrbot、不 import logging</title>
+        <g id="node-journal" data-node-id="journal" data-node-label="bsk/journal.py" tabindex="0" role="button" aria-label="Focus bsk/journal.py, 450 行 · 会话台账, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="database" data-node-sublabel="450 行 · 会话台账" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
+          <title>bsk/journal.py · 450 行 · 会话台账 · bsk/ 包：不 import astrbot、不 import logging</title>
           <rect x="490" y="640" width="150" height="60" rx="6" class="c-mask"/>
           <rect x="490" y="640" width="150" height="60" rx="6" class="c-database" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" transform="translate(496 646) scale(0.6875)">
@@ -5071,7 +5071,7 @@
             <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
           </g>
           <text data-detail-anchor x="565" y="668" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">bsk/journal.py</text>
-        <text data-detail="context" x="565" y="684" class="t-muted" font-size="9" text-anchor="middle">333 行 · 会话台账</text>
+        <text data-detail="context" x="565" y="684" class="t-muted" font-size="9" text-anchor="middle">450 行 · 会话台账</text>
         </g>
 
         <g id="node-shots" data-node-id="shots" data-node-label="bsk/shots.py" tabindex="0" role="button" aria-label="Focus bsk/shots.py, 468 行 · 截图与清理, bsk/ 包：不 import astrbot、不 import logging" aria-pressed="false" data-node-kind="database" data-node-sublabel="468 行 · 截图与清理" data-node-context="bsk/ 包：不 import astrbot、不 import logging">
@@ -5357,25 +5357,28 @@
     <div class="cards">
       <div class="card">
         <div class="card-header">
-          <div class="card-dot cyan"></div>
-          <h3>分层</h3>
+          <div class="card-dot emerald"></div>
+          <h3>调用链</h3>
         </div>
         <ul>
-          <li>&bull; main.py 是唯一 import astrbot 的文件，只做参数解包与结果渲染</li>
-          <li>&bull; bsk/ 包零框架依赖，可脱离 AstrBot 单独单测</li>
-          <li>&bull; 工具规格集中在 bsk/tools.py，schema 与校验同源</li>
+          <li>&bull; 8 个主工具共 57 个 action</li>
+          <li>&bull; action 名与参数名对齐 BrowserSkill</li>
+          <li>&bull; 参数先过 tools.py 校验，再进 service</li>
+          <li>&bull; 会话并发由 acquire 串行化，同一 key 排队</li>
+          <li>&bull; 建会话前落盘令牌，start 带 --request-id</li>
         </ul>
       </div>
 
       <div class="card">
         <div class="card-header">
-          <div class="card-dot emerald"></div>
-          <h3>调用链</h3>
+          <div class="card-dot violet"></div>
+          <h3>按需加载</h3>
         </div>
         <ul>
-          <li>&bull; 6 个多动作工具共 33 个 action，action 名与参数名对齐 BrowserSkill</li>
-          <li>&bull; 参数先过 tools.py 校验，再进 service 拼命令行</li>
-          <li>&bull; 会话并发由 session.py 的 acquire 串行化，同一 key 严格排队</li>
+          <li>&bull; bsk_load_tools 常驻（schema 仅 181 字符）</li>
+          <li>&bull; 调用后把 bsk_debug 加进当轮 req.func_tool</li>
+          <li>&bull; 同一轮下一步即可见，下一条消息自动失效</li>
+          <li>&bull; bsk_debug 默认不注册，省 4937 字符/轮</li>
         </ul>
       </div>
 
@@ -5385,9 +5388,11 @@
           <h3>与 AstrBot 的边界</h3>
         </div>
         <ul>
-          <li>&bull; logger 由 main.py 注入，bsk/ 不碰标准库 logging</li>
-          <li>&bull; 落盘位置全部收在 paths.py，data_dir 不可用时降级到临时目录</li>
-          <li>&bull; 旧工具行为零变化，由 legacy_tools 开关控制是否注册</li>
+          <li>&bull; main.py 是唯一 import astrbot 的文件</li>
+          <li>&bull; logger 由 main.py 注入，bsk/ 不碰它</li>
+          <li>&bull; 落盘位置收在 paths.py，data_dir 不可用则降级</li>
+          <li>&bull; 旧工具分两组：core 4 常驻，fringe 3 默认关</li>
+          <li>&bull; 默认 12 个工具进列表，工具块约 -29%</li>
         </ul>
       </div>
     </div>

@@ -1,4 +1,6 @@
-"""L4 工具层端到端测试：直接 await 插件注册给 LLM 的 6 个工具函数。
+"""L4 工具层端到端测试：直接 await 本脚本覆盖的那 6 个旧工具函数 ——
+core 组的 ``bsk_screenshot`` / ``bsk_close`` / ``bsk_status``，
+fringe 组的 ``bsk_open`` / ``bsk_read`` / ``bsk_act``。
 
 ## 这一层补的是什么缺口
 
@@ -7,7 +9,8 @@
 行为、``bsk_act`` 的动作名归一化。既有的三层测试都不覆盖它：
 
 - L1（``tests/test_*.py``）只测 ``bsk/`` 纯逻辑，用假 runner；
-- L2（``tests/verify_astrbot_contract.py``）只证明 6 个工具注册成功、
+- L2（``tests/verify_astrbot_contract.py``）只证明 16 个工具全部注册成功
+  （清单从 ``main.py`` 的 ``@filter.llm_tool`` 自动推导）、
   docstring schema 正确、生命周期方法可调用，没有调用过工具函数本身；
 - L3（``tests/verify_integration.py``）测的是 ``BskService`` 服务层，
   不经过 main.py 的工具函数。
