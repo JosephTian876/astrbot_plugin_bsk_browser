@@ -113,13 +113,19 @@
     "description": "同时注册旧版工具",
     "type": "bool",
     "default": true,
-    "hint": "默认开启。开启时一共注册 14 个工具：6 个新的（bsk_session / bsk_page / bsk_inspect / bsk_interact / bsk_tabs / bsk_assist）加 8 个旧的（bsk_open / bsk_read / bsk_act / bsk_screenshot / bsk_close / bsk_status / bsk_logs / bsk_evaluate）。旧工具的行为一个字都没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」，老用户升级后一切照旧。关掉它可以少注册 8 个旧工具，每轮对话大约省下 3600 字符的工具描述（模型每次请求都要带上全部工具说明，关掉就能省这份固定开销），代价是旧写法不再可用——请确认你自己和你的提示词都改成新工具之后再关。注意 bsk_evaluate 不受这一项影响，它有自己的开关（enable_evaluate）。另外两个已知限制：①这一项只在插件重新加载时生效，改完配置请重新加载插件；②如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，那个关闭状态会优先于这一项。"
+    "hint": "默认开启。开启时最多注册 16 个工具：8 个新的（bsk_session / bsk_page / bsk_inspect / bsk_debug / bsk_interact / bsk_tabs / bsk_assist / bsk_load_tools，其中 bsk_debug 默认按需加载，见下面那一项）加 8 个旧的（bsk_open / bsk_read / bsk_act / bsk_screenshot / bsk_close / bsk_status / bsk_logs / bsk_evaluate）。旧工具的行为一个字都没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」，老用户升级后一切照旧。关掉它可以少注册 8 个旧工具，每轮对话大约省下 3600 字符的工具描述（模型每次请求都要带上全部工具说明，关掉就能省这份固定开销），代价是旧写法不再可用——请确认你自己和你的提示词都改成新工具之后再关。注意 bsk_evaluate 不受这一项影响，它有自己的开关（enable_evaluate）。另外两个已知限制：①这一项只在插件重新加载时生效，改完配置请重新加载插件；②如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，那个关闭状态会优先于这一项。"
   },
   "legacy_fringe_tools": {
     "description": "注册罕见的旧版工具",
     "type": "bool",
     "default": false,
     "hint": "默认关闭。只控制旧版工具里比较少用的那三个：bsk_open（打开网页）、bsk_read（读页面）、bsk_act（点击/输入等交互）。实际上这三个都有等价的新工具——bsk_open 换成 bsk_page 或 bsk_session，bsk_read 换成 bsk_inspect，bsk_act 换成 bsk_interact——所以关掉它们不会少任何能力，只是模型不能再调用这三个旧名字。收益：每轮对话少带 3 份工具说明，实测约省 1900 字符的固定开销（模型每次请求都要带上全部工具说明）。什么时候需要打开：你的提示词、工作流或使用习惯里还在直接写这三个工具名，并且暂时不想改。注意这一项只在上面「同时注册旧版工具」（legacy_tools）开启时才有意义：那一项一旦关掉，8 个旧工具会被全部停掉，本项填什么都不影响结果。另外常用的四个旧工具（bsk_status 诊断、bsk_close 关会话、bsk_screenshot 截图、bsk_logs 读日志）不受本项影响，只要 legacy_tools 开着就一直在。bsk_evaluate 也不受本项影响，它有自己的开关。与 legacy_tools 一样，本项只在插件重新加载时生效。"
+  },
+  "lazy_debug_tool": {
+    "description": "调试工具按需加载（建议保持开启）",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启。开启时 bsk_debug（抓包与网络调试工具，24 个动作）默认不注册给模型，模型在工具列表里看不到它；需要调试时，模型要先调用常驻的小工具 bsk_load_tools 把 bsk_debug 加载进来，然后才能用它。加载只在当前这一轮对话里有效，下一条消息又会回到未加载状态。为什么默认开启：bsk_debug 光参数说明就有约 5000 字符，而模型每次请求都要带上全部工具说明，绝大多数对话根本不调试网络，这笔开销就白付了。关掉它会怎样：bsk_debug 一直注册，模型随时能调试、不需要先加载这一步，代价是每一轮对话都多付那约 5000 字符。什么时候该关掉：如果你发现模型经常该调试却不先调用 bsk_load_tools（例如它直接回答自己没有调试工具），说明「先加载」这一步对它是个额外的坎，此时关掉本项更划算。它不影响能力有无：两种设置下调试能力都完整，只是多一步加载。bsk_load_tools 本身在两种设置下都注册。与其它工具开关一样，本项只在插件重新加载时生效，改完请重新加载插件。"
   },
   "enable_evaluate": {
     "description": "允许执行 JavaScript（高风险，默认关闭）",

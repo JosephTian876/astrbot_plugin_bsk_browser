@@ -1,11 +1,13 @@
-"""真机实测：7 个新工具（56 个 action）在真实 AstrBot + 真实浏览器上跑通。
+"""真机实测：8 个新工具（57 个 action）在真实 AstrBot + 真实浏览器上跑通。
 
 这是本次移植的核心验收 —— 走 AstrBot 真实工具执行器，驱动真实浏览器，
-覆盖 7 个工具的每个 action（只对被判定为只读的 action 做真实操作，
+覆盖 8 个工具的每个 action（只对被判定为只读的 action 做真实操作，
 写类动作只验证到"命令发出且被正确接受"这一层，避免改动用户页面）。
 
 ``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的调试工具（24 个 action），
 所以这里单独测它，``bsk_inspect`` 只剩 6 个读页面的 action。
+``bsk_load_tools``（1 个 action）是把 ``bsk_debug`` 按需加进当轮请求的开关；
+真机上"加载之后 bsk_debug 真的出现"由 ``verify_lazy_debug_real.py`` 单独验收。
 
 运行：
     & 'D:\\AstrBot\\backend\\python\\python.exe' tests/verify_new_tools_real.py
@@ -83,7 +85,7 @@ async def main() -> int:
     from astrbot_test_doubles import FakeEvent
 
     print("=" * 74)
-    print("真机实测：7 个新工具（56 个 action）")
+    print("真机实测：8 个新工具（57 个 action）")
     print("=" * 74)
 
     module = __import__(
@@ -111,13 +113,32 @@ async def main() -> int:
         "bsk_page",
         "bsk_inspect",
         "bsk_debug",
+        "bsk_load_tools",
         "bsk_interact",
         "bsk_tabs",
         "bsk_assist",
     )
-    print("\n--- 1. 7 个新工具已注册 ---")
+    print("\n--- 1. 8 个新工具已注册 ---")
     missing = [n for n in NEW if n not in bound]
-    record("7 个新工具全部注册", not missing, f"缺少：{missing}")
+    record("8 个新工具全部注册", not missing, f"缺少：{missing}")
+
+    # 这一项查的是**模型能看到什么**：默认 lazy_debug_tool=true，
+    # bsk_debug 虽然还挂在注册表里（handler 仍可被直接调用），但对模型不可见。
+    active = {
+        tool.name
+        for tool in llm_tools.func_list
+        if tool.name.startswith("bsk_") and getattr(tool, "active", True)
+    }
+    record(
+        "默认配置下模型看不到 bsk_debug",
+        "bsk_debug" not in active,
+        f"active 的新工具：{sorted(n for n in active if n in NEW)}",
+    )
+    record(
+        "默认配置下 bsk_load_tools 常驻",
+        "bsk_load_tools" in active,
+        "",
+    )
 
     ev = FakeEvent(is_admin=True, umo="aiocqhttp:group:realnew", sender_id="1")
 
@@ -205,6 +226,25 @@ async def main() -> int:
     record(
         "debug 的 request 缺 id 被拒",
         "id" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    # ------------------------------------------------------------------
+    print("\n--- 4c. bsk_load_tools（按需加载 debug）---")
+    # 这里用的是 FakeEvent，它**没有** provider_request —— 正好可以验收
+    # "拿不到本轮请求"时的降级路径：必须明确说清发生了什么，并且不要让模型
+    # 反复重试（真实加载路径由 verify_lazy_debug_real.py 在真机上验收）。
+    r = await call_tool(bound["bsk_load_tools"], ev, action="debug")
+    record(
+        "load_tools 缺少请求上下文时给出中文降级提示",
+        "无法加载" in r and "稍后重试" in r,
+        r.replace("\n", " ")[:130],
+    )
+
+    r = await call_tool(bound["bsk_load_tools"], ev, action="bogus")
+    record(
+        "load_tools 拒绝未知能力组",
+        "debug" in r and "bogus" in r,
         r.replace("\n", " ")[:130],
     )
 

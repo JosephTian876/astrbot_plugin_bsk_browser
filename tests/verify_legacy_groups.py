@@ -17,14 +17,19 @@
 | false | true  | 8  | 7 新 + ``bsk_evaluate`` |
 | false | false | 8  | 同上（fringe 开关无意义）|
 
-（``bsk_debug`` 从 ``bsk_inspect`` 拆出后新工具是 7 个，上表已计入。）
+新工具一共 8 个（``bsk_debug`` 从 ``bsk_inspect`` 拆出、``bsk_load_tools`` 负责
+按需加载它），但默认 ``lazy_debug_tool=true`` 时 ``bsk_debug`` **不**注册，
+所以上表里"7 新"= 8 个新工具减去 ``bsk_debug``。数字与拆分前一致纯属巧合：
+新多出来的 ``bsk_load_tools`` 正好补上了 ``bsk_debug`` 空出的位置。
 
-另外验两条不变式：
+另外验三条不变式：
 
 1. ``bsk_evaluate`` **始终**不受这两个开关影响 —— 它只由 ``enable_evaluate``
    决定（``enable_evaluate=false`` 时它也在注册表里，只是调用会被权限门拒绝，
    因为那个开关是**运行时**的权限门，不是注册期开关）。
 2. core 的 4 个在 ``legacy_tools=true`` 时始终注册，与 fringe 开关无关。
+3. ``lazy_debug_tool=true`` 时 ``bsk_debug`` 不在注册表里、``bsk_load_tools`` 在；
+   改成 false 则 ``bsk_debug`` 回来、``bsk_load_tools`` 依然在（它无害）。
 
 用法：
     & 'D:\\AstrBot\\backend\\python\\python.exe' tests/verify_legacy_groups.py
@@ -83,17 +88,22 @@ def record(name: str, ok: bool, detail: str = "") -> None:
     print(f"[{mark}] {name}" + (f" —— {detail}" if detail else ""))
 
 
-# 7 个新工具。写死在测试里（不从 main 里 import NEW_TOOL_NAMES）是刻意的：
+# 8 个新工具。写死在测试里（不从 main 里 import NEW_TOOL_NAMES）是刻意的：
 # 用被测代码的常量去算期望值，等于"两边一起错就测不出来"。
 NEW_TOOLS: tuple[str, ...] = (
     "bsk_session",
     "bsk_page",
     "bsk_inspect",
     "bsk_debug",
+    "bsk_load_tools",
     "bsk_interact",
     "bsk_tabs",
     "bsk_assist",
 )
+
+# ``lazy_debug_tool=true``（默认）时不注册给模型的新工具。
+# 写死的理由同上；它必须与 main.py 的 LAZY_TOOL_NAMES 一致。
+LAZY_TOOLS: tuple[str, ...] = ("bsk_debug",)
 
 # core：常用且无等价替代的旧工具，``legacy_tools=true`` 时应当始终在。
 CORE_TOOLS: tuple[str, ...] = (
@@ -147,7 +157,7 @@ def check_group(
     label: str, got: set[str], *, expect_legacy: bool, expect_fringe: bool
 ) -> None:
     """核对一种组合的注册结果：总数 + 逐个名字。"""
-    expected = set(NEW_TOOLS)
+    expected = set(NEW_TOOLS) - set(LAZY_TOOLS)
     if expect_legacy:
         expected |= set(CORE_TOOLS)
         if expect_fringe:
@@ -161,9 +171,14 @@ def check_group(
     )
     # 逐组单独报，失败时能一眼看出是哪一组的问题。
     record(
-        f"{label}：7 个新工具齐全",
-        set(NEW_TOOLS) <= got,
-        f"缺 {sorted(set(NEW_TOOLS) - got)}",
+        f"{label}：常驻新工具齐全（8 个减去按需加载的 {len(LAZY_TOOLS)} 个）",
+        (set(NEW_TOOLS) - set(LAZY_TOOLS)) <= got,
+        f"缺 {sorted((set(NEW_TOOLS) - set(LAZY_TOOLS)) - got)}",
+    )
+    record(
+        f"{label}：按需加载的工具默认不在注册表里",
+        not (set(LAZY_TOOLS) & got),
+        f"实际命中 {sorted(set(LAZY_TOOLS) & got)}",
     )
     record(
         f"{label}：core 4 个{'在' if expect_legacy else '不在'}注册表里",
@@ -234,6 +249,40 @@ async def main() -> int:
         "6.2 enable_evaluate=true 时 bsk_evaluate 仍在",
         "bsk_evaluate" in got,
         "",
+    )
+
+    print("\n--- 7. lazy_debug_tool=false → bsk_debug 回到注册表 ---")
+    got = await observe({**base, "lazy_debug_tool": False})
+    print(f"    实际注册：{sorted(got)}")
+    record(
+        "7.1 lazy_debug_tool=false 时 bsk_debug 已注册",
+        "bsk_debug" in got,
+        f"实际 {'在' if 'bsk_debug' in got else '不在'}",
+    )
+    record(
+        "7.2 lazy_debug_tool=false 时 bsk_load_tools 仍注册（它无害）",
+        "bsk_load_tools" in got,
+        f"实际 {'在' if 'bsk_load_tools' in got else '不在'}",
+    )
+    record(
+        "7.3 lazy_debug_tool=false 时注册数 = 关闭时 + 1",
+        len(got) == 13,
+        f"实际 {len(got)} 个（默认配置是 12 个：7 新 + 4 core + bsk_evaluate）",
+    )
+
+    print("\n--- 8. lazy_debug_tool=true（显式）→ 与默认一致 ---")
+    explicit = await observe({**base, "lazy_debug_tool": True})
+    default = await observe(dict(base))
+    record(
+        "8.1 显式 true 与不填的结果一致",
+        explicit == default,
+        f"显式 {sorted(explicit)} / 默认 {sorted(default)}",
+    )
+    record(
+        "8.2 显式 true 时 bsk_debug 不在、bsk_load_tools 在",
+        "bsk_debug" not in explicit and "bsk_load_tools" in explicit,
+        f"bsk_debug={'在' if 'bsk_debug' in explicit else '不在'}，"
+        f"bsk_load_tools={'在' if 'bsk_load_tools' in explicit else '不在'}",
     )
 
     failed = [n for n, ok, _ in RESULTS if not ok]

@@ -69,6 +69,7 @@ class FakeEvent:
         self._sender_id = sender_id
         self.unified_msg_origin = umo
         self._session_id = session_id
+        self._extras: dict[str, Any] = {}
 
     def is_admin(self) -> bool:
         return self._is_admin
@@ -78,6 +79,20 @@ class FakeEvent:
 
     def get_session_id(self) -> str:
         return self._session_id
+
+    # ``bsk_load_tools`` 靠这两个方法取本轮的 ``ProviderRequest``
+    # （真实实现见 ``astr_message_event.py``）。替身必须提供它们，
+    # 否则测到的是 AttributeError 而不是真实行为。
+    #
+    # 默认**不预置** ``provider_request``：这让"拿不到请求上下文"这条
+    # 降级路径可以被显式测到，而不是被替身悄悄补上一个假对象掩盖过去。
+    def set_extra(self, key: str, value: Any) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key: str | None = None, default: Any = None) -> Any:
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
 
     def image_result(self, path: str) -> Any:
         """返回一个可识别的标记，便于断言图片确实被 yield 了。"""

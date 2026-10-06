@@ -44,6 +44,7 @@ __all__ = [
     "DEFAULT_FULLPAGE_TIMEOUT_SEC",
     "DEFAULT_IDLE_RELEASE_SEC",
     "DEFAULT_JOURNAL_PATH",
+    "DEFAULT_LAZY_DEBUG_TOOL",
     "DEFAULT_LEGACY_FRINGE_TOOLS",
     "DEFAULT_LEGACY_TOOLS",
     "DEFAULT_MAX_PAGE_CHARS",
@@ -122,6 +123,33 @@ DEFAULT_LEGACY_FRINGE_TOOLS = False
 ``bsk_logs`` 读日志）刻意归在常驻组，只要 ``legacy_tools=true`` 就一定注册。
 
 不受本项影响：``bsk_evaluate``（有独立的 ``enable_evaluate``）。
+"""
+
+DEFAULT_LAZY_DEBUG_TOOL = True
+"""是否把 ``bsk_debug`` 改成**按需加载**（默认 ``True``）。
+
+True（默认）：``bsk_debug`` 在插件加载时被设为**不注册**，模型在工具列表里
+看不到它；需要抓包/网络调试时先调常驻的小工具 ``bsk_load_tools``
+（``action="debug"``），它会把 ``bsk_debug`` 加进**当前这一轮请求**的工具集，
+模型紧接着就能用。加载只对当前这一轮有效，下一条用户消息会重新构造请求、
+``bsk_debug`` 又回到"未加载"状态 —— 这正是想要的语义：不常用的大工具
+只在真正要用它的那一轮付费。
+
+为什么默认开：``bsk_debug`` 是 24 个 action、28 个参数的大工具，光是它的
+JSON Schema 就有 4431 字符，而绝大多数对话根本不调试网络。这几千字符是
+**每一轮请求**都要付的固定开销；改用按需加载后，它只在真正要用的那一轮出现，
+代价只是一次 ``bsk_load_tools`` 调用。
+
+False：``bsk_debug`` 一直注册（与参考实现 BrowserSkill 的行为一致）——
+模型随时能调试，不需要先加载，代价是每一轮请求都带上那 4431 字符。
+什么时候该关掉它：如果你发现模型**经常该调试却不先调** ``bsk_load_tools``
+（例如它直接说"我没有调试工具"），那就说明"先加载"这一步对它是额外的
+认知负担，此时关掉本项更划算。
+
+``bsk_load_tools`` 本身**始终注册**：本项关掉时它依然在，只是没人需要用它
+（它的提示文案无害，而且在模型记得两步流程时仍然能用）。
+
+不受本项影响：其余 7 个工具（含 ``bsk_inspect``）的注册状态。
 """
 
 DEFAULT_ENABLE_REQUEST_ID = True
@@ -736,6 +764,19 @@ class Settings:
     详见 :data:`DEFAULT_LEGACY_FRINGE_TOOLS`。
     """
 
+    lazy_debug_tool: bool
+    """``bsk_debug`` 是否改成按需加载。默认 ``True``。
+
+    True：``bsk_debug`` 加载插件时**不注册**给模型，模型要先调常驻的
+    ``bsk_load_tools``（``action="debug"``）才能在这一轮里用它。
+    False：一直注册，模型随时能调试，但每轮都付那 4431 字符的 schema。
+
+    ``bsk_load_tools`` 两种情况下都注册。这是一项纯**省上下文**的开关，
+    不影响任何能力的有无，只影响"要不要先加载一步"。
+
+    详见 :data:`DEFAULT_LAZY_DEBUG_TOOL`。
+    """
+
 
 def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
     """从 AstrBot 的原始配置 dict 构造 :class:`Settings`。
@@ -833,6 +874,12 @@ def parse_settings(raw: dict | None, *, data_dir: str = "") -> Settings:
         # 这份 prompt 开销。它与 legacy_tools 的组合语义由 main.py 落地。
         legacy_fringe_tools=_as_bool(
             raw.get("legacy_fringe_tools"), DEFAULT_LEGACY_FRINGE_TOOLS
+        ),
+        # 默认 True 是**省上下文**的那一侧：bsk_debug 的 schema 有 4431 字符，
+        # 而它只在真的抓包时才有用。用户没填这一项 = 接受"先 bsk_load_tools
+        # 再调试"这个两步流程；明确不想多这一步的用户可以填 false。
+        lazy_debug_tool=_as_bool(
+            raw.get("lazy_debug_tool"), DEFAULT_LAZY_DEBUG_TOOL
         ),
     )
 

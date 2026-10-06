@@ -115,20 +115,33 @@ LEGACY_TOOL_NAMES: tuple[str, ...] = (
 :data:`LEGACY_FRINGE_TOOL_NAMES`。
 """
 
-# 7 个新工具的名字（schema 来自 ``bsk/tools.py`` 的 ``TOOL_SCHEMAS``）。
+# 8 个新工具的名字（schema 来自 ``bsk/tools.py`` 的 ``TOOL_SCHEMAS``）。
 #
-# ``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的：调试参数有 24 个、约 3652 字符，
-# 而日常读页面（observe/snapshot/html/screenshot/console/network）用不到它们。
-# 拆开后每轮对话只为用得上的那一半付 token。
+# ``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的：它独占的 23 个调试参数约占
+# 3260 字符，而日常读页面（observe/snapshot/html/screenshot/console/network）
+# 用不到它们。拆开后每轮对话只为用得上的那一半付 token。
+#
+# ``bsk_load_tools`` 是第 8 个、也是唯一一个**不操作浏览器**的新工具：它只负责
+# 把 ``bsk_debug`` 按需加进当前这一轮请求（见 ``_run_load_tools``）。
+# 它自己必须在工具列表里**常驻**，否则按需加载无从发起。
 NEW_TOOL_NAMES: tuple[str, ...] = (
     "bsk_session",
     "bsk_page",
     "bsk_inspect",
     "bsk_debug",
+    "bsk_load_tools",
     "bsk_interact",
     "bsk_tabs",
     "bsk_assist",
 )
+
+# ``lazy_debug_tool=true`` 时要停用（不注册给模型）的新工具。
+#
+# 只有 ``bsk_debug`` 一个：它是"按需加载"这个机制**唯一**的加载对象，
+# ``bsk_load_tools`` 本身必须常驻。这张表与 ``bsk/tools.py`` 的
+# ``LOAD_TOOL_GROUPS`` 是配套的 —— 那个表说"能加载什么"，这张说"加载什么之前
+# 先不要注册"。将来新增一组按需加载的能力时，两处一起改。
+LAZY_TOOL_NAMES: tuple[str, ...] = ("bsk_debug",)
 
 # 失败回执的中文主语：{工具名: 动词短语}。用于 ``_dispatch`` 拼
 # "{X}失败：{原因}"。刻意不写工具名本身（"bsk_page 失败"对模型没有信息量，
@@ -138,6 +151,7 @@ _ACTION_LABEL: dict[str, str] = {
     "bsk_page": "页面导航",
     "bsk_inspect": "读取页面",
     "bsk_debug": "调试与流量控制",
+    "bsk_load_tools": "加载调试工具",
     "bsk_interact": "页面交互",
     "bsk_tabs": "管理标签页",
     "bsk_assist": "窗口与设备设置",
@@ -477,7 +491,7 @@ class BskBrowserPlugin(Star):
         except Exception as exc:  # noqa: BLE001 - 恢复失败不能让插件加载失败
             astrbot_logger.warning("[bsk_browser] 清理遗留会话时出错（已忽略）：%r", exc)
 
-        # 6 个新工具的完整 schema 由 bsk/tools.py 提供。@filter.llm_tool 在
+        # 8 个新工具的完整 schema 由 bsk/tools.py 提供。@filter.llm_tool 在
         # import 期只给出由 docstring 推出的基础 schema（**表达不了 action 的
         # enum**），所以这里覆写成完整版。
         #
@@ -491,7 +505,7 @@ class BskBrowserPlugin(Star):
 
         # 旧工具分两级开关：
         #
-        # - ``legacy_tools=false``：8 个旧工具全部停用（只剩 6 个新工具 +
+        # - ``legacy_tools=false``：8 个旧工具全部停用（只剩 8 个新工具 +
         #   ``bsk_evaluate`` 若它自己的开关也开着）。默认 true：老用户升级无感
         #   —— 若默认 false，等于**静默删掉** 8 个工具。
         # - ``legacy_tools=true`` 且 ``legacy_fringe_tools=false``（后者的默认值）：
@@ -505,6 +519,16 @@ class BskBrowserPlugin(Star):
         elif not self.settings.legacy_fringe_tools:
             self._deactivate_legacy_tools(fringe_only=True)
 
+        # 第 8 个工具（bsk_load_tools）负责把 bsk_debug 按需加进当轮请求。
+        # 默认开启时 bsk_debug 一开始不注册 —— 它那 4431 字符的 schema 只在
+        # 真的要调试的那一轮才值得付。见 LAZY_TOOL_NAMES 与 _run_load_tools。
+        #
+        # 必须写在 _apply_tool_schemas() **之后**：那一步要按名字取工具、
+        # 覆写 schema 与描述，虽然 get_func 对未激活的工具也会退化返回，
+        # 但"先覆写、再决定注不注册"的顺序读起来才不会有歧义。
+        if self.settings.lazy_debug_tool:
+            self._deactivate_lazy_tools()
+
         astrbot_logger.info(
             "[bsk_browser] 已加载。bsk 路径=%s，最大会话=%d，仅管理员=%s",
             self.settings.bsk_path,
@@ -517,7 +541,7 @@ class BskBrowserPlugin(Star):
     # ------------------------------------------------------------------
 
     def _apply_tool_schemas(self) -> None:
-        """把 ``bsk/tools.py`` 的完整 schema 覆写到已注册的 6 个新工具上。
+        """把 ``bsk/tools.py`` 的完整 schema 覆写到已注册的 8 个新工具上。
 
         覆写而不是重新注册：``@filter.llm_tool`` 已经完成了 handler 注册与
         插件实例绑定（框架用 ``handler.__module__ == metadata.module_path``
@@ -616,6 +640,37 @@ class BskBrowserPlugin(Star):
                 # 它有自己的开关（enable_evaluate）且是独立的高危工具，
                 # 不该跟着"旧工具"一起被关掉，见 LEGACY_TOOL_NAMES 的注释。
                 continue
+            tool = llm_tools.get_func(name)
+            if tool is not None:
+                tool.active = False
+
+    def _deactivate_lazy_tools(self) -> None:
+        """按需加载：把 :data:`LAZY_TOOL_NAMES` 里的工具先设为不注册。
+
+        ``bsk_debug`` 默认就不注册给模型，等 ``bsk_load_tools`` 在被调用的那一轮
+        里把它加进 ``req.func_tool``（见 :meth:`_run_load_tools`）。
+
+        为什么直接设 ``tool.active = False`` 而不是调框架的
+        ``deactivate_llm_tool_async``：与 :meth:`_deactivate_legacy_tools` 同一个
+        理由 —— 后者会把这个名字写进**持久化**的 ``inactivated_llm_tools``
+        （全局 SharedPreferences）。这里的"不注册"是本插件的一项可关闭配置，
+        不该在全局配置里留下永久痕迹（用户改回 false、甚至卸载重装之后，
+        那个痕迹还在，工具会莫名其妙地一直关着）。
+
+        为什么改的是全局 ``active`` 却不会影响"按需"语义：``active`` 只决定
+        **初始**的工具列表；``bsk_load_tools`` 改的是当轮 ``req.func_tool``，
+        两者不在一个层次上。全局关掉是为了"不默认付这 4431 字符"，
+        当轮加进去是为了"要用时能用"。
+
+        Note:
+            与旧工具开关一样，本方法只在插件加载时执行一次，改配置需要重新
+            加载插件；用户若在 AstrBot WebUI 的「扩展 → 组件」里手动改过
+            ``bsk_debug`` 的开关，那一项会在本方法之后被 ``star_manager``
+            重新计算，因此**优先**于本项。
+        """
+        from astrbot.core.provider.register import llm_tools
+
+        for name in LAZY_TOOL_NAMES:
             tool = llm_tools.get_func(name)
             if tool is not None:
                 tool.active = False
@@ -824,18 +879,19 @@ class BskBrowserPlugin(Star):
         return message
 
     # ------------------------------------------------------------------
-    # 七个新工具：统一入口 _dispatch
+    # 八个新工具：统一入口 _dispatch
     # ------------------------------------------------------------------
 
     async def _dispatch(self, tool: str, event: AstrMessageEvent, raw: dict) -> str:
-        """7 个新工具的统一入口：权限门 → 参数校验 → 分派 → 包装结果。
+        """8 个新工具的统一入口：权限门 → 参数校验 → 分派 → 包装结果。
 
-        这 7 个工具的全部 handler 都只是 ``return await self._dispatch(...)``
+        这 8 个工具的全部 handler 都只是 ``return await self._dispatch(...)``
         —— 逻辑只有这一份。它们与旧工具共用同一套权限门（:meth:`_denied`，
         含 ``enabled`` / 白名单 / ``admin_only`` 三态）与同一个 ``service``。
 
         Args:
-            tool: 7 个工具名之一（``bsk_session`` … ``bsk_assist``）。
+            tool: 8 个工具名之一（``bsk_session`` … ``bsk_assist`` 加
+                ``bsk_load_tools``）。
             event: 消息事件，用于权限判定。
             raw: 框架按形参名注入的原始 kwargs（**未经任何处理**）。
 
@@ -888,7 +944,7 @@ class BskBrowserPlugin(Star):
         """把校验过的参数按工具名路由到 ``service`` 的对应方法并渲染结果。
 
         Args:
-            tool: 7 个工具名之一。
+            tool: 8 个工具名之一。
             event: 用于算会话键。
             args: :func:`bsk.tools.validate` 的输出（已含规范化的 ``action``）。
 
@@ -906,8 +962,9 @@ class BskBrowserPlugin(Star):
         #    session_id；认不出来会报"不属于本插件"，不会静默打到别的会话。
         # 2. 没传 → 用本对话的会话键（既有行为，向后兼容）。
         #
-        # 为什么必须在这一层做：7 个工具的 schema 里都有 session 字段
-        # （对齐 DSH 的参数并集），服务层每个方法的第一个参数也正是会话标识。
+        # 为什么必须在这一层做：7 个**操作浏览器**的工具的 schema 里都有
+        # session 字段（对齐 DSH 的参数并集），服务层每个方法的第一个参数也正是
+        # 会话标识。``bsk_load_tools`` 不在此列 —— 它不碰浏览器，用不到会话键。
         # 早先只传 self._key(event)，于是模型显式指定的 session 被**静默丢弃**
         # —— 多会话场景下命令打在另一个会话上，模型无从察觉。
         #
@@ -923,6 +980,8 @@ class BskBrowserPlugin(Star):
             return await self._run_inspect(key, action, args)
         if tool == "bsk_debug":
             return await self._run_debug(key, args)
+        if tool == "bsk_load_tools":
+            return await self._run_load_tools(event, action)
         if tool == "bsk_interact":
             return await self._run_interact(key, action, args)
         if tool == "bsk_tabs":
@@ -1162,8 +1221,8 @@ class BskBrowserPlugin(Star):
         这里是**整条 debug 路径的唯一实现** —— ``bsk_inspect`` 不再有 debug 分支，
         所以不存在"两个工具各走一套逻辑"的风险。
 
-        子动作取自 ``action``：校验层已保证它与 ``debug_action`` 一致
-        （不一致会直接报错），两者本就是同一个值。
+        子动作取自工具级的 ``action``：校验层已经确认它是 ``DEBUG_ACTIONS``
+        之一（``bsk_debug`` 只有一个子动作入口，没有别名），这里直接用它。
         """
         debug_action = str(args["action"])
         # debug：bsk 的原始 JSON 直通（TOOL-SPEC §2 的硬要求：不重映射字段）。
@@ -1177,19 +1236,18 @@ class BskBrowserPlugin(Star):
     def _debug_opts(args: dict) -> dict:
         """摘出要传给 ``service.debug`` 的调试参数。
 
-        这里有两处**必须**处理的形参冲突，都属于"Python 形参绑定"的硬约束
-        （不是设计选择），弄错就是 ``TypeError`` 或静默丢参：
+        这里必须处理的形参冲突只有一个，属于"Python 形参绑定"的硬约束
+        （不是设计选择），弄错就是静默丢参：
 
-        1. ``action`` 要去掉 —— 子动作已经作为 ``debug_action`` 位置参数传进
-           ``service.debug`` 了；``action`` 再留在 ``opts`` 里会被
-           DEBUG_VALUE_FLAGS 静默忽略（表里没有这一项），也就是**不报错也不生效**。
-        2. ``debug_action`` 要去掉 —— ``service.debug`` 的签名是
-           ``debug(self, key, debug_action, **opts)``，``debug_action`` 已经是
-           **位置参数**；如果它还留在 ``opts`` 里，调用就变成
+        ``action`` 要去掉 —— 子动作已经作为 ``debug_action`` 位置参数传进
+        ``service.debug`` 了；``action`` 再留在 ``opts`` 里会被
+        DEBUG_VALUE_FLAGS 静默忽略（表里没有这一项），也就是**不报错也不生效**。
 
-               TypeError: debug() got multiple values for argument 'debug_action'
-
-           （与裁决 1 的 ``press``/``key`` 是同一类冲突，实测确认。）
+        早先这里还要滤掉 ``debug_action``（它曾是 ``action`` 的别名，留着会
+        撞上 ``debug(self, key, debug_action, **opts)`` 的形参，报
+        ``TypeError: got multiple values for argument 'debug_action'``）。
+        现在校验层的输出里**已经没有这个键**（别名已删），所以不需要再滤；
+        真有人把它塞进来反而会立刻撞成 TypeError，比静默吞掉更好。
 
         ``tab_id`` 则**必须留着**：``service.debug`` 内部是
         ``opts.pop("tab_id", None)`` 取它的，也就是说 ``tab_id`` 走的就是
@@ -1197,11 +1255,7 @@ class BskBrowserPlugin(Star):
         静默打在别的标签上（校验层明明收下了它）——正是 REVIEW-ROUND2 的
         P0-1 那一类错误。
         """
-        return {
-            name: value
-            for name, value in args.items()
-            if name not in ("action", "debug_action")
-        }
+        return {name: value for name, value in args.items() if name != "action"}
 
     @staticmethod
     def _render_debug(debug_action: str, result: Any) -> str:
@@ -1223,6 +1277,71 @@ class BskBrowserPlugin(Star):
         if not body.strip():
             body = "（bsk 没有返回任何内容。）"
         return f"debug {debug_action} 的原始返回：\n{body}"
+
+    # --- bsk_load_tools -------------------------------------------------
+
+    async def _run_load_tools(self, event: AstrMessageEvent, group: str) -> str:
+        """``bsk_load_tools`` 的唯一分支：把按需加载的大工具加进**本轮请求**。
+
+        为什么在 handler 里改 ``req.func_tool`` 就能立刻生效：
+        ``astr_main_agent`` 把同一个 ``ProviderRequest`` 对象既存进事件的 extra
+        （``set_extra("provider_request", req)``）又交给 ``tool_loop_agent_runner``
+        当 ``self.req``；那个 runner 的每一步都**现读** ``self.req.func_tool``
+        来构造下一次 provider 调用。所以在工具 handler 里改它，同一轮的
+        下一次 LLM 请求就带上了新工具，不需要等下一轮对话。
+
+        为什么这样不会污染别的会话：``ProviderRequest`` 是**每轮请求新建**的，
+        工具集不共享；用户的下一条消息会重新构造请求，``bsk_debug`` 自然回到
+        未加载状态。这正是我们要的语义（"只在当前这轮有效"）。
+        所以这里**只**往 ``req.func_tool`` 里加东西，绝不碰全局的 ``active``
+        标志 —— 改 ``active`` 才会真的影响所有人。
+
+        Note:
+            ``bsk_debug`` 在 ``lazy_debug_tool=true`` 时是 ``active=False`` 的。
+            这不影响本方法：``llm_tools.get_func`` 在找不到激活的同名工具时会
+            退化成返回未激活的那个（``func_tool_manager.py`` 的 ``get_func``），
+            而 ``ToolSet`` 的三个 schema 序列化器都不按 ``active`` 过滤 ——
+            加进 ``req.func_tool`` 就等于对它"临时激活一轮"。
+
+        Args:
+            event: 消息事件，用来取本轮请求。
+            group: 要加载的能力组（校验层已确认它是 ``LOAD_TOOL_GROUPS`` 之一）。
+
+        Returns:
+            给模型看的中文回执。
+        """
+        if group != "debug":
+            # 走不到这里：validate 只放行 TOOL_ACTIONS 里的取值。留一条兜底，
+            # 免得将来加了新组却忘了在这里实现。
+            return self._fail(f"暂不支持加载 {group!r} 这组能力。")
+
+        req = event.get_extra("provider_request")
+        if req is None:
+            return self._fail(
+                "无法加载调试能力：这次的请求上下文不可用（可能是调用方不是"
+                "正常的对话流程）。请直接告诉用户稍后重试，不要反复调用本工具。"
+            )
+
+        from astrbot.core.agent.tool import ToolSet
+        from astrbot.core.provider.register import llm_tools
+
+        tool = llm_tools.get_func("bsk_debug")
+        if tool is None:
+            return self._fail(
+                "调试工具当前不可用：插件没有注册 bsk_debug。"
+                "请把这一情况告诉用户（通常是插件安装不完整）。"
+            )
+
+        if req.func_tool is None:
+            req.func_tool = ToolSet()
+        req.func_tool.add_tool(tool)
+
+        return (
+            "已加载调试能力。现在可以用 bsk_debug 做抓包与网络调试，"
+            "action 取 performance / aggregate / duplicates / requests / request / "
+            "export / rules / rule_add / replay / start / status 等。"
+            "典型顺序：先 start 开抓包，再去访问页面，最后读结果。"
+        )
 
     async def _run_observe(self, key: str, args: dict) -> str:
         """``bsk_inspect(action="observe")``。
@@ -1627,8 +1746,8 @@ class BskBrowserPlugin(Star):
         )
 
     # ------------------------------------------------------------------
-    # 六个新工具（bsk_session / bsk_page / bsk_inspect / bsk_interact /
-    #            bsk_tabs / bsk_assist）
+    # 八个新工具（bsk_session / bsk_page / bsk_inspect / bsk_debug /
+    #            bsk_load_tools / bsk_interact / bsk_tabs / bsk_assist）
     #
     # 签名一律是 (self, event, **kwargs)：框架按**形参名**注入参数
     # （astr_agent_tool_exec.py:763 的 `handler(event, *args, **kwargs)`），
@@ -1691,6 +1810,25 @@ class BskBrowserPlugin(Star):
         可能改动服务端数据。
         """
         return await self._dispatch("bsk_debug", event, kwargs)
+
+    @filter.llm_tool("bsk_load_tools")
+    async def bsk_load_tools(self, event: AstrMessageEvent, **kwargs):
+        """按需加载能力。目前只有一组：debug（抓包与网络调试）。
+
+        当你需要查接口返回、慢请求、重复请求，或要拦截/改写/重放某个请求时，
+        先调用本工具加载 debug，之后就能使用 bsk_debug（它的 action 取
+        performance / aggregate / duplicates / requests / request / export /
+        rules / rule_add / replay 等）。
+        注意 bsk_debug 平时**不在**工具列表里，不先加载就用不了它。
+        加载只在当前这一轮对话里有效，用户的下一条消息需要重新加载。
+        """
+        raw = dict(kwargs)
+        # ``action`` 只有 debug 一个取值，模型漏填时按 debug 处理。
+        # 为什么容忍省略：schema 里仍写着 required（那是给模型的提示），但为了
+        # 一个**无歧义的唯一取值**让整轮对话白跑一次，代价比容忍省略大得多。
+        if not str(raw.get("action") or "").strip():
+            raw["action"] = "debug"
+        return await self._dispatch("bsk_load_tools", event, raw)
 
     @filter.llm_tool("bsk_interact")
     async def bsk_interact(self, event: AstrMessageEvent, **kwargs):

@@ -1,19 +1,24 @@
-"""``bsk/tools.py`` 的单元测试 —— 七个多动作工具的 schema 与参数校验。
+"""``bsk/tools.py`` 的单元测试 —— 八个多动作工具的 schema 与参数校验。
 
 背景：本插件为对齐 BrowserSkill 的工具形态，新增了多动作工具
 （``bsk_session`` / ``bsk_page`` / ``bsk_inspect`` / ``bsk_debug`` /
-``bsk_interact`` / ``bsk_tabs`` / ``bsk_assist``）。它们的 schema 不再由
-``@filter.llm_tool`` 从 docstring 推导（那条路径丢弃 ``enum``），
-而是由 ``bsk/tools.py`` 提供完整 JSON Schema，注册后覆写。
+``bsk_load_tools`` / ``bsk_interact`` / ``bsk_tabs`` / ``bsk_assist``）。
+它们的 schema 不再由 ``@filter.llm_tool`` 从 docstring 推导（那条路径丢弃
+``enum``），而是由 ``bsk/tools.py`` 提供完整 JSON Schema，注册后覆写。
 
-``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的：调试有 24 个参数、约 3652 字符，
+``bsk_debug`` 是从 ``bsk_inspect`` 里拆出来的：调试有 23 个参数、约 4400 字符，
 日常读页面用不到它们。本文件因此额外钉住**拆分本身**：
 
 - ``bsk_inspect`` 的 schema 里不得再出现任何 debug 独占参数（防它长回来）；
-- ``bsk_debug`` 的 schema 必须包含全部 24 个；
-- 「旧写法」``bsk_inspect(action="debug")`` 必须被明确拒绝并指向新工具；
+- ``bsk_debug`` 的 schema 必须包含全部 23 个；
+- ``bsk_debug`` 的子动作只有 ``action`` 一个入口（``debug_action`` 别名已删）；
+- 「旧写法」``bsk_inspect(action="debug")`` 必须被明确拒绝，并给出
+  "先 bsk_load_tools、再 bsk_debug"的两步引导；
 - 拆分**不得放松任何一条** debug 条件规则（id 必填、pointer↔part、
   slow_ms 仅 aggregate、rule_add↔rule、since 禁用于分析类……）。
+
+``bsk_load_tools`` 是唯一不操作浏览器的工具：它把 ``bsk_debug`` 按需加进
+当前这一轮请求（真正的加载动作在 ``main.py``，这里只管它的 schema 与校验）。
 
 因此 ``bsk/tools.py`` 是**唯一**决定"模型能传什么、什么会被拒绝"的地方，
 它没有任何框架保护：schema 写错会静默误导模型，校验写松会让坏参数进命令行。
@@ -21,7 +26,7 @@
 
 覆盖：
 
-1. **schema 结构** —— 七个工具、action 枚举与 ``TOOL_ACTIONS`` 同源、
+1. **schema 结构** —— 八个工具、action 枚举与 ``TOOL_ACTIONS`` 同源、
    属性类型在 AstrBot 白名单内（**特别注意：没有 ``integer``**）、
    每个属性都有非空 description；
 2. **归一化** —— camelCase → snake_case、连字符、空白、``None``；
@@ -50,11 +55,16 @@ from bsk import tools  # noqa: E402
 # ``verify_astrbot_contract.py`` 会红、provider 侧也可能拒收。
 ALLOWED_TYPES = {"string", "number", "object", "array", "boolean"}
 
-# ``bsk_debug`` 独占的 24 个参数（拆分后不该再出现在 ``bsk_inspect`` 里）。
+# ``bsk_debug`` 独占的 23 个参数（拆分后不该再出现在 ``bsk_inspect`` 里）。
 # 这份清单与任务书逐字一致，是**独立于实现**的验收依据：从实现里反推清单
 # 就等于用实现证明实现。
+#
+# 这里**没有** ``debug_action``：它曾是 ``bsk_debug`` 的 ``action`` 别名，
+# 后来作为纯冗余删掉了（``bsk_debug`` 是本次新造的工具，任何既有提示词都
+# 不可能写过它，所以别名没有兼容价值，只多占 prompt）。子动作的唯一入口是
+# 工具级 ``action``。它的拒绝路径单独有测试（见 TestDebugSplit）。
 DEBUG_ONLY_PARAMS = (
-    "debug_action", "rule", "replay", "state", "part", "id", "offset", "kind",
+    "rule", "replay", "state", "part", "id", "offset", "kind",
     "budget", "pointer", "wait_ms", "fields", "command_id", "include_controlled",
     "window_ms", "method", "output", "status", "resource_type", "slow_ms",
     "url", "max_chars", "name", "run_id",
@@ -75,6 +85,9 @@ EXPECTED_ACTIONS = {
         "console",
         "network",
     ),
+    # ``bsk_load_tools`` 是第 8 个工具，也是唯一一个**不操作浏览器**的：
+    # 它的 action 不是"要做什么"，而是"要按需加载哪一组能力"。
+    "bsk_load_tools": ("debug",),
     "bsk_debug": (
         "performance",
         "aggregate",
@@ -125,7 +138,7 @@ def call(tool_name: str, raw: dict) -> dict:
 class TestToolShape(unittest.TestCase):
     """工具清单与 action 枚举。"""
 
-    def test_exactly_seven_tools(self) -> None:
+    def test_exactly_eight_tools(self) -> None:
         self.assertEqual(set(tools.TOOL_SCHEMAS), set(EXPECTED_ACTIONS))
 
     def test_actions_match_spec(self) -> None:
@@ -197,13 +210,13 @@ class TestSchemaValidity(unittest.TestCase):
 class TestDebugSplit(unittest.TestCase):
     """``bsk_debug`` 从 ``bsk_inspect`` 里拆出来这件事本身。
 
-    拆分的**收益**完全建立在"``bsk_inspect`` 不再带那 24 个调试参数"上 ——
+    拆分的**收益**完全建立在"``bsk_inspect`` 不再带那 23 个调试参数"上 ——
     只要有一个参数长回去，收益就按它的描述长度缩水，而且没人会立刻发现。
     所以这几条断言是这次拆分的核心验收，不是形式检查。
     """
 
     def test_debug_only_params_absent_from_inspect(self) -> None:
-        """防回归：这 24 个参数一个都不许留在 bsk_inspect 里。"""
+        """防回归：这 23 个参数一个都不许留在 bsk_inspect 里。"""
         props = tools.TOOL_SCHEMAS["bsk_inspect"]["properties"]
         leaked = [name for name in DEBUG_ONLY_PARAMS if name in props]
         self.assertEqual(
@@ -213,7 +226,7 @@ class TestDebugSplit(unittest.TestCase):
             "它们属于 bsk_debug，留在 bsk_inspect 会让每轮对话都白付这部分 token。",
         )
 
-    def test_debug_schema_has_all_24_params(self) -> None:
+    def test_debug_schema_has_all_23_params(self) -> None:
         """反向：bsk_debug 必须**全部**收下，少一个对应的 action 就用不了。"""
         props = tools.TOOL_SCHEMAS["bsk_debug"]["properties"]
         missing = [name for name in DEBUG_ONLY_PARAMS if name not in props]
@@ -222,9 +235,42 @@ class TestDebugSplit(unittest.TestCase):
         )
 
     def test_debug_action_enum_matches_debug_actions(self) -> None:
-        """``debug_action`` 的 enum 就是 ``DEBUG_ACTIONS`` 本身。"""
-        prop = tools.TOOL_SCHEMAS["bsk_debug"]["properties"]["debug_action"]
+        """``bsk_debug`` 的 ``action`` enum 就是 ``DEBUG_ACTIONS`` 本身。
+
+        别名删掉之后，子动作只剩这一个入口 —— 它的 enum 一旦与
+        ``DEBUG_ACTIONS`` 脱节，模型照 schema 传的取值会被校验层拒掉。
+        """
+        prop = tools.TOOL_SCHEMAS["bsk_debug"]["properties"]["action"]
         self.assertEqual(list(prop["enum"]), list(tools.DEBUG_ACTIONS))
+
+    def test_debug_action_accepts_hyphen_variant(self) -> None:
+        """连字符写法仍要能用（别名删掉不等于把归一化一起删了）。
+
+        ``rule-add`` / ``rule-enable`` 这类模型常见的写法走的是
+        ``normalize_args`` 对 ``action`` 的连字符归一化，与其它工具同一条路径。
+        """
+        got = call("bsk_debug", {"action": "rule-add", "rule": '{"a":1}'})
+        self.assertEqual(got["action"], "rule_add")
+        got2 = call("bsk_debug", {"action": "RULE_ENABLE", "id": "x"})
+        self.assertEqual(got2["action"], "rule_enable")
+
+    def test_debug_action_alias_is_gone(self) -> None:
+        """``debug_action`` 参数已删除 —— 再传它必须被拒，且不产生任何结果。
+
+        它是纯冗余（``bsk_debug`` 是本次新造的工具，没有历史提示词用过它），
+        所以这里钉死"传了就报错"，避免哪天有人又把它加回 schema。
+        """
+        self.assertNotIn(
+            "debug_action", tools.TOOL_SCHEMAS["bsk_debug"]["properties"]
+        )
+        for raw in (
+            {"action": "capabilities", "debug_action": "capabilities"},
+            {"action": "requests", "debug_action": "capabilities"},
+            {"action": "capabilities", "debug-action": "capabilities"},
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(tools.BskToolError):
+                    call("bsk_debug", raw)
 
     def test_inspect_no_longer_has_debug_action(self) -> None:
         """``action="debug"`` 已不是 bsk_inspect 的合法取值。"""
@@ -233,37 +279,38 @@ class TestDebugSplit(unittest.TestCase):
             call("bsk_inspect", {"action": "debug", "debug_action": "capabilities"})
 
     def test_inspect_debug_action_hints_at_new_tool(self) -> None:
-        """旧的 ``action="debug"`` 必须直接指向 bsk_debug，而不是只说"取值不对"。
+        """旧的 ``action="debug"`` 必须给出**两步**引导，而不是只说"取值不对"。
 
         泛泛报错会让模型以为 action 名写错了、反复重试同一个工具；
-        明确说"调试已搬到 bsk_debug"它下一次就能调对。
+        而 ``bsk_debug`` 默认不注册，只说"改用 bsk_debug"它根本找不到，
+        所以提示里必须同时出现 ``bsk_load_tools``。
         """
         with self.assertRaises(tools.BskToolError) as ctx:
             call("bsk_inspect", {"action": "debug", "debug_action": "capabilities"})
         msg = str(ctx.exception)
         self.assertIn("bsk_debug", msg)
+        self.assertIn("bsk_load_tools", msg)
         # 别把无关 action 的报错也带上这句提示 —— 那会误导。
         with self.assertRaises(tools.BskToolError) as ctx2:
             call("bsk_inspect", {"action": "bogus"})
         self.assertNotIn("bsk_debug", str(ctx2.exception))
 
     def test_inspect_rejects_debug_action_with_new_tool_hint(self) -> None:
-        """旧写法必须指向新工具 —— 只说"不认识"会让模型反复重试同一个工具。"""
+        """旧写法必须给出两步引导 —— 只说"不认识"会让模型反复重试同一个工具。"""
         with self.assertRaises(tools.BskToolError) as ctx:
             call("bsk_inspect", {"action": "observe", "debug_action": "capabilities"})
         msg = str(ctx.exception)
         self.assertIn("bsk_debug", msg)
+        self.assertIn("bsk_load_tools", msg)
 
     def test_inspect_rejects_every_debug_only_param(self) -> None:
-        """跨 action 参数：24 个调试参数逐个传给 bsk_inspect 都必须被拒。
+        """跨 action 参数：23 个调试参数逐个传给 bsk_inspect 都必须被拒。
 
         只测 ``debug_action`` 不够 —— 模型完全可能记得 ``slow_ms`` 却忘了
         工具已经拆开，那批参数会一路进到 service（被静默忽略），
         模型却以为过滤生效了。
         """
         for name in DEBUG_ONLY_PARAMS:
-            if name == "debug_action":
-                continue  # 上面单独测过，它的报错路径更具体
             with self.subTest(param=name):
                 with self.assertRaises(tools.BskToolError):
                     call("bsk_inspect", {"action": "observe", name: "x"})
@@ -294,6 +341,50 @@ class TestDebugSplit(unittest.TestCase):
         self.assertIn("什么时候用", desc)
         # bsk_inspect 的描述必须把模型引到新工具，不然它会继续找 debug。
         self.assertIn("bsk_debug", tools.TOOL_DESCRIPTIONS["bsk_inspect"])
+
+
+class TestLoadTools(unittest.TestCase):
+    """``bsk_load_tools``：把大工具按需加进当前这一轮的那个开关。
+
+    它是第 8 个工具、也是唯一不操作浏览器的工具，所以它的 schema 必须**极小**
+    （常驻工具的体积就是净开销），而且它的 ``action`` 只有一组能力。
+    """
+
+    def test_schema_is_minimal(self) -> None:
+        """常驻工具只该有一个参数：它是"省 4431 字符"这件事的成本。"""
+        props = tools.TOOL_SCHEMAS["bsk_load_tools"]["properties"]
+        self.assertEqual(list(props), ["action"])
+
+    def test_only_debug_group(self) -> None:
+        self.assertEqual(tuple(tools.LOAD_TOOL_GROUPS), ("debug",))
+        self.assertEqual(
+            list(tools.TOOL_SCHEMAS["bsk_load_tools"]["properties"]["action"]["enum"]),
+            ["debug"],
+        )
+
+    def test_accepts_debug(self) -> None:
+        self.assertEqual(call("bsk_load_tools", {"action": "debug"}), {"action": "debug"})
+        # 大小写与连字符写法走与其它工具同一条归一化路径。
+        self.assertEqual(call("bsk_load_tools", {"action": "DEBUG"}), {"action": "debug"})
+
+    def test_rejects_unknown_group(self) -> None:
+        for value in ("bogus", "", "__model__", "debug2"):
+            with self.subTest(value=value):
+                with self.assertRaises(tools.BskToolError):
+                    call("bsk_load_tools", {"action": value})
+
+    def test_rejects_extra_params(self) -> None:
+        """``**kwargs`` 透传意味着 schema 外的参数不会被框架拦下，只能靠这里。"""
+        with self.assertRaises(tools.BskToolError):
+            call("bsk_load_tools", {"action": "debug", "session": "x"})
+        with self.assertRaises(tools.BskToolError):
+            call("bsk_load_tools", {"action": "debug", "group": "debug"})
+
+    def test_description_mentions_both_steps(self) -> None:
+        """描述要写清"先加载、再用"，否则模型不知道加载完该干什么。"""
+        desc = tools.TOOL_DESCRIPTIONS["bsk_load_tools"]
+        self.assertIn("bsk_debug", desc)
+        self.assertIn("这一轮", desc)
 
 
 class TestNormalize(unittest.TestCase):
@@ -572,26 +663,25 @@ class TestDebugRules(unittest.TestCase):
         with self.assertRaises(tools.BskToolError):
             call("bsk_debug", {"action": "__model__"})
 
-    def test_model_placeholder_rejected_via_alias(self) -> None:
-        """走旧别名 ``debug_action`` 时也必须拒绝，两个入口行为一致。"""
+    def test_model_placeholder_not_reachable_via_removed_alias(self) -> None:
+        """别名删掉后 ``__model__`` 只剩一个入口，而且那个入口必须拒绝它。
+
+        这条是上面那条的补充：以前 ``debug_action="__model__"`` 是**另一个**
+        能绕过 tool 级检查的入口，所以校验器里专门补了一道。现在入口只剩
+        ``action``，补丁可以撤掉 —— 但"必须被拒"这个结论不变。
+        """
         with self.assertRaises(tools.BskToolError):
             call("bsk_debug", {"action": "capabilities", "debug_action": "__model__"})
 
-    def test_legacy_debug_action_alias_still_accepted(self) -> None:
-        """拆分前学会 ``debug_action`` 的对话不该因为拆工具而整条失败。
+    def test_conflicting_alias_now_rejected_as_unknown_param(self) -> None:
+        """两个入口给不同值的旧场景：现在统一按"不认识 debug_action"拒绝。
 
-        同时给且一致 → 正常通过；只给 ``debug_action``（``action`` 缺）不在此列 ——
-        ``action`` 是工具的必填项，缺了要在工具级就拦下。
+        以前这种情况报"两者不一致"，现在别名整体没了，报的是参数名不认识 ——
+        对模型来说指向更清楚（它不该再传这个参数），所以不保留旧文案。
         """
-        got = call("bsk_debug", {"action": "capabilities", "debug_action": "capabilities"})
-        self.assertEqual(got["action"], "capabilities")
-        self.assertEqual(got["debug_action"], "capabilities")
-
-    def test_conflicting_alias_rejected(self) -> None:
-        """两个入口给了不同的值时必须报错，不能静默取其一。"""
         with self.assertRaises(tools.BskToolError) as ctx:
             call("bsk_debug", {"action": "requests", "debug_action": "capabilities"})
-        self.assertIn("不一致", str(ctx.exception))
+        self.assertIn("debug_action", str(ctx.exception))
 
     def test_limit_range_enforced(self) -> None:
         """`limit` 范围 1..100 —— 突变测试发现这条曾无回归保护。"""

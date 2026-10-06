@@ -472,6 +472,50 @@ class TestLegacyFringeTools(unittest.TestCase):
         self.assertIs(s.legacy_fringe_tools, True)
 
 
+class TestLazyDebugTool(unittest.TestCase):
+    """``lazy_debug_tool``（调试工具按需加载）：默认开启，认常见写法，垃圾值回退默认。
+
+    默认必须是 ``True``：``bsk_debug`` 的 schema 有 4400 多字符，而它只在真的
+    抓包时才有用。默认关掉等于让每个用户每一轮都白付这笔固定开销 ——
+    这正是这一项存在的理由，所以默认值本身要钉住。
+    """
+
+    def test_default_is_true(self) -> None:
+        self.assertIs(parse_settings({}).lazy_debug_tool, True)
+        self.assertIs(parse_settings(None).lazy_debug_tool, True)
+        self.assertIs(cfg.DEFAULT_LAZY_DEBUG_TOOL, True)
+
+    def test_explicit_values(self) -> None:
+        for value in (True, "true", 1):
+            with self.subTest(value=repr(value)):
+                self.assertIs(
+                    parse_settings({"lazy_debug_tool": value}).lazy_debug_tool, True
+                )
+        for value in (False, "false", 0):
+            with self.subTest(value=repr(value)):
+                self.assertIs(
+                    parse_settings({"lazy_debug_tool": value}).lazy_debug_tool, False
+                )
+
+    def test_unrecognized_falls_back_to_default(self) -> None:
+        # 认不出来的值一律回退默认（True），而不是擅自理解成 False
+        # —— 后者会让每轮对话悄悄多付 4400 字符。
+        for junk in ("maybe", "", "  ", None, [], {}):
+            with self.subTest(junk=repr(junk)):
+                self.assertIs(
+                    parse_settings({"lazy_debug_tool": junk}).lazy_debug_tool, True
+                )
+
+    def test_independent_from_legacy_switches(self) -> None:
+        """与旧工具开关互不影响，各自独立解析。"""
+        s = parse_settings(
+            {"legacy_tools": False, "legacy_fringe_tools": True, "lazy_debug_tool": False}
+        )
+        self.assertIs(s.legacy_tools, False)
+        self.assertIs(s.legacy_fringe_tools, True)
+        self.assertIs(s.lazy_debug_tool, False)
+
+
 class TestValidateSettings(unittest.TestCase):
     """validate_settings 报告"合法但值得提醒"的问题。"""
 

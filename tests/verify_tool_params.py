@@ -1,4 +1,4 @@
-"""核验：7 个工具的「签名参数名」与「docstring Args 段」是否一致。
+"""核验：8 个工具的「签名参数名」与「docstring Args 段」是否一致。
 
 ## 为什么需要这个检查
 AstrBot 用 docstring 的 Args 段生成给模型的参数 schema，

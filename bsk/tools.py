@@ -1,4 +1,4 @@
-"""七个多动作工具的规格与参数校验（纯标准库、纯函数）。
+"""八个多动作工具的规格与参数校验（纯标准库、纯函数）。
 
 本模块是**工具规格的唯一事实源**：
 
@@ -38,6 +38,7 @@ __all__ = [
     "WAIT_UNTIL_VALUES",
     "MODIFIER_VALUES",
     "DEBUG_ACTIONS",
+    "LOAD_TOOL_GROUPS",
     "DEBUG_PART_VALUES",
     "DEBUG_STATE_VALUES",
     "DEBUG_KIND_VALUES",
@@ -101,6 +102,20 @@ DEBUG_ACTIONS: tuple[str, ...] = (
 引用必须能成立，否则只能事后改字典（那就不是"唯一事实源"了）。
 """
 
+LOAD_TOOL_GROUPS: tuple[str, ...] = ("debug",)
+"""``bsk_load_tools`` 能按需加载的能力组（目前只有 ``debug``）。
+
+``bsk_load_tools`` 是唯一一个**不操作浏览器**的工具：它只把别的大工具
+（目前是 ``bsk_debug``）加进**当前这一轮请求**的工具集。所以它的 "action"
+不是"要在页面上做什么"，而是"要加载哪一组能力" —— 取值就是这里的组名，
+将来新增按需加载的能力时只需往这个元组里加一项。
+
+为什么它也要进 :data:`TOOL_ACTIONS` / :data:`TOOL_SCHEMAS`：这个模块是工具
+规格的唯一事实源，第 8 个工具若绕过它，就会同时绕过 ``enum`` 校验、
+``_apply_tool_schemas`` 的 schema 覆写和 ``tests/verify_tool_params.py``
+的检查 —— 那正是本模块存在的意义。
+"""
+
 TOOL_ACTIONS: dict[str, tuple[str, ...]] = {
     "bsk_session": ("start", "stop", "list"),
     "bsk_page": ("navigate", "back", "forward", "reload", "wait"),
@@ -113,6 +128,7 @@ TOOL_ACTIONS: dict[str, tuple[str, ...]] = {
         "network",
     ),
     "bsk_debug": DEBUG_ACTIONS,
+    "bsk_load_tools": LOAD_TOOL_GROUPS,
     "bsk_interact": (
         "click",
         "hover",
@@ -475,23 +491,18 @@ _DEVICE_PROP = _p("string", "设备预设名。", enum=DEVICE_PRESETS)
 _WIDTH_PROP = _p("number", "宽度（CSS 像素）。resize 时为 100..7680，且必须与 height 同时给。")
 _HEIGHT_PROP = _p("number", "高度（CSS 像素）。resize 时为 100..7680，且必须与 width 同时给。")
 
-# ``bsk_debug`` 独占的 24 个参数（``debug_action`` 也在内）。
+# ``bsk_debug`` 独占的 23 个参数。
 #
 # 为什么单独抽一张表：``bsk_inspect`` 与 ``bsk_debug`` 是**互斥**的两套参数 ——
-# 日常读页面不需要那 3652 字符的调试参数说明，用到调试时才带 ``bsk_debug``。
+# 日常读页面不需要那 3260 字符的调试参数说明，用到调试时才带 ``bsk_debug``。
 # 抽表是为了让"哪些参数属于 debug"只有一处定义，两个 schema 都从这里取，
 # 也就不可能出现"拆分后某个参数两边都在/两边都没有"。
+#
+# 表里**没有** ``debug_action``：那只是 ``bsk_debug`` 刚造出来时给 ``action``
+# 起的别名，而 ``bsk_debug`` 是本次新增的工具、任何既有提示词都不可能写过它，
+# 所以别名是纯粹的冗余（多占 738 字符的 prompt，还让模型多一个选错的机会）。
+# 调试子动作的唯一入口就是工具级的 ``action``。
 _DEBUG_ONLY_PROPS: dict[str, Any] = {
-    "debug_action": _p(
-        "string",
-        "要执行的调试子动作的别名（与 action 同义，两者给一致的值即可，"
-        "一般只填 action 就够了）。取值 "
-        + " / ".join(DEBUG_ACTIONS)
-        + "。都要先 start 抓包，再去访问页面，最后读结果。"
-        "rule_add/rule_enable 能拦截、改写或伪造真实请求；"
-        "replay 会重新发送一次请求，可能改动服务端数据。",
-        enum=DEBUG_ACTIONS,
-    ),
     "id": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["id"]),
     "rule": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["rule"]),
     "replay": _p("string", _DEBUG_PROPERTY_DESCRIPTIONS["replay"]),
@@ -519,7 +530,7 @@ _DEBUG_ONLY_PROPS: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# 七个工具的完整 schema
+# 八个工具的完整 schema
 # ---------------------------------------------------------------------------
 
 def _schema(tool: str, properties: dict[str, Any]) -> dict[str, Any]:
@@ -620,6 +631,22 @@ TOOL_SCHEMAS: dict[str, dict] = {
             **_DEBUG_ONLY_PROPS,
         },
     ),
+    "bsk_load_tools": {
+        # 刻意**不**走 _schema()：那条路给 action 的说明是"要执行的操作"，
+        # 而这里的 action 是"要加载哪一组能力"，照抄会误导模型。
+        # 形状仍与其它工具一致（object + required=[action] + enum），
+        # 这样 test_required_is_only_action / enum 同源那几条断言照样成立。
+        "type": "object",
+        "required": ["action"],
+        "properties": {
+            "action": _p(
+                "string",
+                "要加载哪一组能力。目前只有 debug（抓包与网络调试），"
+                "填 debug 即可。加载只在当前这一轮对话里有效。",
+                enum=TOOL_ACTIONS["bsk_load_tools"],
+            ),
+        },
+    },
     "bsk_interact": _schema(
         "bsk_interact",
         {
@@ -711,7 +738,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
     ),
 }
-"""工具名 → 完整 JSON Schema（键与 :data:`TOOL_SCHEMAS` 一致，恰好 7 个）。
+"""工具名 → 完整 JSON Schema（键与 :data:`TOOL_ACTIONS` 一致，恰好 8 个）。
 
 每个 schema 都是 ``{"type": "object", "required": ["action"], "properties": {...}}``，
 properties 是该工具**全部 action 参数的并集**。
@@ -749,6 +776,14 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "典型顺序：先 start 开抓包，再去访问页面，最后读结果。"
         "rule_add/rule_enable 能拦截、改写或伪造真实请求；"
         "replay 会带着用户的 cookie 重新发送一次请求，可能改动服务端数据。"
+    ),
+    "bsk_load_tools": (
+        "按需加载能力。目前只有一组：debug（抓包与网络调试）。"
+        "当你需要查接口返回、慢请求、重复请求，或要拦截/改写/重放某个请求时，"
+        "先调用本工具加载 debug，之后就能使用 bsk_debug"
+        "（它的 action 取 performance / aggregate / requests / rule_add / replay 等）。"
+        "注意 bsk_debug 平时不在工具列表里，不先加载就用不了它。"
+        "加载只在当前这一轮对话里有效，用户的下一条消息需要重新加载。"
     ),
     "bsk_interact": (
         "与当前标签页交互。action 取 click / hover / wheel / scroll-to / focus / blur / fill / "
@@ -824,8 +859,10 @@ def normalize_args(raw: dict) -> dict:
         if value is None:
             continue
         if normalized == "action" and isinstance(value, str):
-            out[normalized] = value.strip().lower().replace("-", "_")
-        elif normalized == "debug_action" and isinstance(value, str):
+            # 连字符归一化只对 ``action`` 做：它是唯一一个取值里可能出现
+            # 连字符的键（``scroll-to`` / ``request-help``）。子动作的取值
+            # （``rule_add`` 这类）本身就用下划线，模型的 ``rule-add``
+            # 也在这一步被归一成 ``rule_add``，所以不需要第二张别名表。
             out[normalized] = value.strip().lower().replace("-", "_")
         elif isinstance(value, str):
             out[normalized] = value.strip()
@@ -885,11 +922,6 @@ class _Ctx:
 
     def where(self) -> str:
         return _where(self.tool, self.action)
-
-    def debug_action(self) -> str:
-        """当前 debug 子动作（调用前应先用 :meth:`require` 确认它非空）。"""
-        value = self.args.get("debug_action", "")
-        return value.strip().lower() if isinstance(value, str) else ""
 
     def fail(self, message: str) -> None:
         raise BskToolError(message)
@@ -1233,13 +1265,15 @@ def _validate_inspect(ctx: _Ctx) -> dict:
     action = ctx.action
     tab_id = _check_tab_id(ctx)
 
-    # ``debug`` 已拆成独立的 ``bsk_debug`` 工具。模型如果还按旧习惯往这里传
-    # ``debug_action``，必须明确告诉它换工具 —— 只说"不认识这个参数"会让它
-    # 以为参数名写错了，然后一直重试同一个工具。
+    # ``debug`` 已拆成独立的 ``bsk_debug`` 工具，而它默认**不注册**（由
+    # ``bsk_load_tools`` 按需加载）。模型如果还按旧习惯往这里传 ``debug_action``，
+    # 必须把两步都告诉它 —— 只说"改用 bsk_debug"，它会去工具列表里找一个
+    # 根本不存在的名字，然后卡住。
     if ctx.given("debug_action"):
         ctx.fail(
             f"{ctx.where()} 不接受 debug_action：调试已拆成独立的 bsk_debug 工具，"
-            "请改用 bsk_debug（把 action 设为原来的 debug_action 取值）。"
+            '请先调用 bsk_load_tools（action="debug"）加载它，'
+            "然后用 bsk_debug（action 设为原来的 debug_action 取值）。"
         )
 
     if action in ("observe", "snapshot"):
@@ -1304,7 +1338,7 @@ def _validate_inspect(ctx: _Ctx) -> dict:
                     "pointer", "run_id", "id", "rule", "replay", "slow_ms", "window_ms",
                     "part", "state", "kind", "fields", "wait_ms", "command_id", "output",
                     "name", "method", "resource_type", "status", "url",
-                    "include_controlled", "debug_action"):
+                    "include_controlled"):
             if ctx.given(key):
                 ctx.fail(
                     f"{ctx.where()} 不接受 {key}：它属于 bsk_debug 或 observe/snapshot，"
@@ -1326,7 +1360,7 @@ def _validate_inspect(ctx: _Ctx) -> dict:
                     "pointer", "run_id", "id", "rule", "replay", "slow_ms", "window_ms",
                     "part", "state", "kind", "fields", "wait_ms", "command_id", "output",
                     "name", "method", "resource_type", "status", "url",
-                    "include_controlled", "debug_action", "include_stack"):
+                    "include_controlled", "include_stack"):
             if ctx.given(key):
                 ctx.fail(
                     f"{ctx.where()} 不接受 {key}：它属于 bsk_debug 或 console，"
@@ -1358,31 +1392,12 @@ def _validate_debug(ctx: _Ctx) -> dict:
     （id 必填、pointer↔part、slow_ms 仅 aggregate、since 禁用于分析类、
     rule_add↔rule、<=81920 字符……）是过去几轮实测逐条钉下来的，拆工具时
     放松任何一条都等于把已修好的缺陷放回去。
+
+    子动作只有一个入口：工具级的 ``action``（schema 的 enum 就是那 24 个，
+    ``validate`` 已经确认它是合法取值之一，所以这里不需要再查一遍）。
     """
-    # 调试子动作有两个入口，取到同一个值：
-    #
-    # - ``action``：``bsk_debug`` 的工具级 action（schema 的 enum 就是那 24 个）；
-    # - ``debug_action``：拆分前 ``bsk_inspect(action="debug")`` 的写法。保留它作
-    #   别名，是为了让已经从旧描述里学会 "debug_action" 的对话/提示词不会因为
-    #   工具拆分而整条失败 —— 但它**不再必填**，唯一的事实源是 ``action``。
-    #
-    # 两个都给且不一致时报错，不静默取其一：那会让模型以为另一个生效了。
-    if ctx.has("debug_action") and ctx.debug_action() != ctx.action:
-        ctx.fail(
-            f"{ctx.where()} 同时给了 action={ctx.action!r} 与 "
-            f"debug_action={ctx.debug_action()!r}，两者不一致；"
-            "它们是同一个东西（要执行的调试子动作），请只给 action。"
-        )
     tab_id = _check_tab_id(ctx)
     debug_action = ctx.action
-    # ``__model__`` 是框架保留名，不是可用取值。tool 级的 action 已经显式拒绝它，
-    # 这里再兜一道：``debug_action`` 绕过同一个名字时行为必须一致。
-    if ctx.debug_action() == "__model__":
-        ctx.fail(
-            f"{ctx.where()} 的调试子动作不能是 __model__（那只是框架的内部提示符，"
-            "不是可执行操作）；可选值：" + " / ".join(DEBUG_ACTIONS) + "。"
-        )
-    ctx.as_enum("debug_action", DEBUG_ACTIONS)
 
     # --- 范围（先查范围，再查条件规则：范围错时先说范围）---
     values: dict[str, int | None] = {}
@@ -1469,7 +1484,7 @@ def _validate_debug(ctx: _Ctx) -> dict:
 
     ctx.check_known()
 
-    out: dict[str, Any] = {"debug_action": debug_action, "tab_id": tab_id}
+    out: dict[str, Any] = {"tab_id": tab_id}
     for key, value in values.items():
         if value is not None:
             out[key] = value
@@ -1501,6 +1516,22 @@ def _validate_debug(ctx: _Ctx) -> dict:
             out[key] = ctx.as_enum(key, allowed)
     out["include_controlled"] = ctx.as_bool("include_controlled")
     return out
+
+
+def _validate_load_tools(ctx: _Ctx) -> dict:
+    """``bsk_load_tools`` 的校验：只有 ``action``（=要加载的能力组）。
+
+    它没有别的参数 —— 加载哪一组由 ``action`` 表达，而 ``action`` 是否在
+    :data:`LOAD_TOOL_GROUPS` 里、是不是 ``__model__`` 这类保留名，都已经由
+    :func:`validate` 的统一入口查过（它按 :data:`TOOL_ACTIONS` 比对取值），
+    所以这里只剩一件事：拒绝 schema 之外的多余参数。
+
+    为什么值得给它一个校验器（而不是在 handler 里裸奔）：``**kwargs`` 透传
+    意味着 schema 外的参数不会被框架拦下，模型写 ``group="debug"`` 这类
+    猜测出来的参数名时，只有这一层能明确告诉它"参数名不对"。
+    """
+    ctx.check_known()
+    return {}
 
 
 def _validate_interact(ctx: _Ctx) -> dict:
@@ -1954,6 +1985,12 @@ def _validate_completion_criteria(ctx: _Ctx) -> dict | None:
 # ---------------------------------------------------------------------------
 
 # action 的两种写法（下划线与连字符）都接受，校验前先归一到 TOOL_ACTIONS 的写法。
+#
+# 这张表是从 ``TOOL_ACTIONS`` 生成的，所以它对**每个**工具都生效 —— 包括
+# ``bsk_debug``：它的 24 个子动作本身没有连字符，但模型的 ``rule-add`` /
+# ``rule-enable`` 会在 :func:`normalize_args` 里先被归一成 ``rule_add`` /
+# ``rule_enable``（那一步对 ``action`` 是无条件做的），于是直接就命中规范写法。
+# 所以这里不需要、也不该再有第二张"调试专用"的别名表。
 _ACTION_ALIASES: dict[str, str] = {
     alias: canonical
     for actions in TOOL_ACTIONS.values()
@@ -1967,14 +2004,10 @@ _VALIDATORS = {
     "bsk_page": _validate_page,
     "bsk_inspect": _validate_inspect,
     "bsk_debug": _validate_debug,
+    "bsk_load_tools": _validate_load_tools,
     "bsk_interact": _validate_interact,
     "bsk_tabs": _validate_tabs,
     "bsk_assist": _validate_assist,
-}
-
-# debugAction 同样接受下划线写法（rule_add → rule-add 之类的反向别名）。
-_DEBUG_ACTION_ALIASES: dict[str, str] = {
-    action.replace("-", "_"): action for action in DEBUG_ACTIONS
 }
 
 
@@ -1982,7 +2015,7 @@ def validate(tool_name: str, args: dict) -> dict:
     """校验并归一化某个工具的参数。
 
     Args:
-        tool_name: 七个工具名之一。
+        tool_name: 八个工具名之一。
         args: 已经过 :func:`normalize_args` 的参数（必须含 ``action``）。
 
     Returns:
@@ -2007,16 +2040,6 @@ def validate(tool_name: str, args: dict) -> dict:
             f"{tool_name} 的参数必须是对象，收到的是 {type(args).__name__}（{args!r}）。"
         )
 
-    # ``debug_action`` 是拆分前 ``bsk_inspect(action="debug")` 的旧写法，在
-    # ``bsk_debug`` 上保留为 ``action`` 的别名；同样接受下划线写法。
-    # 先归一，后续的条件规则才敢直接和 DEBUG_ACTIONS 里的字面值比。
-    if tool_name == "bsk_debug":
-        raw_debug = args.get("debug_action")
-        if isinstance(raw_debug, str):
-            raw_debug = raw_debug.strip().lower().replace("-", "_")
-            if raw_debug in _DEBUG_ACTION_ALIASES:
-                args = {**args, "debug_action": _DEBUG_ACTION_ALIASES[raw_debug]}
-
     ctx = _Ctx(tool_name, args)
 
     if not ctx.action:
@@ -2035,12 +2058,14 @@ def validate(tool_name: str, args: dict) -> dict:
     if canonical not in TOOL_ACTIONS[tool_name]:
         # 旧写法 ``bsk_inspect(action="debug")`` 单独给一条指向新工具的提示。
         # 泛泛地说"取值不对"会让模型以为名字写错了，然后反复重试同一个工具；
-        # 明确告诉它"调试已经搬到 bsk_debug"，它下一次调用就能成功。
+        # 而且 ``bsk_debug`` 默认**不在工具列表里**，只说"改用 bsk_debug"
+        # 它根本找不到，所以必须把"先 bsk_load_tools 加载"这一步也说出来。
         if canonical == "debug":
             raise BskToolError(
                 f"{tool_name} 的 action 不再接受 debug：调试已拆成独立的 bsk_debug 工具，"
-                "请改用 bsk_debug（把 action 设为原来的 debug_action 取值，例如 "
-                "bsk_debug 的 action=\"capabilities\"）。"
+                '它默认不注册 —— 请先调用 bsk_load_tools（action="debug"）加载它，'
+                "再用 bsk_debug（action 设为原来的 debug_action 取值，例如 "
+                'bsk_debug 的 action="capabilities"）。'
             )
         raise BskToolError(
             f"{tool_name} 的 action 必须是 "
