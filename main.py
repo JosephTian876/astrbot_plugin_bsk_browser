@@ -80,7 +80,8 @@ LOGS_LABELS: dict[str, str] = {
 #   ``bsk_logs`` 读控制台/网络日志。
 # - fringe：都有等价新工具，只是名字不同（``bsk_open`` → ``bsk_page``/``bsk_session``、
 #   ``bsk_read`` → ``bsk_inspect``、``bsk_act`` → ``bsk_interact``），所以默认不注册，
-#   省下约 1818 字符的固定 prompt 开销；仍在用旧名字的用户可以打开配置项找回它们。
+#   省下约 1900 字符的固定 prompt 开销（实测三格式 1941/2013/2061 取最小值）；
+#   仍在用旧名字的用户可以打开配置项找回它们。
 #
 # ``bsk_evaluate`` 在两个元组的**并集**里，但停用时会被跳过：它是**独立的高危开关**
 # （``enable_evaluate``），把它绑到 ``legacy_tools``/``legacy_fringe_tools`` 上会让

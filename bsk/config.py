@@ -90,8 +90,14 @@ DEFAULT_LEGACY_TOOLS = True
 
 默认开启，因为它是**向后兼容开关**：老用户可能已在 prompt、
 工作流或习惯里用着 ``bsk_open``/``bsk_read``/``bsk_act`` 这些名字，
-默认关掉等于静默删掉 8 个工具。想要更省上下文的用户可以显式关掉
-（关掉后只剩 7 个工具，可省约 3612 字符的 prompt）。
+默认关掉等于静默删掉旧工具。想要更省上下文的用户可以显式关掉。
+
+**关掉能省多少，取决于旧工具当时注册了几个**（两者共同决定）：
+
+- 默认配置（``legacy_fringe_tools=false``）：只停用常驻的 4 个，
+  每轮约省 1700 字符（实测 google/anthropic/openai = 1631/1739/1803）；
+- 若同时开着 ``legacy_fringe_tools=true``：8 个全停，
+  每轮约省 3600 字符（实测 3572/3752/3864）。
 
 注意：``bsk_evaluate`` 不受本开关影响 —— 它有独立的
 ``enable_evaluate``，是高风险工具，语义不同。
@@ -114,8 +120,9 @@ DEFAULT_LEGACY_FRINGE_TOOLS = False
 "兼容保留，新用法请优先用新工具"。所以关掉它们不会失去任何能力，
 只是让仍在用旧写法的 prompt 失效 —— 需要那三个名字的用户把它改成 True 即可。
 
-代价/收益：关掉后每轮对话少带 3 份工具说明（实测 anthropic 路径约 1818 字符，
-见 README 的实测表），模型不再能调用 ``bsk_open`` / ``bsk_read`` / ``bsk_act``。
+代价/收益：关掉后每轮对话少带 3 份工具说明（实测 google/anthropic/openai
+= 1941/2013/2061 字符，见 README 的实测表），模型不再能调用
+``bsk_open`` / ``bsk_read`` / ``bsk_act``。
 
 与 ``legacy_tools`` 的分工：后者管的是"旧工具整体要不要"，本项管的是
 "旧工具里最没用的那一小撮要不要"。常用且**没有替代品**的 4 个
@@ -656,9 +663,12 @@ class Settings:
     legacy_tools: bool
     """是否同时注册旧版工具（0.1.x 的 8 个单动作工具）。
 
-    默认 ``True``（向后兼容）。关掉后只注册 6 个多动作工具，
-    可省下约 3612 字符的 prompt —— 代价是模型不能再调用旧工具名。
-    但它会**连带停掉**常用的 ``bsk_status`` / ``bsk_close`` /
+    默认 ``True``（向后兼容）。关掉后只剩多动作工具，代价是模型不能再
+    调用旧工具名。**省下多少取决于旧工具当时注册了几个**：默认配置下
+    只停常用的 4 个（约 1700 字符）；若同时开着 :attr:`legacy_fringe_tools`，
+    则 8 个全停（约 3600 字符）。
+
+    注意它会**连带停掉**常用的 ``bsk_status`` / ``bsk_close`` /
     ``bsk_screenshot`` / ``bsk_logs``，只想去掉罕见的那三个请改关
     :attr:`legacy_fringe_tools`。
 
@@ -757,7 +767,8 @@ class Settings:
     **只在 :attr:`legacy_tools` 为 True 时才有意义** —— 后者关掉会把 8 个旧工具
     全部停掉，本项填什么都不影响结果。
 
-    这三个都有等价的新工具，默认不注册可省约 1818 字符的 prompt。
+    这三个都有等价的新工具，默认不注册可省约 1900 字符的 prompt
+    （实测 google/anthropic/openai = 1941/2013/2061，取最小值取整）。
     常用且无替代品的 4 个（``bsk_status`` / ``bsk_close`` / ``bsk_screenshot`` /
     ``bsk_logs``）归常驻组，不受本项影响；``bsk_evaluate`` 有独立开关，同样不受影响。
 

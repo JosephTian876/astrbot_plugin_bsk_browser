@@ -1,6 +1,6 @@
 # astrbot_plugin_bsk_browser — 架构与实施方案
 
-> 版本：v0.2.0（6 个主工具 + 8 个兼容旧工具的 14 工具形态）
+> 版本：v0.2.0（8 个主工具 + 8 个兼容旧工具；默认只注册 12 个）
 > 目标读者：实现该插件的工程师（含 subagent）
 > 依据：本仓库外的调研资料（6 份调研报告，未随仓库分发）+ 本机实测
 >
@@ -21,7 +21,7 @@
 **核心价值**：AstrBot 现有浏览器插件都是"开一个干净的无头浏览器"，用不了用户已登录的账号。本插件复用用户的真实登录态。
 
 非目标（明确不做，避免范围蔓延）：
-- 不实现 `evaluate`（执行任意 JS）—— 安全风险，v1 不开放
+- 不**默认**开放 `evaluate`（执行任意 JS）—— 安全风险；v0.1.0 起它作为独立工具 `bsk_evaluate` 提供，但默认关闭且强制管理员（见 §5 D7）
 - 不捆绑 `bsk` 二进制 —— 合规红线，必须用户自装
 - 不支持远程（非 loopback）模式 —— bsk 远程模式本身不支持文件传输
 
@@ -70,18 +70,18 @@
 │  · pages.py     VOM 语义解析：标题提取、ref 提取、截断       │
 │  · shots.py     截图：唯一路径、魔数校验、清理              │
 │  · journal.py   会话所有权 journal：原子写、损坏即忽略      │
-│  · tools.py     6 个主工具的规格唯一事实源（见 §3.1）        │
+│  · tools.py     8 个主工具的规格唯一事实源（见 §3.1）        │
 │  · service.py   业务编排（tools 的纯逻辑实现，不含装饰器）   │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ### 3.1 `bsk/tools.py` 的职责（为什么它必须零框架依赖）
 
-这个模块是 **6 个主工具规格的唯一事实源**，只做四件事，全是纯函数：
+这个模块是 **8 个主工具规格的唯一事实源**，只做四件事，全是纯函数：
 
 | 导出 | 职责 |
 |---|---|
-| `TOOL_ACTIONS` | 工具名 → 该工具声明的 action 元组（`bsk_session` 3 个、`bsk_page` 5 个、`bsk_inspect` 7 个、`bsk_interact` 9 个、`bsk_tabs` 6 个、`bsk_assist` 3 个，合计 33 个） |
+| `TOOL_ACTIONS` | 工具名 → 该工具声明的 action 元组（`bsk_session` 3 个、`bsk_page` 5 个、`bsk_inspect` 6 个、`bsk_debug` 24 个、`bsk_load_tools` 1 个、`bsk_interact` 9 个、`bsk_tabs` 6 个、`bsk_assist` 3 个，合计 57 个） |
 | `TOOL_SCHEMAS` | 工具名 → 完整 JSON Schema。`action` 的 `enum`、`debug_action` 的 24 项枚举、`device` 的 7 个预设等**都从上面的枚举生成**，不手抄 |
 | `TOOL_DESCRIPTIONS` | 工具名 → 给模型看的中文描述。⚠️ 当前注册路径下，模型真正看到的描述来自 `main.py` 的 docstring（`@filter.llm_tool` 只从 docstring 取 `description`，覆写管线只替换 `parameters`）；这个字典目前由 `tests/test_tools.py` 校验"非空且是中文"，是描述的**规约与回归基准**，尚未接线到注册管线 |
 | `normalize_args` / `validate` | 参数归一化（同时接受 `snake_case` 与 `camelCase`）与**逐 action 校验**；失败抛 `BskToolError`，`str()` 出来就是给模型看的中文提示 |
@@ -90,7 +90,7 @@
 
 1. **它是被覆写进框架的载荷本身。** `main.py` 只是把 `TOOL_SCHEMAS` 的值 deepcopy 到已注册工具上（§5 D8）。如果把 schema 的构造写进 `main.py`，那 `main.py` 就从「薄适配层」变成「规格 + 适配混在一起」，C2 逼出来的分层立刻失效。
 2. **AstrBot 的 Schema 方言不是通用 JSON Schema，必须能独立验证。** 框架的类型白名单是 `{string, number, object, array, boolean}` —— **没有 `integer`**，因为 AstrBot 的 `spec_to_func` 走的是它自己的那套转换。所以本模块里所有整数语义的参数（`limit`、`max_depth`、`timeout_ms`、`width`…）一律声明成 `"number"`，整数性与范围改由 `validate` 在运行时检查。这类"方言"约束只有在能脱离框架反复跑单测时才好守。
-3. **per-action 校验天然是纯逻辑。** DSH 的结构是「公共 schema 只有 `action` 必填、其余参数是扁平并集，真正的必填/互斥/范围校验在 handler 里做」。本插件复刻了这个两层结构，但把第二层下沉成了纯函数 —— 于是 33 个 action 的校验分支可以用 `tests/test_tools.py`（77 个用例）直接覆盖，不需要启动 AstrBot、不需要真实浏览器。
+3. **per-action 校验天然是纯逻辑。** DSH 的结构是「公共 schema 只有 `action` 必填、其余参数是扁平并集，真正的必填/互斥/范围校验在 handler 里做」。本插件复刻了这个两层结构，但把第二层下沉成了纯函数 —— 于是 57 个 action 的校验分支可以用 `tests/test_tools.py`（103 个用例）直接覆盖，不需要启动 AstrBot、不需要真实浏览器。
 
 **为什么 `required` 只写 `action`**：AstrBot 的 `spec_to_func` 只构造 `{type: "object", properties}`，**不生成 `required`**。我们走的是「装饰器注册后覆写 `parameters`」这条路（§5 D8），覆写后的 schema 会被原样交给 provider，所以这里写的 `required: ["action"]` 是**真的会传给模型**的（DSH 侧同样如此）。其余参数的必填仍然只能靠 `validate` 在运行时报中文错 —— AstrBot 读不懂 per-action 的必填。
 
@@ -101,9 +101,9 @@
 **数据落盘位置**：会话所有权 journal 与截图默认都落在**插件数据目录** `data/plugin_data/astrbot_plugin_bsk_browser/` 下（由 `bsk/paths.py` 统一解析，见 §4.7）。该目录由 `main.py` 通过 `StarTools.get_data_dir("astrbot_plugin_bsk_browser")` 取得后注入；取不到时逐级降级，最终退回系统临时目录，**任何一步都不抛异常**（它在插件加载路径上，抛异常等于插件加载失败）。
 
 **为什么这样分**：
-- `C2` 强制工具函数必须在 `main.py`。若把业务逻辑也写进去，`main.py` 会变成数千行巨石（v0.1.0 的骨架就已经是 44KB 单文件；当前 `main.py` 是 2056 行 / 101KB，其中相当一部分还是**不可避免**的 14 个工具函数本身）。
-- 因此让 `main.py` 只做薄适配：每个工具函数 5-15 行，负责"取参数、调 service、包结果"。14 个工具的 schema、归一化、逐 action 校验全部下沉到 `bsk/tools.py`（§3.1）—— 那是本次改造把 `main.py` 的体积增长摁住的关键：**多出来的 6 个工具几乎没有给 `main.py` 增加规格代码**，只增加了分派与渲染。
-- 真正的逻辑在 `bsk/service.py`（当前 3374 行）及其依赖，不 import astrbot，所以可以直接 `pytest` 跑，不需要启动 AstrBot。`bsk/` 包当前合计 10740 行。
+- `C2` 强制工具函数必须在 `main.py`。若把业务逻辑也写进去，`main.py` 会变成数千行巨石（v0.1.0 的骨架就已经是 44KB 单文件；当前 `main.py` 是 2307 行 / 约 114KB，其中相当一部分还是**不可避免**的 16 个工具函数本身）。
+- 因此让 `main.py` 只做薄适配：每个工具函数 5-15 行，负责"取参数、调 service、包结果"。16 个工具的 schema、归一化、逐 action 校验全部下沉到 `bsk/tools.py`（§3.1）—— 那是本次改造把 `main.py` 的体积增长摁住的关键：**多出来的 8 个主工具几乎没有给 `main.py` 增加规格代码**，只增加了分派与渲染。
+- 真正的逻辑在 `bsk/service.py`（当前 3374 行）及其依赖，不 import astrbot，所以可以直接 `pytest` 跑，不需要启动 AstrBot。`bsk/` 包当前合计 11761 行。
 - 同理 `bsk/` 也不 import 内置 `logging`：日志能力同样通过注入获得，未注入时走 `NULL_LOGGER`。这让"脱离框架单测"这条价值不被日志需求侵蚀 —— 单测里既不产生日志输出，也不需要搭建日志设施。
 
 ---
@@ -258,7 +258,7 @@ def default_shot_dir(data_dir, logger=None) -> Path:      # <data_dir>/shots
 - 前者让框架完成 handler 注册与插件实例绑定，单一事实来源，不易写错；
 - 后者需手写 JSON schema，且要自己管 `handler_module_path` 与 `functools.partial` 的实例绑定管线。
 - 代价：工具函数必须在 `main.py`（C2），已由分层设计消化。
-- 6 个主工具的 schema 表达力不够（装饰器路径丢弃 `enum`），由 D8 的覆写管线补齐。
+- 8 个主工具的 schema 表达力不够（装饰器路径丢弃 `enum`），由 D8 的覆写管线补齐。
 
 ### D2：权限默认仅管理员，且可调（用户要求 #5）
 
@@ -303,6 +303,8 @@ AstrBot 原生的 `tool_permissions`），也不给它任何"自动降级"路径
 | 命令 | 内置下限 |
 |---|---|
 | status / browsers / session list / console / network | 5s |
+| `session request --help`（能力探测） | 10s |
+| `session request` 的 prepare / claim / cancel / query | 30s（它们不建窗口、不导航，只改 daemon 侧记账） |
 | observe | 15s |
 | session start | 30s |
 | navigate | 45s（必须 > bsk 自身默认 30s） |
@@ -428,16 +430,16 @@ if not evaluation.ok:           # ← 不能省
 - 返回值可以是任意大的 JSON（实测 2000 元素数组 = 32947 字符），
   必须截断 —— 复用 `max_page_chars`，不新增配置项。
 
-### D8：6 个主工具的注册管线 —— 装饰器注册 + `initialize()` 里覆写 `parameters`
+### D8：8 个主工具的注册管线 —— 装饰器注册 + `initialize()` 里覆写 `parameters`
 
 **结论（一句话）**：用 `@filter.llm_tool` 让框架完成 handler 注册与实例绑定，
 然后在 `initialize()` 里把已注册工具的 `parameters` **整体替换**成 `bsk/tools.py`
 里的完整 schema。
 
 **为什么不能只用纯装饰器**（路径甲）：装饰器从 docstring 的 `Args:` 段生成 schema，
-那条路径**支持的 `type` 只有 5 种，且会丢弃 `enum`**。而本插件的 6 个工具全靠
-`action` 的枚举告诉模型有哪些动作可选 —— `bsk_inspect` 的 `debug_action` 更是有
-24 个取值。丢掉 `enum` 等于把「33 个 action 的多动作工具」降级成「参数含义不明的
+那条路径**支持的 `type` 只有 5 种，且会丢弃 `enum`**。而本插件的 8 个工具全靠
+`action` 的枚举告诉模型有哪些动作可选 —— `bsk_debug` 的 `action` 更是有
+24 个取值。丢掉 `enum` 等于把「57 个 action 的多动作工具」降级成「参数含义不明的
 单个函数」，这次移植的核心价值就没了。
 
 **为什么不用手工 `add_func` + 手工注册 handler**（路径乙）：那要自己接
@@ -467,7 +469,7 @@ if not evaluation.ok:           # ← 不能省
 代价是那个工具少了 action 枚举，远比整个机器人每条消息都报错轻。**刻意不引入
 `jsonschema` 依赖** —— 本插件要求纯标准库。
 
-**handler 签名契约**：6 个新工具一律写成
+**handler 签名契约**：8 个新工具一律写成
 
 ```python
 @filter.llm_tool("bsk_session")
@@ -487,17 +489,27 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 以内（token 成本）。
 
 **旧 8 个工具不走这条管线**，它们就是普通的装饰器工具，schema 由 docstring 生成，
-与 0.1.x 完全一致。它们由配置项 `legacy_tools` 控制是否停用（§5 D9）。
+与 0.1.x 完全一致。它们由配置项 `legacy_tools` 与 `legacy_fringe_tools` 两级控制（§5 D9）。
 
-### D9：`legacy_tools` —— 用运行期 `active` 而非框架的停用 API
+### D9：旧工具的两级开关（`legacy_tools` / `legacy_fringe_tools`）—— 用运行期 `active` 而非框架的停用 API
 
-6 个主工具落地后，14 个工具并存会降低模型的选择准确率，同时 8 个旧工具的说明是
-**每一轮对话都要付的固定开销**。所以提供 `legacy_tools`（**默认 `true`**）让用户
-自己决定要不要带着兼容层跑。
+8 个主工具落地后，16 个工具并存会降低模型的选择准确率，同时 8 个旧工具的说明是
+**每一轮对话都要付的固定开销**。所以给旧工具两级开关，让用户自己决定带不带兼容层跑：
 
-**为什么默认必须是 `true`**：AstrBot 的插件配置是 merge 语义（缺失键插默认值、
+| 配置 | 默认 | 管什么 | 停用后剩下 |
+|---|---|---|---|
+| `legacy_tools` | `true` | 全部 8 个旧工具 | 8 个主工具（`bsk_debug` 按需加载时是 7 个）+ `bsk_evaluate` |
+| `legacy_fringe_tools` | `false` | 其中"有等价新工具"的 3 个：`bsk_open` / `bsk_read` / `bsk_act` | 常用的 4 个继续注册 |
+
+**为什么 `legacy_tools` 默认必须是 `true`**：AstrBot 的插件配置是 merge 语义（缺失键插默认值、
 已有的非 `None` 值原样保留）且加载时立即写盘。默认 `true` → 老用户升级后一切照旧；
 默认 `false` → 等于**静默关掉** 7 个旧工具（`bsk_evaluate` 除外），正在用旧写法的提示词会毫无预兆地发现工具"没了"。
+
+**为什么 `legacy_fringe_tools` 默认是 `false`**：这是本次升级唯一会让老用户感知到的默认变化，
+之所以敢默认关，是因为那 3 个都有等价的新工具（`bsk_open` → `bsk_page` + `bsk_inspect`、
+`bsk_read` → `bsk_inspect`、`bsk_act` → `bsk_interact`），关掉不减能力；而常用的 4 个
+要么新工具做不到（`bsk_screenshot` 会真的发图片、能整页截图），要么是诊断入口
+（`bsk_status`、`bsk_logs`），所以留在 `legacy_tools` 这一级。两个开关都开时才是"全兼容"形态。
 
 **为什么直接设 `tool.active = False`，而不是调框架的 `deactivate_llm_tool_async`**：
 后者会把这个名字写进**持久化**的 `inactivated_llm_tools`（全局 SharedPreferences）。
@@ -515,35 +527,130 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 它是**独立的高危开关**，由 `enable_evaluate` 控制（§5 D7）。把它绑到 `legacy_tools`
 上会让用户误以为"关掉旧工具"就等于"关掉执行脚本"，而实际上它归另一项管。
 
-**量化收益**（实测，本机 AstrBot 4.28.1，按框架真正序列化给 provider 的
-`get_func_desc_openai_style()` 体积计）：
+**量化收益**（实测，本机 AstrBot 4.28.1，把这 12~16 个工具按 `ToolSet` 序列化成 provider
+真正收到的那份 JSON，取 `len(json.dumps(..., ensure_ascii=False))`；三种 provider 格式分别计）：
 
-| 配置 | 注册的工具数 | 本插件工具说明的序列化体积 |
-|---|---|---|
-| `legacy_tools=true`（默认） | 14 | 19398 字符 |
-| `legacy_tools=false` | 7 | 15534 字符 |
+| 配置 | 注册的工具数 | Google | Anthropic | OpenAI |
+|---|---|---|---|---|
+| 本仓库 `10dd1f7`（本次改造前：6 主 + 8 旧，`bsk_inspect` 含 24 个调试参数） | 14 | 18914 | 19097 | 19417 |
+| `legacy_tools=true` + `legacy_fringe_tools=true` + `lazy_debug_tool=false` | 16 | 20178 | 20365 | 20749 |
+| `legacy_tools=true` + `legacy_fringe_tools=true` | 15 | 15241 | 15426 | 15778 |
+| **默认**（`legacy_tools=true`、fringe 关、调试按需加载） | **12** | **13300** | **13413** | **13717** |
+| `lazy_debug_tool=false`（`bsk_debug` 一直注册） | 13 | 18237 | 18352 | 18688 |
+| `legacy_tools=false` | 8 | 11669 | 11674 | 11914 |
 
-差 **3612 字符/轮**。注意关掉后是 **7 个而不是 6 个** —— 多出来的那个正是
+几个能直接读出来的结论：
+
+- **默认比改造前省 5614 / 5684 / 5700 字符（约 29%）**；
+- **关掉 `legacy_tools` 相对默认再省 1631 / 1739 / 1803 字符**，而不是省下"8 个旧工具"的
+  全部开销 —— 因为默认状态下 fringe 那 3 个本来就没注册；「8 个旧工具全开」与「全关」之间的
+  差额是 3572 / 3752 / 3864 字符（`_conf_schema.json` 的 hint 里写的"约 3600 字符"是这个口径）；
+- **打开 `legacy_fringe_tools` 多付 1941 / 2013 / 2061 字符**（hint 里写的"约 1900"）；
+- **关掉 `lazy_debug_tool` 多付 4937 / 4939 / 4971 字符**（hint 里写的"约 5000"）。
+
+注意 `legacy_tools=false` 后仍是 **8 个而不是 7 个**：多出来的那个正是
 不受本项影响的 `bsk_evaluate`。
 
 ### D10：与 DSH（`dsh-plugin-browserskill`）的有意差异
 
-6 个主工具的目标是"使用体验等价"，但**不是逐字节复刻**。下面每一条差异都是
+8 个主工具的目标是"使用体验等价"，但**不是逐字节复刻**。下面每一条差异都是
 有意为之，理由写在第三列 —— 不是没做完。
 
 | 项 | DSH | 本插件 | 理由 |
 |---|---|---|---|
-| `request_id` / 可恢复启动 | 支持 | **不支持** | 依赖 `session request` 的三态语义，而那条路我们未能实测确认。宁可少一个参数，也不实现一个语义没吃透的恢复路径 —— 它在"恢复错了会话"时的代价是操作到用户的另一个页面 |
+| `request_id` / 可恢复启动 | 支持（模型可传的参数） | **支持**（插件驱动，模型看不到这个参数） | 语义已实测确认（`session request` 的 prepare 预约 / claim 认领 / cancel 关闭 / 未预约令牌返回 `unknown`）。本插件把它做成插件内部机制而不是工具参数：令牌由插件生成、**写前落盘**、启动后认领，只由 `enable_request_id` 控制。理由见 §5 D12 下方 —— 令牌一旦由模型填，恢复路径的正确性就取决于模型是否填对值，而它只在启动失败这条罕见路径上起作用 |
 | `current` 会话回退 | `stop` 后回退到最近的 active 会话 | **不回退** | 有意分歧。自动回退意味着"关掉 A 之后，下一个操作打在 B 上"，而 B 是用户可能没意识到还开着的会话。不回退会让模型明确地重新 `start`，代价是一次多余调用，换来的是不会误操作另一个会话 |
-| 会话状态机 | `starting` / `active` / `cleanup` 三态 | 只有 `owns()` | 未实现"半途失败的 start"清理。AstrBot 侧没有对应的生命周期事件可挂；会话泄漏由 journal + `recover_orphans()` 在下次启动时兜底（§4.3 与 §6.1） |
+| 会话状态机 | `starting` / `active` / `cleanup` 三态 | 只有 `owns()` | 未实现"半途失败的 start"清理。AstrBot 侧没有对应的生命周期事件可挂；会话泄漏由 journal + `recover_orphans()` 在下次启动时兜底（§4.3 与 §6.1），启动超时留下的孤儿窗口另由可恢复启动的令牌路径兜底（§5 D12） |
 | SSE 实时观察 / 侧边栏 UI / 缩略图 | 有 | **无** | 展示层能力。AstrBot 没有 DSH 的 `webServer` 路由 seam 与客户端插件体系，无承载之处 |
-| `lazyTools`（skill 调用后才注册工具） | 有 | **无**（改用配置项） | AstrBot 其实有 skills 子系统，但本次不移植。替代方案是 `legacy_tools` 这个**加载期**开关（§5 D9）—— 做不到"模型调用后才注册"，但能把不用的工具从 prompt 里拿掉 |
+| `lazyTools`（大工具按需注册） | 有（skill 调用后注册） | **支持**（模型调用 `bsk_load_tools` 后加载 `bsk_debug`） | 触发方式不同：DSH 靠 skill 触发，本插件靠一个常驻的小工具触发；本插件改的是**当轮** `ProviderRequest.func_tool`，同一轮的下一次请求就生效，不必等下一步操作（§5 D11）。它替换掉了早先"只能在插件加载期开关"的权宜方案 |
 | `bsk_evaluate` | **不暴露** | **保留**（独立开关 + 强制管理员） | 本插件**超出** DSH 的部分。这是 0.1.x 的既有功能，且风险已由 `enable_evaluate` + `evaluate_require_admin` 两道独立闸单独门控（§5 D7）。移除它等于回退既有能力 |
 | `bsk_screenshot` 的 `full_page` | 未暴露 | **保留** | 同上，既有功能，且严格更强（能截整个长页面）。注意新工具的 `screenshot` 是 DSH 语义，没有整页能力 |
 | 新 `screenshot` 是否把图片发给用户 | 会发 | **不发**（只回文字） | 新 handler 返回 `str`，不是 async generator，拿不到 `yield event.image_result(...)` 那条路。这是本次改造里**唯一的功能回退点**，因此旧工具 `bsk_screenshot` 必须保留 |
 
-**反向说明（本插件比 DSH 弱、且短期内不打算补的）**：上面第 1、3 行属于功能性缺口；
+**反向说明（本插件比 DSH 弱、且短期内不打算补的）**：上面第 3 行属于功能性缺口；
 第 4 行属于展示层缺口，**不影响工具功能的等价性**。
+
+### D11：`bsk_debug` 的按需加载（`lazy_debug_tool`）—— 改**当轮** `req.func_tool`
+
+`bsk_debug` 的 schema 有 4431 字符（24 个 action 的参数说明），而绝大多数对话并不调试网络。
+所以默认（`lazy_debug_tool=true`）不把它注册给模型，改由常驻的小工具 `bsk_load_tools`
+在模型真的需要调试时把它加载进来。
+
+**完整链路**（行号为本机 AstrBot 4.28.1 源码实测）：
+
+| 位置 | 做什么 |
+|---|---|
+| `astr_main_agent.py:1547` | `event.set_extra("provider_request", req)` —— 把**同一个** `ProviderRequest` 对象存进事件 extra |
+| `astr_main_agent.py:1753` | `agent_runner.reset(request=req, ...)` —— 同一个对象又交给 runner |
+| `runners/tool_loop_agent_runner.py:234` | `self.req = request` |
+| `runners/tool_loop_agent_runner.py:504-506` | `payload = { ... "func_tool": self._func_tool_for_provider(), ... }` |
+| `runners/tool_loop_agent_runner.py:678` | `return self.req.func_tool` —— **每步现读**，不是初始化时的快照 |
+| `runners/tool_loop_agent_runner.py:1096` | 主循环 `while not self.done() and step_count < max_step:` |
+
+三条要点：
+
+1. **handler 里改 `req.func_tool`，同一轮的下一步就生效。** `bsk_load_tools` 的 handler 用
+   `event.get_extra("provider_request")` 取回那个对象，把 `bsk_debug` 的 `FunctionTool`
+   加进它的 `func_tool`；runner 下一步构造 payload 时现读 `self.req.func_tool`，于是**下一次**
+   LLM 请求就带上了 `bsk_debug`。不需要等下一轮对话，也不需要任何框架 hook。
+2. **不会污染别的会话。** `ProviderRequest` 是每轮请求新建的，`func_tool` 是该请求私有的；
+   用户的下一条消息会重新构造请求，`bsk_debug` 自然回到未加载状态 —— 这正是要的语义
+   （"只在当前这轮有效"）。所以**只**往 `req.func_tool` 里加东西，绝不碰全局 `active`。
+3. **为什么用全局 `active=False` + 当轮加载，而不是一直开着。** `bsk_debug` 在
+   `lazy_debug_tool=true` 时是 `active=False` 的；`ToolSet` 的三个 schema 序列化器都不按
+   `active` 过滤，`llm_tools.get_func` 对未激活的同名工具也会退化返回一个 —— 所以"加进当轮
+   `req.func_tool`"就等于对它**临时激活一轮**。全局关掉是为了"不默认付那 4431 字符"，
+   当轮加进去是为了"要用时能用"，两者不在一个层次上。设置 `active` 用的是直接赋值而不是
+   框架的 `deactivate_llm_tool_async`，理由与旧工具开关相同（§5 D9）：后者会写**持久化**的
+   全局配置，卸载插件也带不走。
+
+**为什么加载入口必须是另一个工具**：不能把"加载"做成 `bsk_debug` 自己的一个参数 ——
+那是循环依赖，模型得先"看见" `bsk_debug` 才能传参给它。所以入口只能是另一个**常驻**的
+小工具（181 字符的 schema），它自己不操作浏览器，只负责把大工具加进当轮请求。
+
+**一个已知边界**（源码阅读，未实测）：AstrBot 还有 `tool_schema_mode="skills_like"` 模式，
+该模式下 runner 初始化时会把 `self.req.func_tool` **替换**成一份轻量工具集
+（`runners/tool_loop_agent_runner.py:298-306`）。加载逻辑作用在同一个 `self.req.func_tool`
+对象上，所以 `bsk_debug` 会带着**完整 schema** 进入当轮请求 —— 功能上没问题，只是这一个
+工具不吃轻量化省下的 token。默认模式是 `full`，不走这条路径。
+
+### D12：可恢复启动（`enable_request_id`）—— 写前落盘的一次性令牌
+
+**要修的缺陷**（实测确认）：`session start` 超时会让窗口成为永久孤儿。
+
+```
+fresh = await self._start(...)     # ← 超时在这里抛异常
+self._journal_add(fresh)           # ← 永远执行不到
+```
+
+窗口可能已经开出来了，但调用方拿不到 `session_id`，于是 journal 里没有任何记录，
+`recover_orphans()` 也够不着它 —— 桌面上留下一个既关不掉、也清理不掉的浏览器窗口
+（重启 AstrBot 同样带不走，因为插件自己都不知道它存在）。
+
+**对策**：把"先启动、后落盘"倒过来。核心不变式是「**绝不带着 `--request-id` 发出 start，
+却没有持久化的令牌**」—— 令牌是 start 回执丢失后唯一能把窗口找回来的东西，落盘晚一步就等于没落：
+
+```
+写前落盘令牌 → session request <令牌> --prepare → session start --request-id <令牌> → --claim
+```
+
+任一步失败时的裁决（`bsk/session.py` 的 `_restart`）：
+
+| 失败点 | 处理 | 理由 |
+|---|---|---|
+| 令牌写不进 journal | 不带令牌走普通启动（= 旧行为），并记 `request_write_ahead_failed` | 拒绝启动会让"数据目录不可写"这种环境问题把整个浏览器功能瘫痪；要守的不变式是"带了令牌就必须落了盘"，既然没落盘就不带 |
+| `--prepare` 失败 | `--cancel` + 清记录 + 抛错 | 还没发 start，窗口一定不存在（实测 `--prepare` 返回 `session: null`） |
+| `start` 抛异常（含 `CancelledError`） | 凭令牌 `--cancel`；确认窗口不在才清记录，没确认就**保留**记录留给下次启动重试 | 此刻 start 的结果**未知**，可能什么都没建、也可能窗口已开而回执丢了 |
+| `--claim` 失败 | 凭令牌 `--cancel`，记录同样只在确认后清理 | 落盘发生在 claim **之前**，所以此刻 journal 里已经有带 `session_id` 的记录，即便取消没被确认，v1 的 journal 兜底路径仍覆盖得住这个窗口 |
+
+**实测确认的 `bsk session request` 语义**（本机 bsk 0.3.2，真实 daemon）：
+`session request <令牌> --help` → exit 0 且输出含 `--prepare`；`--prepare` →
+`{"state": "prepared", "session": null}` 且**不开窗口**；未 prepare 过的令牌查询 →
+`{"state": "unknown"}`，exit 0；`--cancel` → `{"state": "closed", "cleanup_error": null}`；
+对不存在的令牌 `--claim` → exit 1 + `code="not_found"`。
+
+**代价**：每次建立新会话多两条命令（prepare + claim），实测约多花 80 毫秒，只在新会话
+建立时产生一次。`enable_request_id=false` 完全回到旧行为 —— 它是排查用的回退开关。
 
 ---
 
@@ -553,10 +660,10 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制、6 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（735 个用例，`unittest` 口径） |
-| L2 契约测试 | `main.py` 能被真实 AstrBot import、14 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制、8 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（840 个用例，`unittest` 口径） |
+| L2 契约测试 | `main.py` 能被真实 AstrBot import、16 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
 | L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与会话过期自动重建 | ✅ | ✅ | `verify_integration.py` |
-| L4 工具层端到端 | 直接 await `main.py` 里的工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py`（6 个旧工具：`bsk_open/read/act/screenshot/close/status`）、`verify_logs_tool.py`（`bsk_logs`）、`verify_evaluate_gate.py`（`bsk_evaluate` 的权限三分支）、`verify_new_tools_real.py`（6 个新工具、33 个 action，34 项） |
+| L4 工具层端到端 | 直接 await `main.py` 里的工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py`（6 个旧工具：`bsk_open/read/act/screenshot/close/status`）、`verify_logs_tool.py`（`bsk_logs`）、`verify_evaluate_gate.py`（`bsk_evaluate` 的权限三分支）、`verify_new_tools_real.py`（8 个新工具、57 个 action） |
 
 **为什么必须有 L4**：L2 只证明工具"注册成功"，L3 只走到服务层。工具函数内部那层
 （URL 校验、权限判定、`bsk_screenshot` 的 async generator、异常是否被吞掉）
@@ -579,6 +686,8 @@ async def bsk_session(self, event: AstrMessageEvent, **kwargs):
 | `verify_failure_ux.py` | 环境未就绪时的提示质量（不能是 Python 堆栈） | ❌ |
 | `verify_stop_timing_real.py` | `session stop` 真实耗时（为超时预算提供数据依据） | ✅ |
 | `verify_wait_navigation_real.py` | 新增暴露的 `wait_for_navigation` 动作真实可用且只读 | ✅ |
+| `verify_lazy_debug_real.py` | `bsk_debug` 按需加载的完整链路：默认不在工具列表、调 `bsk_load_tools` 后进入**当轮** `req.func_tool`、加载后能真的执行；以及"重新按注册表构造的请求里它仍然不在"（证明没有偷偷改全局） | ✅ |
+| `verify_legacy_groups.py` | `legacy_tools` × `legacy_fringe_tools` 四种组合的真实注册数（15 / 12 / 8 / 8）、`bsk_evaluate` 始终在、`lazy_debug_tool=false` 时 `bsk_debug` 回来 | ❌ |
 | `verify_release_ready.py` | 发布前自检（37 项）：元数据、合规红线、架构约束、工作区卫生 | ❌ |
 
 logger 注入与数据落盘位置这两条改动另有专门的单元测试，见 §6.3。
@@ -588,14 +697,17 @@ logger 注入与数据落盘位置这两条改动另有专门的单元测试，�
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd <插件目录>                                 # 即本仓库根目录
-& $py -m unittest discover -s tests        # L1（735 个）
+& $py -m unittest discover -s tests        # L1（840 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）
 & $py tests\verify_release_ready.py        # 发布前自检
 ```
 
-**注意**：本机 `pytest` 不可用（`ModuleNotFoundError`），全部测试用 `unittest`。
+**注意**：AstrBot 自带的那个解释器里没有 `pytest`（`ModuleNotFoundError`），所以上面一律用
+`unittest`；本机另有一个装了 pytest 的独立解释器（`D:\Python312\python.exe`），可以用它跑同一批
+用例（`python -m pytest tests/ -q`，实测 839 passed / 1 skipped，与 `unittest` 口径的 840 个
+用例一致 —— 差的 1 个是被 skip 的那条）。
 
 L3/L4 的强制安全边界（这些脚本会真的操作浏览器）：
 只访问 `example.com`；绝不借用用户标签页；不做 click/fill/press/upload/download/evaluate；
@@ -632,6 +744,7 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前
 | 7 | 多浏览器时静默随机选 | `probe_browser` 只在恰好 1 个时自动选，多个时返回空 → 交 bsk 自选；且 README 已承诺"会报错"但代码没做 | 用户连了 2 个浏览器时"有时候对有时候不对"，无从排查 | `verify_browser_ambiguity.py` |
 | 8 | 测试自身泄漏会话 | 某用例把假 id `"zzzz"` 写进 args builder，导致懒创建的真实会话在重建时被遗弃 | 全量回归后 daemon 残留会话 | `verify_integration.py` 的差集断言 + 兜底强清 |
 | 9 | README 与实现方向相反 | `session_scope:"user"` 说"跨群共用"，实际键含 umo → 跨群独立 | 用户按文档理解会误判资源占用 | README 核对报告 |
+| 10 | 启动超时留下永久孤儿浏览器窗口 | 顺序是「先 `await self._start()`、成功后再 `_journal_add()`」；start 超时直接抛异常，落盘那一步**永远执行不到** | 窗口已经开出来但插件不知道它的 id，journal 里也没有它，`recover_orphans()` 够不着 → 桌面留下关不掉也清不掉的窗口，重启 AstrBot 同样带不走 | `test_session.py` 的可恢复启动用例 + `verify_recover_real.py`；机制见 §5 D12 |
 
 ### 6.2 已确认的**固有行为**（不是 bug，但必须如实告知）
 
@@ -705,7 +818,7 @@ astrbot_plugin_bsk_browser/
 │   ├── pages.py
 │   ├── shots.py
 │   ├── journal.py            #   会话所有权 journal（原子写 + 损坏容错）
-│   ├── tools.py              #   6 个主工具的规格唯一事实源（schema + 归一化 + 校验）
+│   ├── tools.py              #   8 个主工具的规格唯一事实源（schema + 归一化 + 校验）
 │   └── service.py
 ├── tests/                   # L1 单元测试
 ├── metadata.yaml

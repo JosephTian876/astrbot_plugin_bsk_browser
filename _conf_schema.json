@@ -113,7 +113,7 @@
     "description": "同时注册旧版工具",
     "type": "bool",
     "default": true,
-    "hint": "默认开启。开启时最多注册 16 个工具：8 个新的（bsk_session / bsk_page / bsk_inspect / bsk_debug / bsk_interact / bsk_tabs / bsk_assist / bsk_load_tools，其中 bsk_debug 默认按需加载，见下面那一项）加 8 个旧的（bsk_open / bsk_read / bsk_act / bsk_screenshot / bsk_close / bsk_status / bsk_logs / bsk_evaluate）。旧工具的行为一个字都没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」，老用户升级后一切照旧。关掉它可以少注册 8 个旧工具，每轮对话大约省下 3600 字符的工具描述（模型每次请求都要带上全部工具说明，关掉就能省这份固定开销），代价是旧写法不再可用——请确认你自己和你的提示词都改成新工具之后再关。注意 bsk_evaluate 不受这一项影响，它有自己的开关（enable_evaluate）。另外两个已知限制：①这一项只在插件重新加载时生效，改完配置请重新加载插件；②如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，那个关闭状态会优先于这一项。"
+    "hint": "默认开启。开启时最多注册 16 个工具：8 个新的（bsk_session / bsk_page / bsk_inspect / bsk_debug / bsk_interact / bsk_tabs / bsk_assist / bsk_load_tools，其中 bsk_debug 默认按需加载，见下面那一项）加 8 个旧的（bsk_open / bsk_read / bsk_act / bsk_screenshot / bsk_close / bsk_status / bsk_logs / bsk_evaluate）。旧工具的行为一个字都没改，只是描述里加了一句「兼容保留，新用法请优先用新工具」，老用户升级后一切照旧。关掉它能省多少，取决于旧工具当时注册了几个：按默认配置，只有 4 个常用的常驻，关掉约省 1700 字符的工具描述；如果同时打开了下面那一项（legacy_fringe_tools），8 个会全停，约省 3600 字符（模型每次请求都要带上全部工具说明，关掉就能省这份固定开销）。代价是旧写法不再可用——请确认你自己和你的提示词都改成新工具之后再关。注意这一项会连带停掉常用的截图与关会话工具，只想省掉那三个罕见的请改用下面那一项。注意 bsk_evaluate 不受这一项影响，它有自己的开关（enable_evaluate）。另外两个已知限制：①这一项只在插件重新加载时生效，改完配置请重新加载插件；②如果你以前在 AstrBot WebUI 的「扩展 → 组件」里手动关过某个旧工具，那个关闭状态会优先于这一项。"
   },
   "legacy_fringe_tools": {
     "description": "注册罕见的旧版工具",
