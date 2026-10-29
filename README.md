@@ -546,14 +546,16 @@ bsk --version
 
 ## 12. 开源许可
 
-本项目采用 **`MIT OR AGPL-3.0-or-later` 双许可**：你可以**任选其一**遵守，任选一个都是完整有效的授权。
+本项目采用 **`MIT OR AGPL-3.0-or-later` 双许可**：你可以**任选其一**遵守，任选一个都是完整有效的授权 —— 这是 WordPress、Nextcloud 等生态长期使用的成熟做法。
 
-- 选 **MIT**：条款宽松，允许闭源使用，与 MIT 项目混用时没有额外负担。
-- 选 **AGPL-3.0-or-later**：采取最保守的合规立场。
+- 选 **MIT**（全文见 [LICENSE](LICENSE)）：条款宽松，允许闭源使用，与 MIT 项目混用时没有额外负担。
+- 选 **AGPL-3.0-or-later**（全文见 [LICENSE-AGPL](LICENSE-AGPL)，也可从 <https://www.gnu.org/licenses/agpl-3.0.txt> 获取）：采取最保守的合规立场，Copyleft 义务随之得到满足。
 
-**为什么是双许可？** 因为本插件是 AstrBot（以 AGPL-3.0 发布）的插件，而 AstrBot 是通过**同进程动态加载**插件的方式运行的 ——「这算不算构成衍生作品」在业界**没有定论**（没有判例）。双许可让两个方向都成立：认为不是衍生作品的可以按 MIT 走，认为是的可以按 AGPL 走。
+**为什么是双许可？** 因为本插件是 AstrBot（以 AGPL-3.0 发布）的插件，而 AstrBot 是通过**同进程动态加载**插件的方式运行的 ——「这算不算构成衍生作品」在业界**没有定论**（没有判例，FSF 持保守解释，而大量插件实践并不遵守）。双许可让两个方向都成立：认为不是衍生作品的可以按 MIT 走，认为是的可以按 AGPL 走。
 
-许可证全文见 [LICENSE](LICENSE)（MIT 全文 + 双许可声明）与 [LICENSE-AGPL](LICENSE-AGPL)（AGPL-3.0 全文）。
+**为什么 `LICENSE` 里只有 MIT 全文？** GitHub 的许可证识别（licensee）只对照标准许可证文本：`LICENSE` 里如果放自定义的双许可声明，整份文件就匹配不上任何已知许可证，仓库侧栏会显示 `Other` / `NOASSERTION`。把声明放在本节、`LICENSE` 只保留 MIT 全文之后，GitHub 能正确显示 `MIT`；**授权本身没有变** —— 你依然可以按 AGPL-3.0-or-later 使用，依据是本节的声明和 [`LICENSE-AGPL`](LICENSE-AGPL) 全文，选 MIT 则依据 [`LICENSE`](LICENSE) 全文。
+
+第三方组件（本插件不包含、也不分发它们的代码或二进制）与商标说明见第 11 节。
 
 ---
 

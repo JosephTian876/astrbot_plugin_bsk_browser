@@ -784,7 +784,7 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前
 - **必须提交的文件**：`LICENSE`、`README.md`、`CHANGELOG.md`、`.gitignore`
 - `.gitignore` 需排除：`__pycache__/`、`*.pyc`、测试产物、截图、`.venv/`
 
-**协议**：`MIT OR AGPL-3.0-or-later` 双许可（见调研报告 `07-agpl-redteam.md` 的结论）。
+**协议**：`MIT OR AGPL-3.0-or-later` 双许可（见调研报告 `07-agpl-redteam.md` 的结论）。文件布局：`LICENSE` **只放 MIT 全文**、`LICENSE-AGPL` 放 AGPL-3.0 全文、双许可声明与理由写在 README 第 12 节 —— 自定义声明混在 `LICENSE` 里会让 GitHub 的 licensee 匹配失败、侧栏显示 `Other`。
 **商标纪律**：插件名用 `astrbot_plugin_bsk_browser`，**不得**使用 "BrowserSkill" 作为产品名，README 必须含非官方声明。
 
 ---
@@ -795,7 +795,7 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前
 - [ ] 不复制 Tencent/BrowserSkill 的任何源码/schema/skill 文档
 - [ ] 不复制 AstrBot 源码（写了 AGPL 代码就必须 AGPL）
 - [ ] 未使用官方模板 "Use this template" 建仓
-- [ ] `LICENSE` 存在且为双许可
+- [ ] `LICENSE` 是纯 MIT 全文（不带自定义声明）、`LICENSE-AGPL` 是 AGPL-3.0 全文，双许可声明在 README §12
 - [ ] README 含：非官方声明、致谢 Tencent/BrowserSkill、隐私提醒、已知限制
 - [ ] 仓库公开（满足 AGPL §13）
 

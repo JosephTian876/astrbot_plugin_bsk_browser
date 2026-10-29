@@ -286,12 +286,20 @@ def main() -> int:
         "需明确声明不再分发 bsk",
     )
 
-    # 4d. LICENSE 存在且是双许可
+    # 4d. LICENSE 是纯 MIT 全文，双许可声明在 README
+    #     （GitHub 的 licensee 只认标准许可证文本，自定义声明混进 LICENSE 会让侧栏显示 Other）
     license_text = (PROJECT / "LICENSE").read_text(encoding="utf-8")
     check(
-        "LICENSE 是双许可声明",
-        "MIT" in license_text and "AGPL" in license_text,
-        "",
+        "LICENSE 是标准 MIT 全文（不含自定义声明）",
+        "MIT License" in license_text
+        and "Permission is hereby granted, free of charge" in license_text
+        and license_text.isascii(),
+        "自定义声明混进 LICENSE 会让 GitHub 识别成 Other",
+    )
+    check(
+        "README 保留双许可声明（MIT OR AGPL-3.0-or-later）",
+        "MIT OR AGPL-3.0-or-later" in readme,
+        "LICENSE 只放 MIT 全文后，声明在 README 第 12 节",
     )
 
     # ---------------------------------------------------------------

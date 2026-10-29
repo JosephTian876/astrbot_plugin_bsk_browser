@@ -4,6 +4,12 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- **许可证文件布局调整，授权本身没有变。** `LICENSE` 现在只包含标准 MIT 全文；此前它是"自定义双许可声明 + MIT 全文"，GitHub 的许可证识别因此把本仓库标成 `Other` / `NOASSERTION`。双许可声明、两种选择的说明与理由移到了 [README 第 12 节](README.md#12-开源许可)，AGPL-3.0 全文仍在 [`LICENSE-AGPL`](LICENSE-AGPL)。**你依然可以任选 MIT 或 AGPL-3.0-or-later**，两者都是完整有效的授权。
+
 ## [0.3.0] - 2026-10-07
 
 对齐腾讯 BrowserSkill 的 DSH 插件形态：把工具按能力拆成 8 个多动作主工具（合计 57 个 action），
