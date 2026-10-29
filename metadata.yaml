@@ -40,7 +40,8 @@ desc: |
   权利人所有，本项目仅在描述兼容性时以指称方式提及。本项目不包含、不分发 bsk 及其扩展的任何代码或二进制。
   使用本插件仍需遵守 bsk 自身的许可条款。
 
-  本项目采用 MIT OR AGPL-3.0-or-later 双许可发布。
+  本项目采用 MIT OR AGPL-3.0-or-later 双许可发布：MIT 全文见 LICENSE，AGPL-3.0 全文见
+  LICENSE-AGPL，双许可声明与理由见 README 第 12 节。
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_bsk_browser
 version: 0.3.0

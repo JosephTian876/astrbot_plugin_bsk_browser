@@ -106,13 +106,14 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n--- 4. 未使用官方模板 'Use this template' 建仓 ---")
     # 官方模板 Soulter/helloworld 带 AGPL-3.0 的 LICENSE 与特定结构。
-    # 我们的 LICENSE 是双许可声明（非纯 AGPL 全文），说明不是照模板来的。
+    # 我们的 LICENSE 是标准 MIT 全文（不是模板自带的 AGPL 全文），双许可声明写在
+    # README 第 12 节 —— 同样说明不是照模板来的。
     license_text = (PROJECT / "LICENSE").read_text(encoding="utf-8")
-    is_dual = "MIT" in license_text and "AGPL" in license_text
+    is_mit_not_agpl = "MIT License" in license_text and "GNU AFFERO" not in license_text
     check(
-        "LICENSE 是自写的双许可声明（非模板自带的纯 AGPL 全文）",
-        is_dual,
-        "MIT OR AGPL-3.0-or-later 双许可声明",
+        "LICENSE 是标准 MIT 全文（非模板自带的纯 AGPL 全文）",
+        is_mit_not_agpl,
+        "MIT License",
     )
 
     # ------------------------------------------------------------------
@@ -121,6 +122,11 @@ def main() -> int:
     print("\n--- 5. 许可文件完整 ---")
     has_mit_full = "Permission is hereby granted, free of charge" in license_text
     check("LICENSE 含 MIT 全文", has_mit_full, "已内嵌 MIT 全文")
+    check(
+        "LICENSE 不含自定义声明（纯 ASCII、只有标准 MIT 文本）",
+        license_text.isascii() and "GNU AFFERO" not in license_text,
+        "否则 GitHub 的 licensee 会识别成 Other / NOASSERTION",
+    )
     agpl_file = PROJECT / "LICENSE-AGPL"
     check("LICENSE-AGPL 存在", agpl_file.is_file(), str(agpl_file.name))
     if agpl_file.is_file():
@@ -137,6 +143,11 @@ def main() -> int:
     # ------------------------------------------------------------------
     print("\n--- 6. README 的合规声明（MIT 不授予商标权，必须声明）---")
     readme = (PROJECT / "README.md").read_text(encoding="utf-8")
+    check(
+        "README 第 12 节声明双许可（MIT OR AGPL-3.0-or-later）",
+        "MIT OR AGPL-3.0-or-later" in readme,
+        "LICENSE 只放 MIT 全文后，双许可声明在这里",
+    )
     check(
         "含「第三方非官方集成」声明",
         "第三方非官方集成" in readme,
