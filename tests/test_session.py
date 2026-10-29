@@ -18,10 +18,13 @@ pytest 在本机不可用，因此用标准库 ``unittest.IsolatedAsyncioTestCas
 from __future__ import annotations
 
 import asyncio
+import errno
+import shutil
 import sys
 import time
 import types
 import unittest
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -1346,6 +1349,138 @@ _USE_DEFAULT_JOURNAL: Any = object()
 （等于"不要 journal"），两者必须能区分开。
 """
 
+_JOURNAL_TMPDIR_CLEANUP_ATTEMPTS = 8
+"""清理 journal 临时目录的最大尝试次数（每次间隔见下）。"""
+
+_JOURNAL_TMPDIR_CLEANUP_DELAY_SEC = 0.1
+"""两次尝试之间的等待：Windows 上目录项/句柄的释放是毫秒级的。"""
+
+
+def _remove_journal_tmpdir(tmp: Any) -> None:
+    """删掉 journal 的临时目录，并区分"瞬时删不掉"与"真的没删干净"。
+
+    ``TemporaryDirectory.cleanup()`` 在 Windows 上偶发 ``OSError/[WinError 145]``
+    （"目录不是空的"）：目录里已经没有东西了，``shutil.rmtree`` 最后的
+    ``os.rmdir`` 却还是报错。残留实证 —— ``%TEMP%`` 里堆着 9 个
+    ``bsk-session-journal-*``，逐个看过去全是**空目录**。
+
+    这类失败是瞬时竞态，不该让整轮测试挂掉；但"真的没删干净"必须照实报错，
+    否则就成了掩盖问题。所以先重试，重试用尽再判断目录里还剩什么：
+
+    - 目录已经空了 → 只警告一句（空的残留目录无害，也不会污染断言）；
+    - 目录里还有文件 → 原样抛出，让测试失败。
+
+    Args:
+        tmp: ``tempfile.TemporaryDirectory`` 实例。
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: 重试用尽且目录里仍有文件时，抛出第一次清理的原始异常。
+    """
+    path = Path(tmp.name)
+    first_error: OSError | None = None
+    for attempt in range(_JOURNAL_TMPDIR_CLEANUP_ATTEMPTS):
+        try:
+            if attempt == 0:
+                # 第一次走标准路径：顺便把 TemporaryDirectory 的 finalizer 消费掉。
+                tmp.cleanup()
+            else:
+                # finalizer 已经被消费，重试只能自己删。
+                shutil.rmtree(path)
+            return
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+            if not path.exists():
+                return
+            time.sleep(_JOURNAL_TMPDIR_CLEANUP_DELAY_SEC)
+
+    leftovers = sorted(p.name for p in path.iterdir()) if path.exists() else []
+    if leftovers or first_error is None:
+        raise first_error  # type: ignore[misc]  # 真没删干净：说真话
+    warnings.warn(
+        f"journal 临时目录 {path.name} 已空但仍删不掉，按瞬时竞态忽略：{first_error}",
+        stacklevel=2,
+    )
+
+
+class TestRemoveJournalTmpdir(unittest.TestCase):
+    """``_remove_journal_tmpdir`` 的分类逻辑：容忍瞬时失败，不放过渡真残留。
+
+    这几个用例不依赖真实的 Windows 竞态（那种事只能碰运气），而是把"瞬时失败"
+    与"真没删干净"两种状态显式造出来，钉死判据。
+    """
+
+    def make_tmp(self, *, with_file: bool = True) -> Any:
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory(prefix="bsk-teardown-test-")
+        if with_file:
+            Path(tmp.name, "sessions.json").write_text("{}", encoding="utf-8")
+        # 兜底：用例失败也不会把临时目录留在 %TEMP% 里。
+        self.addCleanup(shutil.rmtree, tmp.name, True)
+        return tmp
+
+    def test_removes_a_clean_directory(self) -> None:
+        tmp = self.make_tmp()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _remove_journal_tmpdir(tmp)
+        self.assertFalse(Path(tmp.name).exists())
+        self.assertEqual([str(w.message) for w in caught], [])
+
+    def test_transient_failure_is_retried_until_the_directory_is_gone(self) -> None:
+        """第一次 rmtree 报 145、之后成功 —— 这正是本次竞态的形状。"""
+        tmp = self.make_tmp()
+        real_rmtree = shutil.rmtree
+        calls = {"count": 0}
+
+        def flaky_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OSError(errno.ENOTEMPTY, "目录不是空的", str(path))
+            return real_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(shutil, "rmtree", flaky_rmtree), mock.patch.object(
+            sys.modules[__name__], "_JOURNAL_TMPDIR_CLEANUP_DELAY_SEC", 0
+        ):
+            _remove_journal_tmpdir(tmp)
+
+        self.assertGreaterEqual(calls["count"], 2)
+        self.assertFalse(Path(tmp.name).exists())
+
+    def test_leftover_files_still_raise(self) -> None:
+        """目录里确实还有文件 —— 必须原样抛出，不能被"容忍"吞掉。"""
+        tmp = self.make_tmp()
+
+        def failing_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+            raise OSError(errno.ENOTEMPTY, "目录不是空的", str(path))
+
+        with mock.patch.object(shutil, "rmtree", failing_rmtree), mock.patch.object(
+            sys.modules[__name__], "_JOURNAL_TMPDIR_CLEANUP_DELAY_SEC", 0
+        ):
+            with self.assertRaises(OSError):
+                _remove_journal_tmpdir(tmp)
+
+    def test_empty_but_undeletable_directory_only_warns(self) -> None:
+        """空目录却删不掉 —— 只提醒，不让整轮测试因为残留目录挂掉。"""
+        tmp = self.make_tmp(with_file=False)
+
+        def failing_rmtree(path: Any, *args: Any, **kwargs: Any) -> Any:
+            raise OSError(errno.ENOTEMPTY, "目录不是空的", str(path))
+
+        with mock.patch.object(shutil, "rmtree", failing_rmtree), mock.patch.object(
+            sys.modules[__name__], "_JOURNAL_TMPDIR_CLEANUP_DELAY_SEC", 0
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                _remove_journal_tmpdir(tmp)
+
+        self.assertEqual(len(caught), 1)
+        self.assertIn("已空但仍删不掉", str(caught[0].message))
+
 
 class TestJournalIntegration(SessionTestCase):
     """建会话时落盘、正常停掉后删记录 —— journal 是崩溃恢复的基础。
@@ -1366,7 +1501,7 @@ class TestJournalIntegration(SessionTestCase):
         self._time = time
         self._JournalEntry = JournalEntry
         self._tmp = tempfile.TemporaryDirectory(prefix="bsk-session-journal-")
-        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(_remove_journal_tmpdir, self._tmp)
         self.journal_path = Path(self._tmp.name) / "sessions.json"
         self.journal = SessionJournal(self.journal_path)
 
