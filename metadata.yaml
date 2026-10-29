@@ -44,5 +44,5 @@ desc: |
   LICENSE-AGPL，双许可声明与理由见 README 第 12 节。
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_bsk_browser
-version: 0.3.0
+version: 0.3.1
 astrbot_version: ">=4.16"

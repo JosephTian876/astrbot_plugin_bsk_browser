@@ -4,11 +4,23 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.1] - 2026-10-29
+
+补丁版：**插件的行为没有变化**。三处改动里只有许可证的文件布局对用户可见，另外两项是内部
+清理 —— 按语义化版本，这是 PATCH。
 
 ### 变更
 
-- **许可证文件布局调整，授权本身没有变。** `LICENSE` 现在只包含标准 MIT 全文；此前它是"自定义双许可声明 + MIT 全文"，GitHub 的许可证识别因此把本仓库标成 `Other` / `NOASSERTION`。双许可声明、两种选择的说明与理由移到了 [README 第 12 节](README.md#12-开源许可)，AGPL-3.0 全文仍在 [`LICENSE-AGPL`](LICENSE-AGPL)。**你依然可以任选 MIT 或 AGPL-3.0-or-later**，两者都是完整有效的授权。
+- **许可证文件布局调整，授权本身没有变。** `LICENSE` 现在只包含标准 MIT 全文；此前它是"自定义双许可声明 + MIT 全文"，GitHub 的许可证识别因此把本仓库标成 `Other` / `NOASSERTION`。现在 GitHub 侧栏显示 **`MIT`**。双许可声明、两种选择的说明与理由移到了 [README 第 12 节](README.md#12-开源许可)，AGPL-3.0 全文仍在 [`LICENSE-AGPL`](LICENSE-AGPL)。**你依然可以任选 MIT 或 AGPL-3.0-or-later**，两者都是完整有效的授权。
+
+### 修复（均为内部改动，不影响插件行为）
+
+- **journal 临时目录的 teardown 加固。** Windows 上 `TemporaryDirectory.cleanup()` 偶发
+  `OSError: [WinError 145] 目录不是空的`，会让整轮测试挂在 teardown 上，而目录事后看是空的。
+  现在改成有界重试，并把两种情形分开：目录已空但删不掉 → 警告后继续；目录里真的还有文件 →
+  原样报错，真残留不许被吞。新增 4 个用例钉住这个判据。
+- **删掉 `bsk/service.py` 里两个没用到的导入**（`BskProtocolError` / `BskSession`）。
+  `ruff check bsk/` 因此变干净；对外行为、API 与配置项都没有变化。
 
 ## [0.3.0] - 2026-10-07
 
@@ -292,6 +304,7 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   清理永远返回 0
 - **权限提示与实现相反**：配置校验说白名单「不生效」，实际是白名单优先
 
+[0.3.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.1
 [0.3.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.2.0
 [0.1.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.1.1
