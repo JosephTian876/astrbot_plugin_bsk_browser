@@ -1,0 +1,67 @@
+name: CI
+
+# 这个仓库此前没有任何 workflow，而 tests/ 下有 838 个通过的用例。
+# 这里只跑 pytest，**不跑 ruff** —— 原因是实测过的，不是省事：
+#
+#   ruff check .            -> 20 个错误，其中 2 个在生产代码 bsk/service.py
+#                              （未使用的导入 BskSession），其余在 tests/verify_*.py
+#   ruff format --check .   -> 46 个文件需要重排
+#
+# 也就是说这个仓库从未统一过 format，也没有 ruff 配置。把 lint 一起塞进来，
+# 这个 workflow 一诞生就是红的。正确的顺序是先合并这个 pytest 门禁，再用一次
+# 独立的清理 PR 让 ruff check 变绿，然后才加 lint job。
+
+on:
+  push:
+    branches: [main, "fix/**", "feat/**", "ci/**"]
+    paths-ignore: ["**/*.md", "logo.png"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    # 全量 25s 左右；给足余量但不要让挂死的用例白占 runner 一小时。
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      # 坐标轴的选取理由（都在本机实测过，不是抄来的）：
+      #
+      # * 只有 3.12+：插件 metadata 声明 astrbot_version ">=4.16"，而 AstrBot 从
+      #   v4.14.7 起 requires-python = ">=3.12"，之后每个版本都是。3.10/3.11 上
+      #   这个插件不可能被 AstrBot 加载。（3.10/3.11 本机也都能过，只是没意义。）
+      # * **不含 3.14**：tests/test_session.py 的 journal 用例存在 Windows teardown
+      #   竞态 —— TemporaryDirectory.cleanup() 里的 shutil.rmtree 撞上刚被终止的
+      #   子进程仍未释放的文件句柄，报
+      #     OSError: [WinError 145] 目录不是空的
+      #   本机 3.14 上 9 跑 5 败（约 55%），3.12 6/6、3.13 8/8 全绿。修好 teardown
+      #   之后再加 3.14（建议给那个 TemporaryDirectory 传 ignore_cleanup_errors=True）。
+      # * 同时跑 ubuntu 与 windows：插件里有进程组/shell 分支的平台差异代码。
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 运行时零依赖（requirements.txt 只有注释）；这四个只给 tests/ 用：
+      #   pytest / PyYAML / packaging（verify 脚本里的 SpecifierSet）
+      #   Pillow —— 不装它时 test_shots.py 的 9 个用例会 skip
+      #   （本机实测 829 passed / 11 skipped）；装上后它们真正执行并通过
+      #   （838 passed / 2 skipped）。
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest PyYAML packaging Pillow
+
+      - name: pytest
+        run: python -m pytest -q
