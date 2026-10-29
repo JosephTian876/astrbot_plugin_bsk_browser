@@ -512,6 +512,11 @@ class TestCleanupShots(TempDirTestCase):
     def test_目录参数不存在也不抛(self) -> None:
         self.assertEqual(cleanup_shots("\x00非法路径"), 0)
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "这是 Windows 语义：删文件看文件自身的 ACL，只读文件会 PermissionError。"
+        "POSIX 看的是目录权限，只读文件照样删得掉，复现不出这条路径",
+    )
     def test_文件被占用时跳过而不是抛异常(self) -> None:
         """Windows 实测：只读/被占用的文件 os.remove 会抛 PermissionError。"""
         made = self._make("mnaa", 3)
