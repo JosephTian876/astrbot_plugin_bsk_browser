@@ -33,13 +33,11 @@ from .errors import (
     CODE_BROWSER_AMBIGUOUS,
     BskBrowserAmbiguous,
     BskError,
-    BskProtocolError,
 )
 from .journal import SessionJournal
 from .logger import NULL_LOGGER, LoggerLike
 from .models import (
     BrowserInstance,
-    BskSession,
     ConsoleLog,
     EvaluateResult,
     NavigateResult,
