@@ -26,6 +26,12 @@ class _FakeToolRegistry:
     def remove_func(self, name: str) -> None:
         self.func_list = [t for t in self.func_list if getattr(t, "name", None) != name]
 
+    def get_func(self, name: str) -> Any:
+        for t in self.func_list:
+            if getattr(t, "name", None) == name:
+                return t
+        return None
+
 
 class FakeContext:
     """``astrbot.api.star.Context`` 的测试替身。
@@ -115,9 +121,40 @@ def ensure_astrbot_modules() -> None:
     if "astrbot" in sys.modules:
         return
     astrbot = types.ModuleType("astrbot")
+    astrbot.__path__ = []
     api = types.ModuleType("astrbot.api")
+    api.__path__ = []
     event = types.ModuleType("astrbot.api.event")
     star = types.ModuleType("astrbot.api.star")
+
+    core = types.ModuleType("astrbot.core")
+    core.__path__ = []
+    provider = types.ModuleType("astrbot.core.provider")
+    provider.__path__ = []
+    register_mod = types.ModuleType("astrbot.core.provider.register")
+    agent = types.ModuleType("astrbot.core.agent")
+    agent.__path__ = []
+    tool_mod = types.ModuleType("astrbot.core.agent.tool")
+    utils = types.ModuleType("astrbot.core.utils")
+    utils.__path__ = []
+    path_mod = types.ModuleType("astrbot.core.utils.astrbot_path")
+
+    class ToolSet:
+        pass
+
+    tool_mod.ToolSet = ToolSet
+    path_mod.get_astrbot_data_path = lambda: "/tmp/fake_astrbot_data"
+
+    fake_registry = _FakeToolRegistry()
+    register_mod.llm_tools = fake_registry
+
+    provider.register = register_mod
+    core.provider = provider
+    agent.tool = tool_mod
+    core.agent = agent
+    utils.astrbot_path = path_mod
+    core.utils = utils
+    astrbot.core = core
 
     class Star:
         def __init__(self, *a, **k):
@@ -186,4 +223,11 @@ def ensure_astrbot_modules() -> None:
     sys.modules["astrbot.api"] = api
     sys.modules["astrbot.api.event"] = event
     sys.modules["astrbot.api.star"] = star
+    sys.modules["astrbot.core"] = core
+    sys.modules["astrbot.core.provider"] = provider
+    sys.modules["astrbot.core.provider.register"] = register_mod
+    sys.modules["astrbot.core.agent"] = agent
+    sys.modules["astrbot.core.agent.tool"] = tool_mod
+    sys.modules["astrbot.core.utils"] = utils
+    sys.modules["astrbot.core.utils.astrbot_path"] = path_mod
 
