@@ -1066,5 +1066,61 @@ class TestPurity(unittest.TestCase):
         self.assertEqual(tools.TOOL_SCHEMAS["bsk_assist"], before)
 
 
+class TestMainPluginInteractionFormatting(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from pathlib import Path
+        import sys
+        _ROOT = Path(__file__).resolve().parent.parent
+        if str(_ROOT.parent) not in sys.path:
+            sys.path.insert(0, str(_ROOT.parent))
+        if str(_ROOT / "tests") not in sys.path:
+            sys.path.insert(0, str(_ROOT / "tests"))
+        from astrbot_test_doubles import ensure_astrbot_modules
+        ensure_astrbot_modules()
+
+    def test_render_interact_includes_auto_scrolled_notice(self) -> None:
+        from astrbot_plugin_bsk_browser.main import BskBrowserPlugin
+
+        res = BskBrowserPlugin._render_interact("click", {
+            "session": "owkd",
+            "target": "@e27",
+            "auto_scrolled": True,
+        })
+        self.assertIn("（注意：目标元素原先位于视口外，已自动将其滚动至视口中心并完成操作。）", res)
+        self.assertNotIn("auto_scrolled", res)
+
+    def test_render_interact_omits_notice_when_not_auto_scrolled(self) -> None:
+        from astrbot_plugin_bsk_browser.main import BskBrowserPlugin
+
+        res = BskBrowserPlugin._render_interact("click", {
+            "session": "owkd",
+            "target": "@e27",
+            "auto_scrolled": False,
+        })
+        self.assertNotIn("（注意：目标元素原先位于视口外，已自动将其滚动至视口中心并完成操作。）", res)
+        self.assertNotIn("auto_scrolled", res)
+
+    async def test_dispatch_exception_includes_diagnostic(self) -> None:
+        from astrbot_plugin_bsk_browser.main import BskBrowserPlugin
+        from astrbot_test_doubles import make_context, FakeEvent
+        from astrbot_plugin_bsk_browser.bsk.errors import BskError
+
+        plugin = BskBrowserPlugin(make_context(), config={"admin_only": False})
+        event = FakeEvent(is_admin=True)
+
+        async def fake_run_tool(*args, **kwargs):
+            raise BskError(
+                "tab 12 is user tab",
+                friendly="该动作只允许在 bsk 自己的窗口里执行。",
+                reason="agent_window_scope",
+            )
+
+        plugin._run_tool = fake_run_tool
+        result = await plugin._dispatch("bsk_interact", event, {"action": "click", "target": "@e1"})
+        self.assertIn("该动作只允许在 bsk 自己的窗口里执行。", result)
+        self.assertIn("（原因: agent_window_scope，详情: tab 12 is user tab）", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

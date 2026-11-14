@@ -930,8 +930,9 @@ class BskBrowserPlugin(Star):
         try:
             return await self._run_tool(tool, event, args)
         except BskError as exc:
+            diag = exc.format_diagnostic()
             return self._fail(
-                f"{_ACTION_LABEL.get(tool, tool)}失败：{exc.friendly}"
+                f"{_ACTION_LABEL.get(tool, tool)}失败：{exc.friendly}{diag}"
             )
         except Exception:  # noqa: BLE001 - 兜底，绝不让异常穿到框架
             astrbot_logger.exception("[bsk_browser] %s 未预期错误", tool)
@@ -1575,6 +1576,8 @@ class BskBrowserPlugin(Star):
         target = result.get("target")
         if target:
             lines.append(f"目标元素：{target}")
+        if result.get("auto_scrolled"):
+            lines.append("（注意：目标元素原先位于视口外，已自动将其滚动至视口中心并完成操作。）")
         if result.get("changed"):
             lines.append(
                 "这个动作会改变页面，接下来请用 bsk_inspect(action=\"observe\") "
@@ -1584,7 +1587,7 @@ class BskBrowserPlugin(Star):
         extra = {
             name: value
             for name, value in result.items()
-            if name not in ("session", "action", "target", "changed", "tab_id")
+            if name not in ("session", "action", "target", "changed", "tab_id", "auto_scrolled")
             and value not in (None, "", [], {})
         }
         if extra:
@@ -1909,7 +1912,7 @@ class BskBrowserPlugin(Star):
                 header = f"已打开：{target}\n实际落点：{nav.final_url}（发生了跳转）"
             return f"{header}\n\n{page_text}"
         except BskError as exc:
-            return self._fail(f"打开网页失败：{exc.friendly}")
+            return self._fail(f"打开网页失败：{exc.friendly}{exc.format_diagnostic()}")
         except Exception as exc:  # noqa: BLE001 - 兜底，绝不让异常穿到框架
             astrbot_logger.exception("[bsk_browser] bsk_open 未预期错误")
             return self._fail(f"打开网页时出现未预期的错误：{exc}")
@@ -1938,7 +1941,7 @@ class BskBrowserPlugin(Star):
             observation = await self.service.observe(key)
             return self.service.render_page(observation)
         except BskError as exc:
-            return self._fail(f"读取页面失败：{exc.friendly}")
+            return self._fail(f"读取页面失败：{exc.friendly}{exc.format_diagnostic()}")
         except Exception as exc:  # noqa: BLE001
             astrbot_logger.exception("[bsk_browser] bsk_read 未预期错误")
             return self._fail(f"读取页面时出现未预期的错误：{exc}")
@@ -2003,7 +2006,7 @@ class BskBrowserPlugin(Star):
                 hint = "建议接着用 bsk_read 确认页面变化。"
             return f"已执行 {action_norm}{note}。{hint}"
         except BskError as exc:
-            return self._fail(f"操作失败：{exc.friendly}")
+            return self._fail(f"操作失败：{exc.friendly}{exc.format_diagnostic()}")
         except ValueError as exc:
             return self._fail(f"参数格式不对：{exc}")
         except Exception as exc:  # noqa: BLE001
@@ -2036,7 +2039,7 @@ class BskBrowserPlugin(Star):
         try:
             payload = await self.service.screenshot(key, full_page=bool(full_page))
         except BskError as exc:
-            yield self._fail(f"截图失败：{exc.friendly}")
+            yield self._fail(f"截图失败：{exc.friendly}{exc.format_diagnostic()}")
             return
         except Exception as exc:  # noqa: BLE001
             astrbot_logger.exception("[bsk_browser] bsk_screenshot 未预期错误")
@@ -2222,7 +2225,7 @@ class BskBrowserPlugin(Star):
             result = await self.service.evaluate(key, script)
             return self.service.render_evaluate(result, script)
         except BskError as exc:
-            return self._fail(f"执行脚本失败：{exc.friendly}")
+            return self._fail(f"执行脚本失败：{exc.friendly}{exc.format_diagnostic()}")
         except Exception as exc:  # noqa: BLE001
             astrbot_logger.exception("[bsk_browser] bsk_evaluate 未预期错误")
             return self._fail(f"执行脚本时出现未预期的错误：{exc}")
@@ -2273,7 +2276,7 @@ class BskBrowserPlugin(Star):
             else:
                 log = await self.service.read_network(key, since=cursor)
         except BskError as exc:
-            return self._fail(f"读取{label}失败：{exc.friendly}")
+            return self._fail(f"读取{label}失败：{exc.friendly}{exc.format_diagnostic()}")
         except Exception as exc:  # noqa: BLE001
             astrbot_logger.exception("[bsk_browser] bsk_logs 未预期错误")
             return self._fail(f"读取{label}时出现未预期的错误：{exc}")

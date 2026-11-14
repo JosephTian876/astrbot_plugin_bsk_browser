@@ -105,3 +105,85 @@ class FakeEvent:
                 return f"<ImageResult {self.path}>"
 
         return _ImageResult(path)
+
+
+def ensure_astrbot_modules() -> None:
+    """在无真实 AstrBot 时注入最小替身模块，供单元测试加载 main.py。"""
+    import sys
+    import types
+
+    if "astrbot" in sys.modules:
+        return
+    astrbot = types.ModuleType("astrbot")
+    api = types.ModuleType("astrbot.api")
+    event = types.ModuleType("astrbot.api.event")
+    star = types.ModuleType("astrbot.api.star")
+
+    class Star:
+        def __init__(self, *a, **k):
+            pass
+
+    class AstrMessageEvent:
+        pass
+
+    class Filter:
+        def llm_tool(self, *a, **k):
+            def dec(f):
+                return f
+
+            return dec
+
+        def event_message_type(self, *a, **k):
+            def dec(f):
+                return f
+
+            return dec
+
+        def command(self, *a, **k):
+            def dec(f):
+                return f
+
+            return dec
+
+        def command_group(self, *a, **k):
+            def dec(f):
+                return f
+
+            return dec
+
+    filter = Filter()
+
+    class StarTools:
+        @staticmethod
+        def get_data_dir(*a, **k):
+            return ""
+
+    class Context:
+        pass
+
+    event.AstrMessageEvent = AstrMessageEvent
+    event.filter = filter
+    event.EventMessageType = type("EMT", (), {"ALL": 1})
+    star.Star = Star
+    star.Context = Context
+    star.StarTools = StarTools
+    star.register = lambda *a, **k: (lambda cls: cls)
+    api.logger = type(
+        "Logger",
+        (),
+        {
+            "info": lambda *a, **k: None,
+            "warning": lambda *a, **k: None,
+            "debug": lambda *a, **k: None,
+            "exception": lambda *a, **k: None,
+        },
+    )()
+    api.event = event
+    api.star = star
+    astrbot.api = api
+
+    sys.modules["astrbot"] = astrbot
+    sys.modules["astrbot.api"] = api
+    sys.modules["astrbot.api.event"] = event
+    sys.modules["astrbot.api.star"] = star
+
