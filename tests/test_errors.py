@@ -196,5 +196,49 @@ class TestClassifyIsUnchanged(unittest.TestCase):
                 self.assertNotIsInstance(exc, BskStartCancelled)
 
 
+class TestPermissionDeniedReasons(unittest.TestCase):
+    def test_element_not_visible_friendly(self) -> None:
+        err = errors.classify(
+            exit_code=1,
+            code="permission_denied",
+            message="element not visible",
+            reason="element_not_visible",
+        )
+        self.assertIn("不在视口可视范围内", err.friendly)
+        self.assertNotIn("只允许在 bsk 自己的窗口里执行", err.friendly)
+        self.assertEqual(err.reason, "element_not_visible")
+
+    def test_frame_unobservable_friendly(self) -> None:
+        err = errors.classify(
+            exit_code=1,
+            code="permission_denied",
+            message="unobservable frame",
+            reason="frame_unobservable",
+        )
+        self.assertIn("空白页", err.friendly)
+        self.assertEqual(err.reason, "frame_unobservable")
+
+    def test_agent_window_scope_friendly(self) -> None:
+        err = errors.classify(
+            exit_code=1,
+            code="permission_denied",
+            message="window scope",
+            reason="agent_window_scope",
+        )
+        self.assertIn("只允许在 bsk 自己的窗口里执行", err.friendly)
+        self.assertEqual(err.reason, "agent_window_scope")
+
+    def test_format_diagnostic(self) -> None:
+        err = errors.classify(
+            exit_code=1,
+            code="permission_denied",
+            message="bounds outside",
+            reason="element_not_visible",
+        )
+        diag = err.format_diagnostic()
+        self.assertIn("原因: element_not_visible", diag)
+        self.assertIn("详情: bounds outside", diag)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

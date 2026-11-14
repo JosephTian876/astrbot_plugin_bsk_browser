@@ -104,10 +104,23 @@ class BskError(Exception):
     ) -> None:
         super().__init__(message)
         self.message = message
+        self.detail = message
         self.friendly = friendly or message
         self.code = code
         self.exit_code = exit_code
         self.reason = reason
+
+    def format_diagnostic(self, max_detail_len: int = 120) -> str:
+        """格式化底层诊断信息供回显。"""
+        parts = []
+        if self.reason:
+            parts.append(f"原因: {self.reason}")
+        det = (self.detail or self.message or "").strip()
+        if det and det != self.friendly.strip():
+            if len(det) > max_detail_len:
+                det = det[: max_detail_len - 3] + "..."
+            parts.append(f"详情: {det}")
+        return f"（{'，'.join(parts)}）" if parts else ""
 
     @property
     def retryable(self) -> bool:
@@ -316,9 +329,20 @@ def classify(
         )
 
     if code == CODE_PERMISSION_DENIED:
+        if reason == "element_not_visible":
+            friendly = "目标元素当前不在视口可视范围内，请滚动页面使其进入视野后再操作。"
+        elif reason == "frame_unobservable":
+            friendly = "当前页面处于空白页或受限协议页面（如 about:blank），无法读取或操作元素。"
+        elif reason == "agent_window_scope":
+            friendly = "浏览器拒绝了这次操作：该动作只允许在 bsk 自己的窗口里执行（若需操作其它标签页，请先使用 bsk_tabs(action='borrow') 借用）。"
+        elif reason == "control_authority_required":
+            friendly = "当前页面需要用户控制权或外部确认，暂时无法直接操作。"
+        else:
+            friendly = f"操作被浏览器权限策略拒绝（原因：{reason or '未知'}）。"
+
         return BskError(
             detail,
-            friendly="浏览器拒绝了这次操作：该动作只允许在 bsk 自己的窗口里执行。",
+            friendly=friendly,
             code=code,
             exit_code=exit_code,
             reason=reason,
