@@ -2942,5 +2942,103 @@ class TestSessionKeyResolutionInService(unittest.IsolatedAsyncioTestCase):
         self.assertIn("business:key:1", service.sessions._entries)
 
 
+class TestInteractAutoScroll(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    async def test_interact_auto_scrolls_and_retries_on_element_not_visible(self) -> None:
+        from bsk.errors import BskError
+
+        class AutoScrollFakeRunner:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+                self.click_count = 0
+
+            async def run_or_raise(self, args: list[str], *, timeout: float | None = None, expect_json: bool = True) -> BskResult:
+                self.calls.append(list(args))
+                cmd = args[0]
+                if cmd == "session" and args[1] == "start":
+                    return BskResult(ok=True, exit_code=0, data={"session_id": "sid-1", "browser_instance_id": "b-1"})
+                if cmd == "click":
+                    self.click_count += 1
+                    if self.click_count == 1:
+                        raise BskError("element not visible", reason="element_not_visible", exit_code=1)
+                    return BskResult(ok=True, exit_code=0, data={"session": "sid-1", "target": "@e27"})
+                if cmd == "scroll-to":
+                    return BskResult(ok=True, exit_code=0, data={"session": "sid-1", "target": "@e27"})
+                return BskResult(ok=True, exit_code=0, data={})
+
+        runner = AutoScrollFakeRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+        await service.start_session(key="biz:key:1")
+        runner.calls.clear()
+
+        result = await service.interact("biz:key:1", "click", target="@e27")
+        self.assertTrue(result.get("auto_scrolled"))
+        cmds = [c[0] for c in runner.calls]
+        self.assertEqual(cmds, ["click", "scroll-to", "click"])
+        self.assertIn("@e27", runner.calls[1])
+        self.assertIn("@e27", runner.calls[2])
+
+    async def test_interact_fails_if_retry_still_not_visible(self) -> None:
+        from bsk.errors import BskError
+
+        class PersistentFailRunner:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            async def run_or_raise(self, args: list[str], *, timeout: float | None = None, expect_json: bool = True) -> BskResult:
+                self.calls.append(list(args))
+                cmd = args[0]
+                if cmd == "session" and args[1] == "start":
+                    return BskResult(ok=True, exit_code=0, data={"session_id": "sid-1", "browser_instance_id": "b-1"})
+                if cmd == "click":
+                    raise BskError("element still not visible", reason="element_not_visible", exit_code=1)
+                if cmd == "scroll-to":
+                    return BskResult(ok=True, exit_code=0, data={"session": "sid-1", "target": "@e27"})
+                return BskResult(ok=True, exit_code=0, data={})
+
+        runner = PersistentFailRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+        await service.start_session(key="biz:key:1")
+        runner.calls.clear()
+
+        with self.assertRaises(BskError) as ctx:
+            await service.interact("biz:key:1", "click", target="@e27")
+        self.assertEqual(ctx.exception.reason, "element_not_visible")
+        cmds = [c[0] for c in runner.calls]
+        self.assertEqual(cmds, ["click", "scroll-to", "click"])
+
+    async def test_interact_does_not_auto_scroll_if_action_is_scroll_to(self) -> None:
+        from bsk.errors import BskError
+
+        class ScrollToFailRunner:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            async def run_or_raise(self, args: list[str], *, timeout: float | None = None, expect_json: bool = True) -> BskResult:
+                self.calls.append(list(args))
+                cmd = args[0]
+                if cmd == "session" and args[1] == "start":
+                    return BskResult(ok=True, exit_code=0, data={"session_id": "sid-1", "browser_instance_id": "b-1"})
+                if cmd == "scroll-to":
+                    raise BskError("element not visible", reason="element_not_visible", exit_code=1)
+                return BskResult(ok=True, exit_code=0, data={})
+
+        runner = ScrollToFailRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+        await service.start_session(key="biz:key:1")
+        runner.calls.clear()
+
+        with self.assertRaises(BskError) as ctx:
+            await service.interact("biz:key:1", "scroll-to", target="@e27")
+        self.assertEqual(ctx.exception.reason, "element_not_visible")
+        cmds = [c[0] for c in runner.calls]
+        self.assertEqual(cmds, ["scroll-to"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)

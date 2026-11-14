@@ -2516,19 +2516,44 @@ class BskService:
                 opts["key"] = opts.pop(alias)
         session_key = self._resolve_key(key)
         argv, readonly = self._build_interact_args(action, opts)
-        result = await self.sessions.execute(
-            session_key,
-            lambda sid: self._with_tab_id(argv, tab_id)
-            + ["--session", sid, "--json"],
-            timeout=self._timeout(self._interact_timeout_builtin(action)),
-            # 写类动作（click/fill/press/select/hover）绝不允许在不确定态下执行
-            # —— 那可能造成重复点击、重复提交。
-            allow_uncertain=readonly,
-        )
+        target = str(opts.get("target") or "").strip()
+        auto_scrolled = False
+
+        try:
+            result = await self.sessions.execute(
+                session_key,
+                lambda sid: self._with_tab_id(argv, tab_id)
+                + ["--session", sid, "--json"],
+                timeout=self._timeout(self._interact_timeout_builtin(action)),
+                # 写类动作（click/fill/press/select/hover）绝不允许在不确定态下执行
+                # —— 那可能造成重复点击、重复提交。
+                allow_uncertain=readonly,
+            )
+        except BskError as exc:
+            if getattr(exc, "reason", "") == "element_not_visible" and target and action != "scroll-to":
+                self._logger.info("目标 %s 不在视口内，尝试自动 scroll-to 后重试 %s", target, action)
+                scroll_argv, scroll_readonly = self._build_interact_args("scroll-to", {"target": target})
+                await self.sessions.execute(
+                    session_key,
+                    lambda sid: self._with_tab_id(scroll_argv, tab_id) + ["--session", sid, "--json"],
+                    timeout=self._timeout(self._interact_timeout_builtin("scroll-to")),
+                    allow_uncertain=scroll_readonly,
+                )
+                result = await self.sessions.execute(
+                    session_key,
+                    lambda sid: self._with_tab_id(argv, tab_id) + ["--session", sid, "--json"],
+                    timeout=self._timeout(self._interact_timeout_builtin(action)),
+                    allow_uncertain=readonly,
+                )
+                auto_scrolled = True
+            else:
+                raise
+
         out: dict[str, Any] = {
             "session": self._session_field(session_key),
             "action": action,
             "tab_id": self._payload_tab_id(result.data),
+            "auto_scrolled": auto_scrolled,
         }
         out.update(self._interact_result(action, opts, result.data, readonly))
         return out
