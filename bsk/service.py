@@ -569,14 +569,15 @@ class BskService:
         Returns:
             ``(导航结果, 页面观察)``。
         """
+        session_key = self._resolve_key(key)
         nav_result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["navigate", url, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_NAVIGATE),
         )
         nav = NavigateResult.from_json(nav_result.data)
 
-        observation = await self.observe(key)
+        observation = await self.observe(session_key)
         return nav, observation
 
     # ------------------------------------------------------------------
@@ -620,6 +621,7 @@ class BskService:
             没内容"来回答用户。所以重建时往 ``text`` 前面插一句明确提示
             （``text`` 是模型唯一会读到的字段）。
         """
+        session_key = self._resolve_key(key)
         counters_before = self.sessions.stats().get("counters", {})
         rebuilds_before = counters_before.get("not_found_rebuilds", 0)
 
@@ -632,7 +634,7 @@ class BskService:
             args += ["--max-tokens", str(int(max_tokens))]
 
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: self._with_tab_id(args, tab_id) + ["--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_OBSERVE),
             allow_uncertain=True,
@@ -884,8 +886,9 @@ class BskService:
             脚本很可能是上一次失败操作的重复（例如重复提交）。所以这个
             参数刻意传 False（默认值），与 click/fill 同一档。
         """
+        session_key = self._resolve_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             # EXPRESSION 是位置参数；--json 让输出可机器解析。
             lambda sid: ["evaluate", expression, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_EVALUATE),
@@ -1107,8 +1110,9 @@ class BskService:
             250 倍余量；它跟着 ``command_timeout_sec`` 走是刻意的 ——
             那条本来就表达"你愿意为一条命令最多等多久"，截图没有理由例外。
         """
+        session_key = self._resolve_key(key)
         directory = self.settings.screenshot_dir or self._default_shot_dir()
-        out_path = make_shot_path(directory, key)
+        out_path = make_shot_path(directory, session_key)
 
         if full_page:
             timeout = self._timeout(self.fullpage_budget())
@@ -1119,7 +1123,7 @@ class BskService:
             argv.append("--full-page")
 
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: [*argv, "--session", sid, "--json"],
             timeout=timeout,
             # 截图是只读动作。
@@ -1282,8 +1286,9 @@ class BskService:
             返回里 ``entries`` 字段可能整个不存在（实测），
             ``ConsoleLog.from_json`` 已经处理成空列表。
         """
+        session_key = self._resolve_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["console", "--since", str(int(since)), "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
@@ -1296,8 +1301,9 @@ class BskService:
         ⚠️ 实测 ``url`` 字段可能内联巨大的 ``data:image/png;base64,...``，
         渲染给模型时必须截断，否则会瞬间吃光上下文。
         """
+        session_key = self._resolve_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["network", "--since", str(int(since)), "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
@@ -1798,6 +1804,21 @@ class BskService:
     # 会话解析：session 参数 → 实际要操作的 key
     # ------------------------------------------------------------------
 
+    def _resolve_key(self, session_or_key: str) -> str:
+        """把 session_id 或业务 key 解析为 SessionManager 槽位 key。
+
+        如果传入的是已知 session_id，映射回所属的业务 key 并激活；
+        若传入的是业务 key 则直接使用（兼容未入台账的纯测试 key）。
+        """
+        raw = (session_or_key or "").strip() if isinstance(session_or_key, str) else ""
+        if not raw:
+            return self.current_key() or ""
+        resolved = self._key_for(raw)
+        if resolved:
+            self.set_current(resolved)
+            return resolved
+        return raw
+
     def _resolve(self, session: str = "", *, param: str = "session") -> str:
         """把调用方给的会话标识解析成 SessionManager 用的 key。
 
@@ -1938,7 +1959,7 @@ class BskService:
         ``reached`` **可以**是 ``"timeout"``，那是结果不是错误
         （TOOL-SPEC §1.2 明说），照原样回传让模型自己判断。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = []
         if wait_until and wait_until != "load":
             args += ["--wait-until", str(wait_until)]
@@ -1979,7 +2000,7 @@ class BskService:
         它和既有的 ``service.act(action="navigate_back")`` 发的是同一条命令，
         不引入第二种写法。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         if direction not in ("back", "forward"):
             raise BskError(
                 f"history 的方向非法：{direction}",
@@ -2024,7 +2045,7 @@ class BskService:
 
             bsk reload --hard --wait-until <W> --timeout <T> --session <ID> --json
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = []
         if hard:
             args.append("--hard")
@@ -2068,7 +2089,7 @@ class BskService:
             上一次操作结果未知时，正是最需要"等一等看页面有没有自己稳定下来"
             的时候。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = []
         if wait_until and wait_until != "load":
             args += ["--wait-until", str(wait_until)]
@@ -2148,7 +2169,7 @@ class BskService:
 
         只读，所以 ``allow_uncertain=True``（与 ``observe`` 同一条理由）。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = []
         if max_depth is not None:
             args += ["--max-depth", str(int(max_depth))]
@@ -2193,7 +2214,7 @@ class BskService:
             一件需要清理的东西，而且那份文件的内容我们还得再读回来。
             ``--max-bytes`` 就是长度控制手段（TOOL-SPEC §1.3 默认 524288）。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = ["--max-bytes", str(int(max_bytes))]
         if ref:
             args += ["--ref", ref]
@@ -2238,7 +2259,7 @@ class BskService:
 
         ``--include-stack`` 只有 ``console`` 有（§14 明确 network 没有）。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = ["--since", str(int(since))]
         if limit is not None:
             args += ["--limit", str(int(limit))]
@@ -2273,7 +2294,7 @@ class BskService:
         ``network`` **没有** ``--include-stack``（§14 的括号注），
         所以本方法也不接受这个参数。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = ["--since", str(int(since))]
         if limit is not None:
             args += ["--limit", str(int(limit))]
@@ -2341,7 +2362,7 @@ class BskService:
                 就有 ``--tab-id``，见 CLI 报告 §15）；本方法还额外接受
                 显式的 ``tab_id=`` 关键字参数，两者等价。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         action = str(debug_action)
 
         args: list[str] = []
@@ -2493,7 +2514,7 @@ class BskService:
         for alias in _PRESS_KEY_ALIASES:
             if alias in opts and "key" not in opts:
                 opts["key"] = opts.pop(alias)
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         argv, readonly = self._build_interact_args(action, opts)
         result = await self.sessions.execute(
             session_key,
@@ -2696,7 +2717,7 @@ class BskService:
             **不发 ``--tab-id``**。这也是本方法没有跟着其它方法一起接
             ``tab_id=`` 关键字参数的原因（那会把同一个名字指到两个东西上）。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         spec = TABS_SPECS.get(action)
         if spec is None:
             raise BskError(
@@ -2835,7 +2856,7 @@ class BskService:
             参数"糟得多。窗口是会话级的，本就没有"给某个标签 resize"的语义。
         """
         del tab_id  # CLI §8 无此选项，见 docstring 的 Note。
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         result = await self.sessions.execute(
             session_key,
             lambda sid: [
@@ -2893,7 +2914,7 @@ class BskService:
             故也不发（模拟总是作用于会话当前的活动标签，与 CLI 报告 §9 的
             默认值一致）。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
 
         if off:
             args = ["--off"]
@@ -2958,7 +2979,7 @@ class BskService:
             **整体**序列化成**一个** argv 元素，不做任何二次改写 ——
             逐键翻译只会把两个已经对齐的命名空间又拧开一次。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         args: list[str] = ["--prompt", str(prompt)]
         if title:
             args += ["--title", str(title)]
@@ -3029,7 +3050,7 @@ class BskService:
             我们**不**加 ``--full-page``：报告明确说 ``--capture`` 绑定的是
             "``screenshot --ref`` 返回的图像"，而全页拼接出来的图不是那个区域。
         """
-        session_key = self._resolve(key)
+        session_key = self._resolve_key(key)
         directory = self.settings.screenshot_dir or self._default_shot_dir()
         out_path = make_shot_path(directory, session_key)
 

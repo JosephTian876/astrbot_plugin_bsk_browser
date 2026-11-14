@@ -2906,5 +2906,41 @@ class TestReadConsoleAndNetwork(ServiceIntegrationCase):
         self.assertEqual(len(runner.calls_for("network")), 1)
 
 
+class TestSessionKeyResolutionInService(unittest.IsolatedAsyncioTestCase):
+    """验证 service.observe 等接口在收到 session_id 时能正确通过 _resolve 映射到已有会话。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    async def test_observe_resolves_session_id_before_sessions_execute(self) -> None:
+        class FakeObserveRunner:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+
+            async def run_or_raise(self, args: list[str], *, timeout: float | None = None, expect_json: bool = True) -> BskResult:
+                self.calls.append(list(args))
+                if len(args) >= 2 and args[0] == "session" and args[1] == "start":
+                    return BskResult(ok=True, exit_code=0, data={"session_id": "sid-999", "browser_instance_id": "b-1"})
+                if args and args[0] == "observe":
+                    return BskResult(ok=True, exit_code=0, data={"title": "Test Page", "nodes": []})
+                return BskResult(ok=True, exit_code=0, data={})
+
+        runner = FakeObserveRunner()
+        service = BskService(make_settings(screenshot_dir=self.tmp.name), runner=runner)
+
+        # 启动一个会话，key 为 "business:key:1"，分配到的 session_id 为 "sid-999"
+        await service.start_session(key="business:key:1")
+
+        # 现在使用 session_id "sid-999" 调用 observe
+        await service.observe("sid-999")
+
+        # 验证：SessionManager 内部不能出现 key 为 "sid-999" 的 entry！
+        self.assertNotIn("sid-999", service.sessions._entries, "observe 未解析 key，导致创建了幽灵 entry")
+        self.assertIn("business:key:1", service.sessions._entries)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
