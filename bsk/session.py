@@ -59,11 +59,35 @@ import re
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from .cooperation import (
+    COOP_MODE_NONE,
+    COOP_MODE_STRICT,
+    COOP_MODE_STRICT_BOOTSTRAP,
+    COOP_PROBE_TIMEOUT_SEC,
+    COOP_SYNC_TIMEOUT_SEC,
+    CooperationCapability,
+    CoopReceipt,
+    attach_coop_flags,
+    classify_command_coop,
+    command_invalidates_tab_context,
+    command_invalidates_window_context,
+    command_leaves_blank_tab,
+    command_switches_default_tab,
+    extract_target_tab_id,
+    has_snapshot_ref_target,
+    is_readonly_strict_command,
+)
 from .errors import (
     CODE_CANCELLED,
+    CODE_PERMISSION_DENIED,
+    CODE_UNSUPPORTED,
+    CODE_USER_ABORTED,
+    COOPERATION_INVALIDATING_REASONS,
+    COOPERATION_READONLY_RETRY_REASONS,
+    COOPERATION_UNOBSERVABLE_REASONS,
     EXIT_TIMEOUT,
     OUTCOME_UNKNOWN_REASONS,
     BskBrowserAmbiguous,
@@ -76,6 +100,7 @@ from .errors import (
     BskStartCancelled,
     BskTimeout,
     BskVersionError,
+    classify as classify_error,
     is_cancelled_error,
 )
 from .journal import JournalEntry, SessionJournal, now_seconds
@@ -510,6 +535,18 @@ class _Entry:
     在这之后绝不允许再用它重建会话，否则会造出一个无人管理的僵尸会话。
     """
 
+    coop_receipts: dict[int | None, CoopReceipt] = field(default_factory=dict)
+    """按标签页缓存的 ``cooperate sync`` 凭证（``None`` 表示默认任务标签页）。"""
+
+    bootstrap_blank: bool = True
+    """是否仍处于未导航离开过的初始空白页（bsk >= 0.4.0 允许首次引导免凭证）。"""
+
+    had_sync: bool = False
+    """当前底层会话是否已至少完成过一次 ``cooperate sync``。"""
+
+    force_strict_policy: bool = False
+    """新版 CLI 搭配旧扩展（协议 < 1.8）时，需显式传 ``--policy strict``。"""
+
 
 class SessionManager:
     """按 key 管理 bsk 会话的并发安全对象池。
@@ -654,6 +691,8 @@ class SessionManager:
             _setting(settings, "enable_request_id", True)
         )
         self._request_protocol: bool | None = None
+        # bsk 0.4.x / 0.5.0 协作控制协议能力探测结果（每进程只探一次；None = 尚未探）。
+        self._coop_capability: CooperationCapability | None = None
 
         self._entries: dict[str, _Entry] = {}
         self._registry_lock = asyncio.Lock()
@@ -702,6 +741,9 @@ class SessionManager:
             "request_cancelled": 0,
             "request_claim_failed": 0,
             "request_orphans_cancelled": 0,
+            # --- 协作控制协议（bsk >= 0.4.0 / 0.5.0）的可观测性 ---
+            "coop_syncs": 0,
+            "coop_retries": 0,
         }
         self._recent_stop_errors: list[str] = []
 
@@ -791,13 +833,27 @@ class SessionManager:
             #   循环体里的每个分支要么 return、要么 continue（消耗掉下一次机会）、
             #   要么 raise，所以不存在无限重试的可能。
             for attempt in range(1, MAX_ATTEMPTS + 1):
-                args = await self._build_args(args_builder, entry.session.session_id)
+                raw_args = await self._build_args(args_builder, entry.session.session_id)
+                coop_mode = classify_command_coop(raw_args)
+                target_tab = extract_target_tab_id(raw_args)
+                used_receipt: CoopReceipt | None = None
+                used_bootstrap = False
                 try:
+                    effective_args, used_receipt, used_bootstrap = (
+                        await self._prepare_coop_args(
+                            entry,
+                            raw_args,
+                            mode=coop_mode,
+                            tab_id=target_tab,
+                            timeout=effective_timeout,
+                        )
+                    )
                     result = await self._runner.run_or_raise(
-                        args, timeout=effective_timeout
+                        effective_args, timeout=effective_timeout
                     )
                 except BskOutcomeUnknown as exc:
                     # 动作可能已经生效，绝不重试；标记后让异常冒出去。
+                    self._invalidate_tab_receipt(entry, target_tab)
                     self._mark_uncertain(entry, f"命令结果未知：{exc.message}")
                     raise
                 except BskError as exc:
@@ -805,6 +861,7 @@ class SessionManager:
                     # 这里再兜一层：任何带 outcome_unknown reason 的错误都按
                     # 不可重试处理，防止上游改了分类逻辑就悄悄退化成重试。
                     if exc.reason in OUTCOME_UNKNOWN_REASONS:
+                        self._invalidate_tab_receipt(entry, target_tab)
                         self._mark_uncertain(entry, f"命令结果未知：{exc.message}")
                         raise
 
@@ -831,12 +888,120 @@ class SessionManager:
                         await asyncio.sleep(BUSY_RETRY_DELAY_SEC)
                         continue
 
+                    self._handle_coop_error(
+                        entry,
+                        exc,
+                        tab_id=target_tab,
+                        used_receipt=used_receipt,
+                        used_bootstrap=used_bootstrap,
+                    )
+                    # 只读型严格动作（目前仅 screenshot --full-page）遇到过期观察凭证时，
+                    # 无页面写副作用，清掉旧凭证并在下一轮自动重同步重试一次。
+                    if (
+                        attempt < MAX_ATTEMPTS
+                        and allow_uncertain
+                        and is_readonly_strict_command(raw_args)
+                        and exc.code == CODE_PERMISSION_DENIED
+                        and exc.reason in COOPERATION_READONLY_RETRY_REASONS
+                        and not entry.closed
+                    ):
+                        self._invalidate_tab_receipt(entry, target_tab)
+                        self._counters["coop_retries"] += 1
+                        continue
+
                     raise
 
+                self._record_coop_success(
+                    entry,
+                    raw_args,
+                    mode=coop_mode,
+                    tab_id=target_tab,
+                    used_receipt=used_receipt,
+                )
                 self._touch(entry)
                 return result
 
             # 循环必然以 return 或 raise 结束，正常走不到这里。
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    async def cooperation_capability(self) -> CooperationCapability:
+        """探测当前 bsk CLI 是否支持协作控制协议（每进程只探测一次）。"""
+        if self._coop_capability is None:
+            self._coop_capability = await self._probe_cooperation_protocol()
+            if self._coop_capability.supported:
+                self._logger.debug(
+                    "bsk 支持协作控制协议（observation=%s, settle=%s, policy=%s）",
+                    self._coop_capability.supports_observation,
+                    self._coop_capability.supports_settle,
+                    self._coop_capability.supports_policy,
+                )
+        return self._coop_capability
+
+    def has_valid_coop_context(self, key: str, tab_id: int | None = None) -> bool:
+        """本地是否已为该会话的目标标签页缓存了有效控制凭证（纯内存判断，不跑子进程）。"""
+        entry = self._entries.get(key)
+        if entry is None or entry.closed:
+            return False
+        receipt = entry.coop_receipts.get(tab_id)
+        return receipt is not None and receipt.has_valid_context()
+
+    async def sync_cooperation(
+        self,
+        key: str,
+        *,
+        tab_id: int | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """执行 ``bsk cooperate sync --json`` 并缓存颁发的 ``context_id`` / 顶层 ``observation_id``。
+
+        老版本 bsk（<= 0.3.3）不支持协作协议时直接返回 ``None``，调用方按原路径继续。
+
+        Returns:
+            ``cooperate sync --json`` 的原始字典载荷；老 bsk 不支持时返回 ``None``。
+        """
+        self._ensure_open()
+        cap = await self.cooperation_capability()
+        if not cap.supported:
+            return None
+
+        effective_timeout = (
+            float(timeout) if timeout is not None else self._command_timeout
+        )
+        async with self._locked_entry(key) as entry:
+            await self._ensure_session(entry)
+            self._touch(entry)
+
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    _, data = await self._sync_entry_cooperation(
+                        entry,
+                        cap,
+                        tab_id=tab_id,
+                        max_tokens=max_tokens,
+                        timeout=effective_timeout,
+                    )
+                except BskSessionGone:
+                    if attempt >= MAX_ATTEMPTS or entry.closed:
+                        raise
+                    self._counters["not_found_rebuilds"] += 1
+                    await self._restart(entry, stop_old=False)
+                    self._logger.info(
+                        "会话 %s 在协作同步时失效，已重建为 %s，重试一次",
+                        key,
+                        entry.session.session_id,
+                    )
+                    continue
+                except BskSessionBusy:
+                    if attempt >= MAX_ATTEMPTS:
+                        raise
+                    self._counters["busy_retries"] += 1
+                    await asyncio.sleep(BUSY_RETRY_DELAY_SEC)
+                    continue
+
+                self._touch(entry)
+                return data
+
             raise AssertionError("unreachable")  # pragma: no cover
 
     async def release(self, key: str) -> bool:
@@ -1340,6 +1505,7 @@ class SessionManager:
             )
 
         _adopt(entry.session, fresh)
+        self._reset_coop_state(entry)
         entry.last_used = self._clock()
         self._counters["started"] += 1
         if is_rebuild:
@@ -1487,6 +1653,288 @@ class SessionManager:
             self._logger.debug("bsk 不支持 session request（能力探测失败）：%r", exc)
             return False
         return "--prepare" in (result.stdout or "")
+
+    # ------------------------------------------------------------------
+    # 内部：协作控制协议（bsk >= 0.4.0 / 0.5.0）
+    # ------------------------------------------------------------------
+
+    async def _probe_cooperation_protocol(self) -> CooperationCapability:
+        """探测 ``bsk cooperate --help``。任何失败都退化为"不支持"（兼容 bsk <= 0.3.3）。"""
+        try:
+            result = await self._runner.run_or_raise(
+                ["cooperate", "--help"],
+                timeout=COOP_PROBE_TIMEOUT_SEC,
+                expect_json=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - 老 bsk 无 cooperate 子命令，直接降级
+            self._logger.debug("bsk 不支持 cooperate 协议（能力探测失败）：%r", exc)
+            return CooperationCapability()
+        return CooperationCapability.from_help_text(result.stdout or "")
+
+    @staticmethod
+    def _reset_coop_state(entry: _Entry) -> None:
+        """新建/重建底层会话后清空全部协作缓存。"""
+        entry.coop_receipts.clear()
+        entry.bootstrap_blank = True
+        entry.had_sync = False
+        entry.force_strict_policy = False
+
+    @staticmethod
+    def _store_receipt(
+        entry: _Entry, receipt: CoopReceipt, *, requested_tab_id: int | None
+    ) -> None:
+        """按具体 tab_id（以及默认标签页槽位 None）同步存入同一份凭证对象。"""
+        if receipt.tab_id is not None:
+            entry.coop_receipts[receipt.tab_id] = receipt
+        if requested_tab_id is None:
+            entry.coop_receipts[None] = receipt
+        else:
+            entry.coop_receipts[requested_tab_id] = receipt
+
+    @staticmethod
+    def _invalidate_tab_receipt(entry: _Entry, tab_id: int | None) -> None:
+        """清除目标标签页（及其默认别名）的协作凭证缓存。"""
+        if tab_id is None:
+            popped = entry.coop_receipts.pop(None, None)
+            if (
+                popped is not None
+                and popped.tab_id is not None
+                and entry.coop_receipts.get(popped.tab_id) is popped
+            ):
+                entry.coop_receipts.pop(popped.tab_id, None)
+            return
+        entry.coop_receipts.pop(tab_id, None)
+        default_receipt = entry.coop_receipts.get(None)
+        if default_receipt is not None and default_receipt.tab_id == tab_id:
+            entry.coop_receipts.pop(None, None)
+
+    async def _sync_entry_cooperation(
+        self,
+        entry: _Entry,
+        cap: CooperationCapability,
+        *,
+        tab_id: int | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> tuple[CoopReceipt, dict[str, Any]]:
+        """在已持锁的槽位上跑一次 ``bsk cooperate sync --json`` 并更新本地凭证缓存。"""
+        sync_timeout = (
+            max(1.0, min(float(timeout), COOP_SYNC_TIMEOUT_SEC))
+            if timeout is not None
+            else max(1.0, min(self._command_timeout, COOP_SYNC_TIMEOUT_SEC))
+        )
+
+        def _build_sync_args(*, strict_policy: bool) -> list[str]:
+            argv = ["cooperate", "sync"]
+            if strict_policy and cap.supports_policy:
+                argv += ["--policy", "strict"]
+            if tab_id is not None:
+                argv += ["--tab-id", str(int(tab_id))]
+            if max_tokens is not None:
+                argv += ["--max-tokens", str(int(max_tokens))]
+            if cap.supports_settle:
+                argv.append("--settle")
+            argv += ["--session", entry.session.session_id, "--json"]
+            return argv
+
+        try:
+            result = await self._runner.run_or_raise(
+                _build_sync_args(strict_policy=entry.force_strict_policy),
+                timeout=sync_timeout,
+            )
+        except BskError as exc:
+            # 新版 CLI（0.4.1+/0.5.0）连旧扩展（协议 < 1.8）时，--policy auto 会被
+            # 拒绝并报 unsupported / unsupported_feature；降级到 --policy strict 再试一次。
+            if (
+                exc.code == CODE_UNSUPPORTED
+                and exc.reason == "unsupported_feature"
+                and cap.supports_policy
+                and not entry.force_strict_policy
+            ):
+                entry.force_strict_policy = True
+                result = await self._runner.run_or_raise(
+                    _build_sync_args(strict_policy=True),
+                    timeout=sync_timeout,
+                )
+            else:
+                raise
+
+        data = result.data if isinstance(result.data, dict) else {}
+        if data.get("stopped") is True:
+            entry.coop_receipts.clear()
+            raise classify_error(
+                exit_code=1,
+                code=CODE_USER_ABORTED,
+                message="The user stopped this task",
+            )
+
+        receipt = CoopReceipt.from_sync_json(data)
+        if receipt is None:
+            self._invalidate_tab_receipt(entry, tab_id)
+            state_obj = data.get("state")
+            mode = (
+                str(state_obj.get("mode") or "").strip().lower()
+                if isinstance(state_obj, dict)
+                else ""
+            )
+            if data.get("ready") is False and mode in ("human", "held"):
+                raise classify_error(
+                    exit_code=1,
+                    code=CODE_PERMISSION_DENIED,
+                    message="The user is operating this tab",
+                    reason="control_held",
+                )
+            raise classify_error(
+                exit_code=1,
+                code=CODE_PERMISSION_DENIED,
+                message="cooperate sync did not return a control context",
+                reason="cooperation_sync_required",
+            )
+
+        self._store_receipt(entry, receipt, requested_tab_id=tab_id)
+        entry.had_sync = True
+        entry.bootstrap_blank = False
+        self._counters["coop_syncs"] += 1
+        return receipt, data
+
+    async def _prepare_coop_args(
+        self,
+        entry: _Entry,
+        raw_args: list[str],
+        *,
+        mode: str,
+        tab_id: int | None,
+        timeout: float,
+    ) -> tuple[list[str], CoopReceipt | None, bool]:
+        """为需要协作凭证的命令准备 ``--context`` / ``--observation`` 参数。
+
+        Returns:
+            ``(最终参数列表, 使用的凭证或 None, 是否走了空白页免凭证引导)``。
+        """
+        if mode == COOP_MODE_NONE:
+            return raw_args, None, False
+
+        cap = await self.cooperation_capability()
+        if not cap.supported:
+            return raw_args, None, False
+
+        receipt = entry.coop_receipts.get(tab_id)
+        if (
+            mode == COOP_MODE_STRICT_BOOTSTRAP
+            and tab_id is None
+            and entry.bootstrap_blank
+            and receipt is None
+        ):
+            return raw_args, None, True
+
+        needs_strict_obs = mode in (COOP_MODE_STRICT, COOP_MODE_STRICT_BOOTSTRAP)
+        needs_sync = receipt is None or not receipt.has_valid_context()
+        if (
+            not needs_sync
+            and receipt is not None
+            and needs_strict_obs
+            and cap.supports_observation
+            and receipt.is_target_policy
+            and not receipt.has_valid_observation()
+        ):
+            needs_sync = True
+
+        if needs_sync:
+            had_prior_sync = entry.had_sync
+            try:
+                receipt, _ = await self._sync_entry_cooperation(
+                    entry, cap, tab_id=tab_id, timeout=timeout
+                )
+            except BskError as exc:
+                # 引导/脱离类动作（navigate <url> / emulate / window resize / tab close）
+                # 遇到新开空白页或加载失败页（frame_unobservable / page_load_failed 等）时，
+                # 不应被 sync 卡死，直接交给 bsk 自身判定是否允许免凭证引导/关闭。
+                if (
+                    mode == COOP_MODE_STRICT_BOOTSTRAP
+                    and exc.reason in COOPERATION_UNOBSERVABLE_REASONS
+                ):
+                    return raw_args, None, True
+                raise
+            # 安全防线：若本次自动同步返回的是全新 baseline（说明页面结构/文档已经
+            # 替换、ref 编号可能变化），绝不能拿模型之前看到的 @eN 盲目执行操作。
+            if (
+                had_prior_sync
+                and receipt.kind == "baseline"
+                and has_snapshot_ref_target(raw_args)
+            ):
+                raise classify_error(
+                    exit_code=1,
+                    code=CODE_PERMISSION_DENIED,
+                    message="Page structure changed before targeted ref action",
+                    reason="document_changed",
+                )
+
+        assert receipt is not None
+        attached = attach_coop_flags(raw_args, receipt, mode=mode, capability=cap)
+        return attached, receipt, False
+
+    def _record_coop_success(
+        self,
+        entry: _Entry,
+        raw_args: list[str],
+        *,
+        mode: str,
+        tab_id: int | None,
+        used_receipt: CoopReceipt | None,
+    ) -> None:
+        """命令成功后按 bsk 协议精确更新本地凭证的消费/失效状态。"""
+        if command_invalidates_window_context(raw_args):
+            entry.coop_receipts.clear()
+        elif command_invalidates_tab_context(raw_args):
+            self._invalidate_tab_receipt(entry, tab_id)
+        elif command_switches_default_tab(raw_args):
+            entry.coop_receipts.pop(None, None)
+        elif raw_args[:2] == ["tab", "close"]:
+            self._invalidate_tab_receipt(entry, tab_id)
+        elif raw_args and raw_args[0] in ("observe", "snapshot"):
+            # strict 策略下补充 observe/snapshot 会推进 refStore 版本并使旧严格上下文失效；
+            # target 策略下补充读取不影响 context_id 与 observation_id。
+            existing = entry.coop_receipts.get(tab_id)
+            if existing is not None and not existing.is_target_policy:
+                existing.context_consumed = True
+                existing.observation_consumed = True
+        elif used_receipt is not None:
+            if used_receipt.is_target_policy:
+                if mode in (COOP_MODE_STRICT, COOP_MODE_STRICT_BOOTSTRAP):
+                    used_receipt.observation_consumed = True
+            else:
+                used_receipt.context_consumed = True
+                used_receipt.observation_consumed = True
+
+        if command_leaves_blank_tab(raw_args):
+            entry.bootstrap_blank = False
+
+    def _handle_coop_error(
+        self,
+        entry: _Entry,
+        exc: BskError,
+        *,
+        tab_id: int | None,
+        used_receipt: CoopReceipt | None,
+        used_bootstrap: bool,
+    ) -> None:
+        """命令失败后按错误原因清理失效的本地凭证，避免下一次继续带死凭证。"""
+        if exc.code == CODE_USER_ABORTED:
+            entry.coop_receipts.clear()
+            return
+        if exc.reason in COOPERATION_INVALIDATING_REASONS:
+            self._invalidate_tab_receipt(entry, tab_id)
+            if used_bootstrap and exc.reason in (
+                "cooperation_sync_required",
+                "control_context_invalid",
+            ):
+                entry.bootstrap_blank = False
+            return
+        if (
+            exc.reason in ("observation_required", "observation_changed")
+            and used_receipt is not None
+        ):
+            used_receipt.observation_consumed = True
 
     async def _request_command(
         self, args: list[str], *, request_id: str

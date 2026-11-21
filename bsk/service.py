@@ -29,8 +29,11 @@ from .config import (
     Settings,
     as_timeout_seconds,
 )
+from .cooperation import extract_sync_observation
 from .errors import (
     CODE_BROWSER_AMBIGUOUS,
+    COOPERATION_UNOBSERVABLE_REASONS,
+    HUMAN_CONTROL_REASONS,
     BskBrowserAmbiguous,
     BskError,
 )
@@ -552,6 +555,24 @@ class BskService:
             name += "（此实例当前无响应，不建议选它）"
         return name
 
+    def _resolve_existing_key(self, key: str) -> str:
+        """若 ``key`` 是已知的会话键或 ``session_id``，返回对应的会话键；否则原样返回。
+
+        用途：新工具文档指导模型把 ``bsk_session(start)`` 返回的 4 字母
+        ``session_id``（如 ``ulen``）传给 ``session`` 参数；若旧路径直接把
+        ``session_id`` 当新 key 传进 ``SessionManager.execute``，会错误地新建一扇
+        空白浏览器窗口。先按 ``_key_for`` 归并回原会话键，同时保留旧工具首次用
+        ``umo`` 自动建会话的向后兼容行为。
+        """
+        raw = (key or "").strip() if isinstance(key, str) else ""
+        if not raw:
+            return key
+        mapped = self._key_for(raw)
+        if mapped:
+            self.set_current(mapped)
+            return mapped
+        return key
+
     # ------------------------------------------------------------------
     # 用例 1：打开网页
     # ------------------------------------------------------------------
@@ -569,14 +590,15 @@ class BskService:
         Returns:
             ``(导航结果, 页面观察)``。
         """
+        session_key = self._resolve_existing_key(key)
         nav_result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["navigate", url, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_NAVIGATE),
         )
         nav = NavigateResult.from_json(nav_result.data)
 
-        observation = await self.observe(key)
+        observation = await self.observe(session_key)
         return nav, observation
 
     # ------------------------------------------------------------------
@@ -595,7 +617,10 @@ class BskService:
         """读取当前页面的语义结构（VOM）。
 
         只调 ``observe``，不调 ``snapshot`` —— 实机验证两者输出逐字节相同，
-        且都不带截图，同时调用纯属浪费一倍时间。
+        且都不带截图，同时调用纯属浪费一倍时间。在 ``bsk >= 0.4.0`` 下会先通过
+        ``cooperate sync`` 刷新控制上下文（``--context``）与顶层严格观察凭证
+        （``--observation``）；当 ``sync`` 直接返回 baseline 观察且无需游标/深度
+        裁剪时直接复用该结果，避免二次往返并保持稳定元素编号（``@eN``）。
 
         Args:
             key: 会话键。
@@ -620,26 +645,68 @@ class BskService:
             没内容"来回答用户。所以重建时往 ``text`` 前面插一句明确提示
             （``text`` 是模型唯一会读到的字段）。
         """
+        session_key = self._resolve_existing_key(key)
         counters_before = self.sessions.stats().get("counters", {})
         rebuilds_before = counters_before.get("not_found_rebuilds", 0)
+        observe_timeout = self._timeout(TIMEOUT_OBSERVE)
 
-        args: list[str] = ["observe"]
-        if cursor:
-            args += ["--cursor", str(cursor)]
-        if max_depth is not None:
-            args += ["--max-depth", str(int(max_depth))]
-        if max_tokens is not None:
-            args += ["--max-tokens", str(int(max_tokens))]
+        observation: PageObservation | None = None
+        human_active_note = ""
 
-        result = await self.sessions.execute(
-            key,
-            lambda sid: self._with_tab_id(args, tab_id) + ["--session", sid, "--json"],
-            timeout=self._timeout(TIMEOUT_OBSERVE),
-            allow_uncertain=True,
-        )
-        observation = parse_observation(
-            result.data if isinstance(result.data, dict) else {}
-        )
+        # 不打断 cursor 分页（翻页中间穿插 sync 会让游标失效）。
+        sync_fn = getattr(self.sessions, "sync_cooperation", None)
+        if not cursor and callable(sync_fn):
+            try:
+                sync_data = await sync_fn(
+                    session_key,
+                    tab_id=tab_id,
+                    max_tokens=(max_tokens if max_depth is None else None),
+                    timeout=observe_timeout,
+                )
+            except BskError as exc:
+                if exc.reason in COOPERATION_UNOBSERVABLE_REASONS:
+                    # 初始 about:blank 或受限页不支持协作采集，降级走被动 observe。
+                    self._logger.debug(
+                        "会话 %s 的 cooperate sync 降级为被动 observe（reason=%s）",
+                        session_key,
+                        exc.reason,
+                    )
+                    sync_data = None
+                elif exc.reason in HUMAN_CONTROL_REASONS:
+                    # 人工接管期间仍允许只读查看页面，并在正文前明确告知模型不要立刻交互。
+                    human_active_note = (
+                        "（提示：用户当前正在操作该标签页，浏览器已暂停自动交互。"
+                        "请等用户操作完成后再重新观察并执行操作。）\n"
+                    )
+                    sync_data = None
+                else:
+                    raise
+            if isinstance(sync_data, dict) and max_depth is None:
+                obs_payload = extract_sync_observation(sync_data)
+                if obs_payload is not None:
+                    observation = parse_observation(obs_payload)
+
+        if observation is None:
+            args: list[str] = ["observe"]
+            if cursor:
+                args += ["--cursor", str(cursor)]
+            if max_depth is not None:
+                args += ["--max-depth", str(int(max_depth))]
+            if max_tokens is not None:
+                args += ["--max-tokens", str(int(max_tokens))]
+
+            result = await self.sessions.execute(
+                session_key,
+                lambda sid: self._with_tab_id(args, tab_id) + ["--session", sid, "--json"],
+                timeout=observe_timeout,
+                allow_uncertain=True,
+            )
+            observation = parse_observation(
+                result.data if isinstance(result.data, dict) else {}
+            )
+
+        if human_active_note:
+            observation.text = human_active_note + observation.text
 
         counters_after = self.sessions.stats().get("counters", {})
         rebuilds_after = counters_after.get("not_found_rebuilds", 0)
@@ -651,7 +718,9 @@ class BskService:
                 "如果用户之前在浏览某个页面，需要重新用 bsk_open 打开那个网址。）\n"
                 + observation.text
             )
-            self._logger.info("会话 %s 在读取时被重建，已在返回内容里标注页面已重置", key)
+            self._logger.info(
+                "会话 %s 在读取时被重建，已在返回内容里标注页面已重置", session_key
+            )
 
         return observation
 
@@ -707,6 +776,7 @@ class BskService:
         Raises:
             BskError: 任何 bsk 层错误（含会话不确定态被拒）。
         """
+        session_key = self._resolve_existing_key(key)
         args = self._build_action_args(
             action,
             target=target,
@@ -717,7 +787,7 @@ class BskService:
             delta_x=delta_x,
         )
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: [*args, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_ACTION),
             # 写类动作绝不允许在不确定态下执行 —— 那可能造成重复点击/重复提交。
@@ -884,8 +954,9 @@ class BskService:
             脚本很可能是上一次失败操作的重复（例如重复提交）。所以这个
             参数刻意传 False（默认值），与 click/fill 同一档。
         """
+        session_key = self._resolve_existing_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             # EXPRESSION 是位置参数；--json 让输出可机器解析。
             lambda sid: ["evaluate", expression, "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_EVALUATE),
@@ -1107,8 +1178,9 @@ class BskService:
             250 倍余量；它跟着 ``command_timeout_sec`` 走是刻意的 ——
             那条本来就表达"你愿意为一条命令最多等多久"，截图没有理由例外。
         """
+        session_key = self._resolve_existing_key(key)
         directory = self.settings.screenshot_dir or self._default_shot_dir()
-        out_path = make_shot_path(directory, key)
+        out_path = make_shot_path(directory, session_key)
 
         if full_page:
             timeout = self._timeout(self.fullpage_budget())
@@ -1119,7 +1191,7 @@ class BskService:
             argv.append("--full-page")
 
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: [*argv, "--session", sid, "--json"],
             timeout=timeout,
             # 截图是只读动作。
@@ -1282,8 +1354,9 @@ class BskService:
             返回里 ``entries`` 字段可能整个不存在（实测），
             ``ConsoleLog.from_json`` 已经处理成空列表。
         """
+        session_key = self._resolve_existing_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["console", "--since", str(int(since)), "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
@@ -1296,8 +1369,9 @@ class BskService:
         ⚠️ 实测 ``url`` 字段可能内联巨大的 ``data:image/png;base64,...``，
         渲染给模型时必须截断，否则会瞬间吃光上下文。
         """
+        session_key = self._resolve_existing_key(key)
         result = await self.sessions.execute(
-            key,
+            session_key,
             lambda sid: ["network", "--since", str(int(since)), "--session", sid, "--json"],
             timeout=self._timeout(TIMEOUT_QUICK),
             allow_uncertain=True,
@@ -2149,6 +2223,20 @@ class BskService:
         只读，所以 ``allow_uncertain=True``（与 ``observe`` 同一条理由）。
         """
         session_key = self._resolve(key)
+        observe_timeout = self._timeout(TIMEOUT_OBSERVE)
+        # 若该标签页尚未建立协作同步，先同步一次以启用稳定 ref 表并缓存控制凭证。
+        sync_fn = getattr(self.sessions, "sync_cooperation", None)
+        has_ctx_fn = getattr(self.sessions, "has_valid_coop_context", None)
+        if callable(sync_fn) and not (
+            callable(has_ctx_fn) and has_ctx_fn(session_key, tab_id)
+        ):
+            try:
+                await sync_fn(session_key, tab_id=tab_id, timeout=observe_timeout)
+            except BskError as exc:
+                if exc.reason not in (
+                    COOPERATION_UNOBSERVABLE_REASONS | HUMAN_CONTROL_REASONS
+                ):
+                    raise
         args: list[str] = []
         if max_depth is not None:
             args += ["--max-depth", str(int(max_depth))]
@@ -2158,7 +2246,7 @@ class BskService:
             session_key,
             lambda sid: self._with_tab_id(["snapshot", *args], tab_id)
             + ["--session", sid, "--json"],
-            timeout=self._timeout(TIMEOUT_OBSERVE),
+            timeout=observe_timeout,
             allow_uncertain=True,
         )
         data = result.data if isinstance(result.data, dict) else {}

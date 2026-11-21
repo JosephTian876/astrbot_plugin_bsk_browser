@@ -236,6 +236,26 @@ def _extract_error_fields(data: Any) -> tuple[str, str, str, str]:
     )
 
 
+def _extract_effect_state(data: Any) -> str:
+    """从错误 JSON 的 ``data.effect_state`` 里取出副作用状态（如 ``"unknown"``）。
+
+    单独抽成辅助而不是改 :func:`_extract_error_fields` 的四元组返回值：
+    既有调用方与单元测试直接解包四元组，保持签名与返回值完全向后兼容。
+    """
+    if not isinstance(data, dict):
+        return ""
+    node: dict[str, Any] = data
+    inner = data.get("error")
+    if isinstance(inner, dict):
+        node = inner
+    extra = node.get("data")
+    if isinstance(extra, dict):
+        state = extra.get("effect_state")
+        if isinstance(state, str):
+            return state.strip().lower()
+    return ""
+
+
 class BskRunner:
     """调用 bsk CLI 的执行器。
 
@@ -424,6 +444,7 @@ class BskRunner:
             return result
 
         code, message, hint, reason = _extract_error_fields(result.data)
+        effect_state = _extract_effect_state(result.data)
         raise errors.classify(
             exit_code=result.exit_code,
             code=code,
@@ -431,6 +452,7 @@ class BskRunner:
             hint=hint,
             reason=reason,
             stderr=result.stderr,
+            effect_state=effect_state,
         )
 
     @staticmethod

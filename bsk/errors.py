@@ -44,6 +44,9 @@ EXIT_TIMEOUT = 4
 EXIT_VERSION = 5
 """版本不匹配（CLI 与扩展协议版本对不上）。"""
 
+EXIT_DIALOG_PENDING = 6
+"""页面弹出原生对话框（alert/confirm/prompt），原操作被挂起（bsk >= 0.4.0）。"""
+
 # --- bsk 返回的 error code 字符串 ---
 
 CODE_NOT_FOUND = "not_found"
@@ -53,10 +56,19 @@ CODE_SESSION_BUSY = "session_busy"
 """同一 session 上有 in-flight 命令。可以短暂等待后重试一次。"""
 
 CODE_PERMISSION_DENIED = "permission_denied"
-"""权限不足（例如 evaluate 试图跑在非 Agent Window 标签里）。重试无用。"""
+"""权限或协作策略拒绝（bsk >= 0.4.0 下按 data.reason 细分为窗口归属、协作同步、人工接管、目标不可操作等）。"""
 
 CODE_BROWSER_AMBIGUOUS = "browser_ambiguous"
 """同时连着多个浏览器，而用户没有指定用哪一个。必须改配置才能继续，重试无用。"""
+
+CODE_USER_ABORTED = "user_aborted"
+"""用户在浏览器浮层里主动点击了「停止任务」（bsk >= 0.4.0）。禁止自动恢复或重试。"""
+
+CODE_DIALOG_PENDING = "dialog_pending"
+"""原生 JS 对话框挂起了当前操作（bsk >= 0.4.0）。禁止重放提交。"""
+
+CODE_UNSUPPORTED = "unsupported"
+"""对端组件（daemon 或扩展）不支持该特性或协议版本过旧。"""
 
 CODE_CANCELLED = "cancelled"
 """可恢复启动的请求已被取消。
@@ -78,8 +90,153 @@ OUTCOME_UNKNOWN_REASONS: frozenset[str] = frozenset(
         "extension_disconnected",
         "input_outcome_unknown",
         "result_outcome_unknown",
+        "transfer_outcome_unknown",
+        "borrow_outcome_unknown",
     }
 )
+
+# 这些 reason 表示当前标签页缓存的协作控制凭证已经失效，必须清掉本地缓存。
+COOPERATION_INVALIDATING_REASONS: frozenset[str] = frozenset(
+    {
+        "cooperation_sync_required",
+        "control_context_invalid",
+        "document_changed",
+        "human_intervention",
+        "control_held",
+        "control_authority_required",
+        "uncertain_prior_effect",
+        "user_moved_tab",
+    }
+)
+
+# 只读型严格命令（如 screenshot --full-page）遇到这些 reason（且 effect_state != unknown）时，
+# 可以安全地重新执行一次 cooperate sync 再重试一次。
+COOPERATION_READONLY_RETRY_REASONS: frozenset[str] = frozenset(
+    {
+        "cooperation_sync_required",
+        "control_context_invalid",
+        "observation_required",
+        "observation_changed",
+        "document_changed",
+    }
+)
+
+# 这些 reason 表示目标页面当前无法建立协作采集（例如初始 about:blank 或受限页），
+# 只读 observe/snapshot 遇到它们时应优雅降级为被动读取，不阻断页面查看。
+COOPERATION_UNOBSERVABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "frame_unobservable",
+        "restricted_tab_url",
+        "page_load_failed",
+    }
+)
+
+# 这些 reason 表示人类正在操作该标签页（人工接管中）。
+HUMAN_CONTROL_REASONS: frozenset[str] = frozenset(
+    {
+        "human_intervention",
+        "control_held",
+        "control_authority_required",
+    }
+)
+
+# bsk >= 0.4.0 / 0.5.0 下 code="permission_denied" 对应的细分 reason 文案。
+# 空白或 agent_window_scope 沿用既有文案；未知的非空 reason 不再冒充窗口归属错误。
+_PERMISSION_DENIED_FRIENDLY: dict[str, str] = {
+    "agent_window_scope": "浏览器拒绝了这次操作：该动作只允许在 bsk 自己的窗口里执行。",
+    "cooperation_sync_required": (
+        "当前标签页的协作控制状态尚未同步或已失效。"
+        '请先用 bsk_inspect(action="observe") 重新读取页面状态后再试。'
+    ),
+    "control_context_invalid": (
+        "当前标签页的控制上下文已失效（页面可能发生了切换或人工操作）。"
+        '请先用 bsk_inspect(action="observe") 重新读取页面状态后再试。'
+    ),
+    "observation_required": (
+        "该操作需要来自最新协作同步（cooperate sync）的显式观察凭证（--observation）。"
+        '请先用 bsk_inspect(action="observe") 刷新页面状态后再试。'
+    ),
+    "observation_changed": (
+        "页面内容在执行前发生了变化，浏览器已拦截本次操作以防误点。"
+        '请先用 bsk_inspect(action="observe") 确认页面最新状态后再决定下一步。'
+    ),
+    "document_changed": (
+        "页面主文档已跳转或重新加载，原有的控制上下文与元素编号均已失效。"
+        '请先用 bsk_inspect(action="observe") 重新读取页面后再操作。'
+    ),
+    "human_intervention": (
+        "用户正在亲自操作这个标签页，浏览器已暂停自动操作。"
+        '请等用户操作完成后，再用 bsk_inspect(action="observe") 确认当前页面状态。'
+    ),
+    "control_held": (
+        "用户当前正持有该标签页的控制权，浏览器已暂停自动操作。"
+        '请等用户交回控制权后，再用 bsk_inspect(action="observe") 同步状态。'
+    ),
+    "control_authority_required": (
+        "当前未持有该标签页的控制权（可能处于人工接管或共享控制已结束）。"
+        "请等用户交回控制权后检查当前页面状态，不要盲目重试。"
+    ),
+    "uncertain_prior_effect": (
+        "上一步操作的结果尚未确认，bsk 已拦截后续写操作以防重复提交。"
+        '请先用 bsk_inspect(action="observe") 检查页面或业务状态，确认后再继续。'
+    ),
+    "frame_unobservable": (
+        "当前页面无法建立交互监测（例如空白页 about:blank、受限内部页面或子框架无响应）。"
+        "请先导航到正常网页或刷新页面；只读查看可改用 snapshot 或 html。"
+    ),
+    "page_load_failed": (
+        "目标主页面加载失败，暂时无法交互。请检查网址与网络连接后重新打开或刷新。"
+    ),
+    "element_not_visible": (
+        "目标元素当前不在可见视口范围内，无法直接操作。"
+        "请先滚动页面让元素进入视野，或重新读取页面确认元素位置后再试。"
+    ),
+    "target_hidden": (
+        "目标元素当前处于隐藏状态，无法操作。"
+        '请确认页面状态或先用 bsk_inspect(action="observe") 查看最新元素。'
+    ),
+    "target_detached": (
+        "目标元素已从页面中移除。"
+        '请先用 bsk_inspect(action="observe") 重新获取最新的元素编号后再试。'
+    ),
+    "target_unavailable": (
+        "目标元素当前不可用或已失效。"
+        '请先用 bsk_inspect(action="observe") 重新读取页面并选择有效目标。'
+    ),
+    "target_disabled": "目标元素当前处于禁用（disabled）状态，暂时无法操作。",
+    "target_readonly": "目标输入框当前为只读（readonly）状态，无法写入内容。",
+    "target_covered": (
+        "目标元素被页面上的弹窗、浮层或其他元素遮挡，无法直接点击。"
+        "请先关闭遮挡层或滚动页面后再试。"
+    ),
+    "target_moved": (
+        "目标元素在点击前发生了位置移动，本次输入已取消以防点偏。"
+        "请重新确认页面元素后再试。"
+    ),
+    "target_focus_lost": "键盘焦点已从目标元素移走，请先聚焦该元素后再按键。",
+    "virtual_row_recycled": (
+        "目标所在的列表行已被虚拟列表复用到另一条记录，浏览器已拦截操作以防点错。"
+        '请先用 bsk_inspect(action="observe") 刷新列表编号后再试。'
+    ),
+    "precondition_failed": (
+        "操作前校验的页面条件不再匹配（目标文字或状态已变化）。"
+        '请先用 bsk_inspect(action="observe") 核对最新内容后再决定是否操作。'
+    ),
+    "restricted_tab_url": (
+        "当前标签页属于浏览器受限内部页面（如 chrome:// 或扩展页），不允许执行此操作。"
+    ),
+    "user_denied": "用户拒绝了借用标签页的授权请求，请不要重复发起同一请求。",
+    "confirmation_timeout": "等待用户确认借用标签页超时，本次操作未执行。",
+    "confirmation_ui_unavailable": (
+        "浏览器当前无法弹出借用确认界面，请检查浏览器窗口状态或扩展的自动化设置。"
+    ),
+    "file_drop_target_unavailable": "无法安全定位文件拖放目标，本次上传未发出。",
+    "local_file_error": "本地文件路径无效或无读写权限，请检查目标路径。",
+    "user_moved_tab": (
+        "用户把受控标签页移出了任务窗口，该浏览器会话已结束且无法恢复。"
+        "请向用户确认是否需要新建会话。"
+    ),
+}
 
 
 class BskError(Exception):
@@ -250,6 +407,61 @@ def is_cancelled_error(exc: BaseException) -> bool:
     return getattr(exc, "code", "") == CODE_CANCELLED
 
 
+def _permission_denied_friendly(reason: str, detail: str) -> str:
+    """把 ``code="permission_denied"`` 按 ``data.reason`` 翻译成准确的中文提示。"""
+    if not reason:
+        return _PERMISSION_DENIED_FRIENDLY["agent_window_scope"]
+    known = _PERMISSION_DENIED_FRIENDLY.get(reason)
+    if known is not None:
+        return known
+    return f"操作被浏览器策略拒绝（{reason}）：{detail}"
+
+
+def _browser_error_friendly(reason: str, detail: str) -> str:
+    """为退出码 3（浏览器/CDP 层失败）提供按 ``data.reason`` 细分的中文提示。"""
+    if reason == "operation_settling":
+        return "上一条浏览器操作还在收尾中，本次动作未发出。请稍等一秒后重试。"
+    if reason == "screenshot_capture_failed":
+        return (
+            f"截屏失败：{detail}。"
+            "若是动态变化或无限滚动页面，可改用普通视口截图，或等页面稳定后再试。"
+        )
+    if reason == "page_hidden":
+        return "截图失败：目标标签页当前处于隐藏状态，请保持窗口可见后再试。"
+    if reason == "stale_frame":
+        return "全页截图失败：页面滚动后画面未刷新，请保持目标窗口可见后再试。"
+    if reason == "navigation":
+        return "截图过程中页面发生了跳转，请重新读取页面后再试。"
+    if reason == "cdp_extension_access_denied":
+        return (
+            "浏览器拦截了当前页面里其他扩展内容的访问权限。"
+            "可尝试导航离开该页面，或停用冲突扩展后刷新重试。"
+        )
+    if reason == "observe_identity_reload_loop":
+        return (
+            "目标站点检测到调试器附加并不断自动刷新（反调试限制），"
+            "请不要反复观察或刷新该页，改用其他页面或由用户自行操作。"
+        )
+    return (
+        "浏览器层面出错了。请确认浏览器和 bsk 扩展还在正常运行"
+        "（可以看浏览器工具栏里的扩展图标是否为已连接）。"
+    )
+
+
+def _timeout_friendly(reason: str, detail: str) -> str:
+    """为退出码 4（超时）提供按 ``data.reason`` 细分的中文提示。"""
+    if reason == "loading_stalled":
+        return (
+            "全页截图超时：页面底部一直处于加载状态且高度不再增长，"
+            "建议改用视口截图而不是继续放大超时。"
+        )
+    if reason == "watchdog_timeout":
+        return "全页截图与页面失去响应，请确认浏览器正常运行后再试。"
+    if reason == "screenshot_capture_failed":
+        return f"截图超时：{detail}。请确认标签页响应正常后再试。"
+    return "网页响应太慢，操作超时了。可以稍后重试，或换一个更快的页面。"
+
+
 # --- 构造错误的统一入口 ---
 
 
@@ -261,6 +473,7 @@ def classify(
     hint: str = "",
     reason: str = "",
     stderr: str = "",
+    effect_state: str = "",
 ) -> BskError:
     """把一次失败的 bsk 调用归类成具体的异常。
 
@@ -271,8 +484,10 @@ def classify(
         code: 错误 JSON 里的 ``code``，没有则为空串。
         message: 错误 JSON 里的 ``message``。
         hint: 错误 JSON 里的 ``hint``。
-        reason: 错误 JSON 里 ``data.reason``，用于判定"结果未知"。
+        reason: 错误 JSON 里 ``data.reason``，用于判定"结果未知"与细分权限/目标原因。
         stderr: 进程 stderr 原文，clap 参数错误时只有它可用。
+        effect_state: 错误 JSON 里 ``data.effect_state``（bsk >= 0.4.2 / 0.5.0），
+            为 ``"unknown"`` 时与 ``OUTCOME_UNKNOWN_REASONS`` 同等对待，绝不重试。
 
     Returns:
         对应的 BskError 子类实例。
@@ -282,14 +497,72 @@ def classify(
         detail = f"{detail}（提示：{hint}）"
 
     # 优先级 1：动作结果未知 —— 必须最先判断，否则会被当成可重试错误。
-    if reason in OUTCOME_UNKNOWN_REASONS:
+    if reason in OUTCOME_UNKNOWN_REASONS or effect_state == "unknown":
         return BskOutcomeUnknown(
             detail,
             friendly=(
-                "浏览器连接中断，上一步操作的结果无法确认。"
+                "上一步操作的结果无法确认（连接中断或浏览器执行状态未知）。"
                 "为避免重复操作，我不会自动重试。"
                 "请先看一眼浏览器里的实际状态，再决定是否继续。"
             ),
+            code=code,
+            exit_code=exit_code,
+            reason=reason,
+        )
+
+    # 优先级 1.5：明确不可自动重建/重试的协作终态或目标不存在（避免误入 BskSessionGone 重建整扇窗口）。
+    if code == CODE_USER_ABORTED:
+        return BskError(
+            detail,
+            friendly="用户已主动停止当前浏览器任务。请尊重用户操作，不要自动恢复或重试。",
+            code=code,
+            exit_code=exit_code,
+            reason=reason,
+        )
+
+    if reason == "user_moved_tab":
+        return BskError(
+            detail,
+            friendly=_PERMISSION_DENIED_FRIENDLY["user_moved_tab"],
+            code=code,
+            exit_code=exit_code,
+            reason=reason,
+        )
+
+    if code == CODE_DIALOG_PENDING or exit_code == EXIT_DIALOG_PENDING:
+        return BskError(
+            detail,
+            friendly=(
+                "页面弹出了原生对话框（alert/confirm/prompt），当前操作已挂起。"
+                "请先查看页面状态或请用户处理对话框，不要重复提交。"
+            ),
+            code=code,
+            exit_code=exit_code,
+            reason=reason,
+        )
+
+    if code == CODE_NOT_FOUND and reason in (
+        "ref_not_found",
+        "selector_not_found",
+        "visual_target_changed",
+    ):
+        target_hints = {
+            "ref_not_found": (
+                "找不到对应的元素编号（可能页面已经变化，旧的 @eN 已失效）。"
+                '请先用 bsk_inspect(action="observe") 重新读取页面获取最新编号后再试。'
+            ),
+            "selector_not_found": (
+                "页面上找不到匹配的 CSS 选择器。"
+                '请检查选择器是否正确，或先用 bsk_inspect(action="observe") 获取元素的 @eN 编号。'
+            ),
+            "visual_target_changed": (
+                "Canvas 截图目标在点击前已变化或失效。"
+                '请重新 observe 并对元素截屏（screenshot --ref）后再试。'
+            ),
+        }
+        return BskError(
+            detail,
+            friendly=target_hints[reason],
             code=code,
             exit_code=exit_code,
             reason=reason,
@@ -318,7 +591,7 @@ def classify(
     if code == CODE_PERMISSION_DENIED:
         return BskError(
             detail,
-            friendly="浏览器拒绝了这次操作：该动作只允许在 bsk 自己的窗口里执行。",
+            friendly=_permission_denied_friendly(reason, detail),
             code=code,
             exit_code=exit_code,
             reason=reason,
@@ -328,7 +601,7 @@ def classify(
     if exit_code == EXIT_TIMEOUT:
         return BskTimeout(
             detail,
-            friendly="网页响应太慢，操作超时了。可以稍后重试，或换一个更快的页面。",
+            friendly=_timeout_friendly(reason, detail),
             code=code,
             exit_code=exit_code,
             reason=reason,
@@ -337,10 +610,7 @@ def classify(
     if exit_code == EXIT_BROWSER:
         return BskBrowserError(
             detail,
-            friendly=(
-                "浏览器层面出错了。请确认浏览器和 bsk 扩展还在正常运行"
-                "（可以看浏览器工具栏里的扩展图标是否为已连接）。"
-            ),
+            friendly=_browser_error_friendly(reason, detail),
             code=code,
             exit_code=exit_code,
             reason=reason,
@@ -356,6 +626,14 @@ def classify(
         )
 
     if exit_code == EXIT_PROTOCOL:
+        if reason == "user_cancelled":
+            return BskProtocolError(
+                detail,
+                friendly="操作已被用户中断（如全页截图期间发生人工操作），不会自动重试。",
+                code=code,
+                exit_code=exit_code,
+                reason=reason,
+            )
         return BskProtocolError(
             detail,
             friendly="与 bsk 后台服务的通信失败了。可以在终端执行 `bsk doctor` 检查环境。",
