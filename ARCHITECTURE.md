@@ -1,6 +1,6 @@
 # astrbot_plugin_bsk_browser — 架构与实施方案
 
-> 版本：v0.3.1（8 个主工具 + 8 个兼容旧工具；默认只注册 12 个）
+> 版本：v0.3.2（8 个主工具 + 8 个兼容旧工具；默认只注册 12 个）
 > 目标读者：实现该插件的工程师（含 subagent）
 > 依据：本仓库外的调研资料（6 份调研报告，未随仓库分发）+ 本机实测
 >
@@ -64,8 +64,9 @@
 │  · paths.py     插件数据目录解析与降级（journal/截图共用）   │
 │  · models.py    数据模型（Session、Page、Shot、Result）     │
 │  · errors.py    bsk 退出码/错误码 → 分类异常 → 中文提示      │
-│  · config.py    原始 dict → 强类型 Settings（含校验与兜底）  │
-│  · runner.py    子进程调用：超时、编码、退出码、JSON 容错    │
+│  · config.py      原始 dict → 强类型 Settings（含校验与兜底）│
+│  · cooperation.py bsk 0.4.x/0.5.0 协作控制协议与凭证分类     │
+│  · runner.py      子进程调用：异步、无黑框、超时、UTF-8 容错 │
 │  · session.py   会话生命周期：umo→session 映射、锁、显式 stop│
 │  · pages.py     VOM 语义解析：标题提取、ref 提取、截断       │
 │  · shots.py     截图：唯一路径、魔数校验、清理              │
@@ -146,6 +147,8 @@ class BskRunner:
 4. stdout/stderr 显式 `.decode("utf-8", errors="replace")` —— 见 C9
 5. 错误 JSON 走 stdout 不是 stderr；clap 参数错误是 stderr 纯文本 → 解析必须容错
 6. 退出码非 0 即失败，不能靠解析 JSON 判成败
+7. Windows（`sys.platform == "win32"`）下注入 `creationflags=subprocess.CREATE_NO_WINDOW`，避免桌面无控制台环境下每次调用 `bsk.exe` 闪现黑框；非 Windows 严禁传入该参数
+8. `bsk/` 中只有本模块可直接导入 `subprocess`；`BskService.probe_browser()` 亦经由 `runner.run_or_raise` 异步执行，绝不在事件循环上同步调用 `subprocess.run`
 
 ### 4.3 `bsk/session.py`
 
@@ -660,7 +663,7 @@ self._journal_add(fresh)           # ← 永远执行不到
 
 | 层 | 范围 | AstrBot | 浏览器 | 脚本 |
 |---|---|---|---|---|
-| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、框架超时读取与钳制、8 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（840 个用例，`unittest` 口径） |
+| L1 单元测试 | `bsk/*` 纯逻辑：错误映射、VOM 解析、配置校验、截图魔数、会话状态机、协作控制协议、框架超时读取与钳制、Windows 无黑框与异步探测、8 个主工具的 action 枚举与逐 action 参数校验 | ❌ | ❌ | `tests/test_*.py`（891 个用例，`unittest` 口径） |
 | L2 契约测试 | `main.py` 能被真实 AstrBot import、16 个工具注册成功、docstring schema 正确、硬约束（无 `__del__` 等）满足 | ✅ | ❌ | `verify_astrbot_contract.py` |
 | L3 服务层集成 | 真实调用 bsk：开→导航→读→截图→关，含并发与会话过期自动重建 | ✅ | ✅ | `verify_integration.py` |
 | L4 工具层端到端 | 直接 await `main.py` 里的工具函数，验证权限门、参数校验、异步生成器行为、异常包装 | ✅ | ✅ | `verify_tools_e2e.py`（6 个旧工具：`bsk_open/read/act/screenshot/close/status`）、`verify_logs_tool.py`（`bsk_logs`）、`verify_evaluate_gate.py`（`bsk_evaluate` 的权限三分支）、`verify_new_tools_real.py`（8 个新工具、57 个 action） |
@@ -697,7 +700,7 @@ logger 注入与数据落盘位置这两条改动另有专门的单元测试，�
 ```powershell
 $py = "D:\AstrBot\backend\python\python.exe"
 cd <插件目录>                                 # 即本仓库根目录
-& $py -m unittest discover -s tests        # L1（840 个）
+& $py -m unittest discover -s tests        # L1（891 个）
 & $py tests\verify_astrbot_contract.py     # L2
 & $py tests\verify_integration.py          # L3（需要浏览器）
 & $py tests\verify_tools_e2e.py            # L4（需要浏览器）
@@ -706,8 +709,8 @@ cd <插件目录>                                 # 即本仓库根目录
 
 **注意**：AstrBot 自带的那个解释器里没有 `pytest`（`ModuleNotFoundError`），所以上面一律用
 `unittest`；本机另有一个装了 pytest 的独立解释器（`D:\Python312\python.exe`），可以用它跑同一批
-用例（`python -m pytest tests/ -q`，实测 839 passed / 1 skipped，与 `unittest` 口径的 840 个
-用例一致 —— 差的 1 个是被 skip 的那条）。
+用例（`python -m pytest tests/ -q`，实测 889 passed / 2 skipped / 1034 subtests passed，与 `unittest` 口径的 891 个
+用例一致 —— 差的 2 个是被 skip 的条目）。
 
 L3/L4 的强制安全边界（这些脚本会真的操作浏览器）：
 只访问 `example.com`；绝不借用用户标签页；不做 click/fill/press/upload/download/evaluate；
@@ -745,6 +748,9 @@ AstrBot 解析数据路径时优先读该变量，否则普通模式下用当前
 | 8 | 测试自身泄漏会话 | 某用例把假 id `"zzzz"` 写进 args builder，导致懒创建的真实会话在重建时被遗弃 | 全量回归后 daemon 残留会话 | `verify_integration.py` 的差集断言 + 兜底强清 |
 | 9 | README 与实现方向相反 | `session_scope:"user"` 说"跨群共用"，实际键含 umo → 跨群独立 | 用户按文档理解会误判资源占用 | README 核对报告 |
 | 10 | 启动超时留下永久孤儿浏览器窗口 | 顺序是「先 `await self._start()`、成功后再 `_journal_add()`」；start 超时直接抛异常，落盘那一步**永远执行不到** | 窗口已经开出来但插件不知道它的 id，journal 里也没有它，`recover_orphans()` 够不着 → 桌面留下关不掉也清不掉的窗口，重启 AstrBot 同样带不走 | `test_session.py` 的可恢复启动用例 + `verify_recover_real.py`；机制见 §5 D12 |
+| 11 | `probe_browser` 同步阻塞事件循环 | 在 asyncio 线程直接调用 `subprocess.run([exe, "browsers", "--json"])`，且超时套用 `command_timeout_sec`（默认 60s） | 未配置 `browser_instance_id` 时，建会话前探测卡顿会冻结整个 AstrBot 事件循环长达 60 秒 | `test_service.py::TestBrowserProbeIsWiredIntoSessionCreation` + `test_logger_injection.py::TestSourceLevelLayering` |
+| 12 | Windows 桌面端调用 `bsk.exe` 闪黑框 | `create_subprocess_exec` 未在 `win32` 下传 `creationflags=subprocess.CREATE_NO_WINDOW` | 无控制台窗口的 AstrBot Desktop 每次调工具都在桌面闪现 cmd 黑框 | `test_runner.py::TestWindowsNoConsoleWindow` |
+| 13 | 过期旧工具引导语误导模型 | `service.observe()` 会话重建提示仍写 `bsk_open`、`main.py` 的 `bsk_evaluate` 说明仍写 `bsk_read`，而二者自 v0.3.0 起默认关闭 | 模型按提示调用未注册的旧工具导致失败 | `test_service.py::TestModernToolGuidance` |
 
 ### 6.2 已确认的**固有行为**（不是 bug，但必须如实告知）
 
@@ -813,6 +819,7 @@ astrbot_plugin_bsk_browser/
 │   ├── models.py
 │   ├── errors.py
 │   ├── config.py
+│   ├── cooperation.py        #   bsk 0.4.x/0.5.0 协作控制协议纯逻辑层
 │   ├── runner.py
 │   ├── session.py
 │   ├── pages.py

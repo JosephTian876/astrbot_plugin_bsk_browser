@@ -4,6 +4,40 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-11-27
+
+兼容与稳定性补丁版：完整适配腾讯 BrowserSkill `bsk 0.4.x / 0.5.0` 的协作控制协议与细粒度错误码，
+并修复浏览器自动探测同步阻塞事件循环、Windows 闪黑框以及过期旧工具引导文案等问题。
+**没有破坏性变更，无需修改任何现有配置项。**
+
+### 新增
+
+- **适配 `bsk 0.4.x / 0.5.0` 协作控制协议（新增 `bsk/cooperation.py`）**：
+  - 自动探测 `bsk cooperate` 能力，按 `target` / `strict` / `bootstrap` 分类命令并接入
+    `cooperate sync` 与 `--context` / `--observation` 生命周期（严格提取顶层
+    `observation_id`，不误用嵌套字段）；
+  - 支持初始空白页首屏引导、多标签页凭证隔离、旧版 `bsk <= 0.3.3` 零开销回退、
+    `0.4.0` 与旧扩展 `--policy strict` 自动降级、全页截图过期观察单次重同步重试、
+    过期 `@eN` 防误点，以及 `observe` / `evaluate` / `screenshot` 的 `session_id` 归并；
+  - 细分 `bsk/errors.py` 与 `bsk/runner.py` 错误分类：按 `data.reason` 区分
+    `permission_denied`（人机接管、人工暂停、协作状态失效等），识别 `effect_state=unknown`、
+    `user_aborted`、`dialog_pending` 与目标 `not_found` 等新语义，给出更清晰的可操作中文提示；
+  - 新增 `tests/test_cooperation.py`（38 个测试函数 / 100 个子用例）覆盖协议边界与版本兼容矩阵。
+
+### 修复
+
+- **消除自动探测浏览器同步阻塞事件循环**：`BskService.probe_browser()` 由在事件循环线程
+  同步调用 `subprocess.run`（超时可随 `command_timeout_sec` 高达 60 秒）改为经
+  `runner.run_or_raise(["browsers", "--json"], timeout=min(self._timeout(TIMEOUT_QUICK), 10.0))`
+  异步非阻塞执行，并对接 `SessionManager` 原有的 awaitable 探测接缝。
+  `bsk/runner.py` 自此成为 `bsk/` 包内唯一与子进程打交道的模块。
+- **修复 Windows 桌面端调用 `bsk.exe` 闪现控制台黑框**：在 `bsk/runner.py` 启动子进程时
+  按 `sys.platform == "win32"` 条件注入 `creationflags=subprocess.CREATE_NO_WINDOW`，
+  在无控制台窗口的桌面版 AstrBot 下不再闪烁 cmd 窗口，同时严格保证 Linux / macOS 不传该参数。
+- **更新失效的旧工具引导文案**：将 `bsk/service.py` 会话重建提示中的 `bsk_open` 更新为
+  `bsk_page(action="navigate")`，将 `main.py` 中 `bsk_evaluate` 工具说明里的 `bsk_read` 更新为
+  `bsk_inspect(action="observe")`，避免默认关闭旧工具时误导模型。
+
 ## [0.3.1] - 2026-10-29
 
 补丁版：**插件的行为没有变化**。三处改动里只有许可证的文件布局对用户可见，另外两项是内部
@@ -304,6 +338,7 @@ LLM 可调用工具，让机器人能操作**用户已登录的真实浏览器**
   清理永远返回 0
 - **权限提示与实现相反**：配置校验说白名单「不生效」，实际是白名单优先
 
+[0.3.2]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.2
 [0.3.1]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.1
 [0.3.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.3.0
 [0.2.0]: https://github.com/JosephTian876/astrbot_plugin_bsk_browser/releases/tag/v0.2.0
