@@ -388,11 +388,19 @@ class TestServiceLoggerInjection(TempDirCase):
 
     def test_probe_failure_is_reported_to_injected_logger(self) -> None:
         """``probe_browser`` 的降级分支必须记到注入对象。"""
+        import asyncio
+
         rec = RecordingLogger()
 
         class BoomRunner(FakeRunner):
-            def resolve(self) -> str:
-                return str(self_dir_that_does_not_exist())
+            async def run_or_raise(
+                self,
+                args: list[str],
+                *,
+                timeout: float | None = None,
+                expect_json: bool = True,
+            ) -> BskResult:
+                raise OSError("bsk 不可用")
 
         service = BskService(
             make_settings(),
@@ -400,7 +408,7 @@ class TestServiceLoggerInjection(TempDirCase):
             logger=rec,
         )
 
-        self.assertEqual(service.probe_browser(), "")
+        self.assertEqual(asyncio.run(service.probe_browser()), "")
         self.assertIn("debug", rec.levels())
         self.assertIn("浏览器探测失败", rec.rendered())
 
@@ -544,7 +552,7 @@ class TestNullLoggerFallback(TempDirCase):
             make_settings(screenshot_dir=str(self.dir)),
             runner=FakeRunner(),  # type: ignore[arg-type]
         )
-        self.assertEqual(service.probe_browser(), "")
+        self.assertEqual(asyncio.run(service.probe_browser()), "")
         asyncio.run(service.sessions.acquire("umo-1"))
 
     def test_fallback_logger_is_null_logger(self) -> None:
@@ -656,10 +664,18 @@ class TestSourceLevelLayering(unittest.TestCase):
         self.assertNotIn("astrbot", roots)
         self.assertNotIn("logging", roots)
 
-
-def self_dir_that_does_not_exist() -> str:
-    """给 ``BoomRunner.resolve`` 用的假可执行文件路径（必然不存在）。"""
-    return str(Path(tempfile.gettempdir()) / "bsk-logger-injection-no-such-binary")
+    def test_only_runner_imports_subprocess_in_bsk(self) -> None:
+        """子进程治理约束：``bsk/`` 中只有 ``runner.py`` 可以直接 import ``subprocess``。"""
+        offenders = [
+            py.name
+            for py in _bsk_modules()
+            if py.name != "runner.py" and "subprocess" in _imported_roots(_parse(py))
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            f"除 runner.py 外不应直接 import subprocess（否则绕过异步/无黑框治理）：{offenders}",
+        )
 
 
 def _raising_cleanup(*args: Any, **kwargs: Any) -> int:

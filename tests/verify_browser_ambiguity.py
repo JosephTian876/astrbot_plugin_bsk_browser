@@ -7,10 +7,8 @@
 3. ≥2 个但已配置 → 尊重配置，不报歧义
 
 ## 测试方式说明
-``probe_browser()`` 内部用的是同步 ``subprocess.run`` 调真实 bsk，
-所以不能靠注入假 runner 来喂数据。好在判定逻辑被拆成了纯函数
-``_pick_browser_from_probe(data)``，本脚本直接测它 —— 覆盖面相同，
-且不依赖 subprocess。
+判定逻辑被拆成了纯函数 ``_pick_browser_from_probe(data)``，本脚本直接测它 ——
+覆盖面与 ``probe_browser()`` 一致，且不依赖真实浏览器。
 
 ``probe_browser`` 与 ``SessionManager`` 的异常穿透行为另行验证
 （用注入的 ``browser_probe``），见第 4 节。

@@ -470,5 +470,79 @@ class TestResolveCaching(RunnerTestBase):
             await runner.run(["status", "--json"])
 
 
+class TestWindowsNoConsoleWindow(unittest.IsolatedAsyncioTestCase):
+    """Windows 下调用 bsk 必须带 CREATE_NO_WINDOW，且非 Windows 严禁传入 creationflags。"""
+
+    def test_subprocess_kwargs_on_win32_sets_create_no_window(self) -> None:
+        from unittest import mock
+
+        from bsk import runner as runner_mod
+
+        fake_flag = 0x08000000
+        with (
+            mock.patch.object(runner_mod.sys, "platform", "win32"),
+            mock.patch.object(
+                runner_mod.subprocess, "CREATE_NO_WINDOW", fake_flag, create=True
+            ),
+        ):
+            self.assertEqual(
+                runner_mod._subprocess_kwargs(),
+                {"creationflags": fake_flag},
+            )
+
+    def test_subprocess_kwargs_on_non_windows_is_empty(self) -> None:
+        """Linux / macOS 不支持 creationflags，必须返回空字典避免 TypeError。"""
+        from unittest import mock
+
+        from bsk import runner as runner_mod
+
+        for platform in ("linux", "darwin", "freebsd"):
+            with self.subTest(platform=platform):
+                with mock.patch.object(runner_mod.sys, "platform", platform):
+                    self.assertEqual(runner_mod._subprocess_kwargs(), {})
+
+    async def test_run_forwards_creationflags_only_on_win32(self) -> None:
+        from unittest import mock
+
+        from bsk import runner as runner_mod
+
+        class _FakeProc:
+            returncode = 0
+            stdout = None
+            stderr = None
+            stdin = None
+
+            async def wait(self) -> int:
+                return 0
+
+        fake_flag = 0x08000000
+        runner = BskRunner(sys.executable)
+
+        win_mock = mock.AsyncMock(return_value=_FakeProc())
+        with (
+            mock.patch.object(runner_mod.sys, "platform", "win32"),
+            mock.patch.object(
+                runner_mod.subprocess, "CREATE_NO_WINDOW", fake_flag, create=True
+            ),
+            mock.patch.object(
+                runner_mod.asyncio, "create_subprocess_exec", win_mock
+            ),
+        ):
+            result = await runner.run(["status", "--json"])
+        self.assertTrue(result.ok)
+        self.assertEqual(win_mock.await_args.kwargs.get("creationflags"), fake_flag)
+
+        linux_mock = mock.AsyncMock(return_value=_FakeProc())
+        with (
+            mock.patch.object(runner_mod.sys, "platform", "linux"),
+            mock.patch.object(
+                runner_mod.asyncio, "create_subprocess_exec", linux_mock
+            ),
+        ):
+            result = await runner.run(["status", "--json"])
+        self.assertTrue(result.ok)
+        self.assertNotIn("creationflags", linux_mock.await_args.kwargs)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

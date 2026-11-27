@@ -25,6 +25,8 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 from typing import Any
 
@@ -100,6 +102,21 @@ def _build_env() -> dict[str, str]:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
     return env
+
+
+def _subprocess_kwargs() -> dict[str, Any]:
+    """构造 ``create_subprocess_exec`` 的平台相关额外参数。
+
+    Windows 桌面端（例如无控制台窗口的 AstrBot Desktop）每次拉起 ``bsk.exe``
+    时，如果不传 ``CREATE_NO_WINDOW``，屏幕上会闪现控制台黑框。
+    非 Windows 平台不支持 ``creationflags`` 参数，必须严格按
+    ``sys.platform == "win32"`` 守卫，避免在 Linux / macOS 上抛 ``TypeError``。
+    """
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if flags:
+            return {"creationflags": flags}
+    return {}
 
 
 def resolve_bsk_path(configured: str) -> str:
@@ -328,6 +345,7 @@ class BskRunner:
                 # stdin 保持打开（PIPE）但不写入 —— 见下面关于 communicate() 的说明。
                 stdin=asyncio.subprocess.PIPE,
                 env=_build_env(),
+                **_subprocess_kwargs(),
             )
         except OSError as exc:
             raise BskError(

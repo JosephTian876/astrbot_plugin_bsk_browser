@@ -57,6 +57,7 @@ from bsk.service import (  # noqa: E402
     TIMEOUT_FULLPAGE,
     TIMEOUT_NAVIGATE,
     TIMEOUT_OBSERVE,
+    TIMEOUT_PROBE_MAX,
     TIMEOUT_QUICK,
     TIMEOUT_SCREENSHOT,
     BskService,
@@ -641,17 +642,20 @@ class TestBuiltinConstants(unittest.TestCase):
 #   4. 用户显式配了 ``browser_instance_id`` → 直接用配置的，
 #      不做歧义检查（用户已经明确表态了）。
 #
-# 假 subprocess：``probe_browser`` 走的是同步 ``subprocess.run``，
-# 所以这里替换掉 ``subprocess.run`` 本身，而不是真的去执行 bsk
-#（本机可能真的有浏览器连着，测试绝不能依赖这一点，也绝不能碰到它）。
+# 假 runner：``probe_browser`` 已改为异步走 ``runner.run_or_raise(["browsers", "--json"])``，
+# 不再同步调 ``subprocess.run``。这里把假 runner 的 ``browsers`` 响应参数化，
+# 并同时用 ``subprocess.run`` 哨兵断言不会退化回同步子进程。
 # ======================================================================
 
-import json  # noqa: E402 - 追加段落自带 import，不改动文件上方的任何一行
+import ast  # noqa: E402 - 追加段落自带 import，不改动文件上方的任何一行
+import asyncio  # noqa: E402
 from unittest import mock  # noqa: E402
 
 from bsk.errors import (  # noqa: E402
     CODE_BROWSER_AMBIGUOUS,
     BskBrowserAmbiguous,
+    BskError,
+    BskSessionGone,
 )
 from bsk.models import BrowserInstance  # noqa: E402
 
@@ -679,27 +683,29 @@ def browsers_payload(*instances: tuple[str, str]) -> list[dict[str, Any]]:
     ]
 
 
-def fake_subprocess_run(
-    payload: Any,
-    *,
-    returncode: int = 0,
-) -> Any:
-    """造一个 ``subprocess.run`` 替身，假装 ``bsk browsers --json`` 的返回。
+class ProbeFakeRunner(FakeRunner):
+    """可定制 ``browsers`` 命令响应的假 runner，用于测试异步 ``probe_browser``。"""
 
-    Args:
-        payload: 要假装成 bsk 输出的对象（会被 JSON 序列化）。
-        returncode: 假的退出码。非 0 表示"探测本身失败"。
-    """
+    def __init__(self, browsers_handler: Any = None) -> None:
+        super().__init__()
+        self._browsers_handler = browsers_handler
 
-    def _run(args: list[str], **kwargs: Any) -> Any:
-        return types.SimpleNamespace(
-            returncode=returncode,
-            stdout=json.dumps(payload).encode("utf-8"),
-            stderr=b"",
-            args=args,
-        )
-
-    return _run
+    async def run_or_raise(
+        self,
+        args: list[str],
+        *,
+        timeout: float | None = None,
+        expect_json: bool = True,
+    ) -> BskResult:
+        call = list(args)
+        if self._command_of(call) == "browsers" and self._browsers_handler is not None:
+            self.calls.append(call)
+            self.timeouts.append(timeout)
+            outcome = self._browsers_handler(call, timeout)
+            if asyncio.iscoroutine(outcome):
+                outcome = await outcome
+            return outcome
+        return await super().run_or_raise(args, timeout=timeout, expect_json=expect_json)
 
 
 def browser_id_of(start_call: list[str]) -> str:
@@ -875,25 +881,46 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
 
     def setUp(self) -> None:
         super().setUp()
-        # 在没有任何补丁的情况下，绝不允许真的去执行 bsk。
-        # 任何一次真实调用都会撞上这个断言（下面的用例各自按需覆盖它）。
-        self._patchers: list[Any] = []
-        self._patch_run(mock.Mock(side_effect=AssertionError("不该真的执行 bsk")))
-
-    def _patch_run(self, replacement: Any) -> None:
-        """把 ``subprocess.run`` 换成 ``replacement``（同一用例内可反复替换）。
-
-        自己管 patcher 列表而不是用 ``mock.patch.stopall()``：后者会把
-        ``unittest`` 框架自己的补丁也一起停掉，属于误伤。
-        """
-        patcher = mock.patch("subprocess.run", replacement)
+        # 哨兵：绝不允许 probe_browser 再走同步 subprocess.run（避免阻塞事件循环）。
+        patcher = mock.patch(
+            "subprocess.run",
+            mock.Mock(side_effect=AssertionError("probe_browser 不应同步调用 subprocess.run")),
+        )
         patcher.start()
-        self._patchers.append(patcher)
         self.addCleanup(patcher.stop)
+        self._browsers_handler: Any = lambda _args, _timeout: (_ for _ in ()).throw(
+            AssertionError("不该触发浏览器探测")
+        )
+
+    def make(
+        self,
+        *,
+        framework_tool_timeout: float | None = None,
+        **overrides: Any,
+    ) -> tuple[BskService, ProbeFakeRunner]:
+        overrides.setdefault("screenshot_dir", self.tmp.name)
+        runner = ProbeFakeRunner(self._browsers_handler)
+        service = BskService(
+            make_settings(**overrides),
+            runner=runner,
+            framework_tool_timeout=framework_tool_timeout,
+        )
+        return service, runner
 
     def patch_browsers(self, payload: Any, *, returncode: int = 0) -> None:
-        """让 ``bsk browsers --json`` 返回给定载荷。"""
-        self._patch_run(fake_subprocess_run(payload, returncode=returncode))
+        """让假 runner 对 ``bsk browsers --json`` 返回给定载荷或报错。"""
+
+        def _handler(_args: list[str], _timeout: float | None) -> BskResult:
+            if returncode != 0:
+                raise BskError(
+                    "bsk browsers failed",
+                    friendly="探测失败",
+                    code="probe_failed",
+                    exit_code=returncode,
+                )
+            return BskResult(ok=True, exit_code=0, data=payload, elapsed=0.0)
+
+        self._browsers_handler = _handler
 
     # --- 分支 2：恰好 1 个 → 免配置（回归保护）---
 
@@ -992,6 +1019,7 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
 
         start_call = runner.calls_for("session start")[0]
         self.assertEqual(browser_id_of(start_call), "deadbeef")
+        self.assertEqual(runner.calls_for("browsers"), [])
 
     # --- 分支 1 的变体：探测本身失败 → 保持原有容错语义 ---
 
@@ -1012,7 +1040,11 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
 
     async def test_probe_crash_still_creates_session(self) -> None:
         """探测抛异常（bsk 没装、超时等）→ 同样不许连累建会话。"""
-        self._patch_run(mock.Mock(side_effect=OSError("bsk 不存在")))
+
+        def _boom(_args: list[str], _timeout: float | None) -> BskResult:
+            raise OSError("bsk 不存在")
+
+        self._browsers_handler = _boom
         service, runner = self.make(browser_instance_id="")
 
         await service.observe("umo-1")
@@ -1021,49 +1053,157 @@ class TestBrowserProbeIsWiredIntoSessionCreation(ServiceIntegrationCase):
         self.assertEqual(browser_id_of(start_call), "")
 
     async def test_probe_returns_broken_json_still_creates_session(self) -> None:
-        """探测输出不是 JSON（截断/clap 报错）→ 同样静默降级。"""
-        self._patch_run(
-            lambda *a, **k: types.SimpleNamespace(
-                returncode=0, stdout=b"not json at all", stderr=b""
-            )
-        )
+        """探测输出不是 JSON（runner 返回 data=None）→ 同样静默降级。"""
+        self.patch_browsers(None)
         service, runner = self.make(browser_instance_id="")
 
         await service.observe("umo-1")
 
         self.assertEqual(browser_id_of(runner.calls_for("session start")[0]), "")
 
-    # --- 调用频率：不许在热路径上多探测 ---
+    # --- 调用频率与异步非阻塞 + 超时上限（v0.3.2 回归保护）---
 
     async def test_probe_happens_once_per_session_not_per_command(self) -> None:
         """探测次数 = 建会话次数，不随后续命令增长。
 
-        ``probe_browser`` 走的是同步 ``subprocess.run``，每次都有真实开销。
-        检查必须搭在"建会话的那一次探测"上，绝不能变成每条命令都探一次。
+        即使探测已异步化，仍需起一次 ``bsk browsers`` 子进程，
+        绝不能退化成每条命令都探一次。
         """
-        calls: list[list[str]] = []
-        real = fake_subprocess_run(browsers_payload(("c900a3da", "edge")))
-
-        def counting_run(args: list[str], **kwargs: Any) -> Any:
-            calls.append(list(args))
-            return real(args, **kwargs)
-
-        self._patch_run(counting_run)
-        service, _ = self.make(browser_instance_id="")
+        self.patch_browsers(browsers_payload(("c900a3da", "edge")))
+        service, runner = self.make(browser_instance_id="")
 
         await service.observe("umo-1")
-        first = len(calls)
-        self.assertEqual(first, 1, f"建会话时应该恰好探测一次，实际 {first} 次")
+        calls = runner.calls_for("browsers")
+        self.assertEqual(len(calls), 1, f"建会话时应该恰好探测一次，实际 {len(calls)} 次")
 
         # 同一个 key 上再跑三条命令：会话已存在，一次都不该再探。
         await service.observe("umo-1")
         await service.read_console("umo-1")
         await service.read_network("umo-1")
 
-        self.assertEqual(len(calls), first, "后续命令不应该再触发探测（热路径开销）")
-        for call in calls:
-            with self.subTest(call=call):
-                self.assertEqual(call[1:], ["browsers", "--json"])
+        self.assertEqual(
+            len(runner.calls_for("browsers")),
+            1,
+            "后续命令不应该再触发探测（热路径开销）",
+        )
+        self.assertEqual(calls[0], ["browsers", "--json"])
+
+    async def test_probe_browser_is_async_and_does_not_block_event_loop(self) -> None:
+        """``probe_browser`` 异步挂起期间，同一事件循环上的其他协程必须能继续推进。"""
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+        concurrent_ticked = False
+
+        async def _slow_probe(_args: list[str], _timeout: float | None) -> BskResult:
+            probe_started.set()
+            await release_probe.wait()
+            return BskResult(
+                ok=True,
+                exit_code=0,
+                data=browsers_payload(("c900a3da", "edge")),
+                elapsed=0.0,
+            )
+
+        self._browsers_handler = _slow_probe
+        service, _ = self.make(browser_instance_id="")
+
+        async def _other_coroutine() -> None:
+            nonlocal concurrent_ticked
+            await probe_started.wait()
+            concurrent_ticked = True
+            release_probe.set()
+
+        probed, _ = await asyncio.gather(service.probe_browser(), _other_coroutine())
+        self.assertTrue(concurrent_ticked, "事件循环在探测期间被阻塞，其他协程无法运行")
+        self.assertEqual(probed, "c900a3da")
+
+    async def test_probe_browser_caps_timeout_at_10s(self) -> None:
+        """无论 ``command_timeout_sec`` 配得多大，自动探测超时都不得超过 10 秒。"""
+        self.patch_browsers(browsers_payload(("c900a3da", "edge")))
+        for user_timeout, expected in (
+            (5.0, 5.0),
+            (8.0, 8.0),
+            (60.0, TIMEOUT_PROBE_MAX),
+            (110.0, TIMEOUT_PROBE_MAX),
+        ):
+            with self.subTest(command_timeout_sec=user_timeout):
+                service, runner = self.make(
+                    browser_instance_id="",
+                    command_timeout_sec=user_timeout,
+                )
+                picked = await service.probe_browser()
+                self.assertEqual(picked, "c900a3da")
+                self.assertEqual(runner.timeout_for("browsers"), expected)
+
+    async def test_probe_browser_propagates_cancellation(self) -> None:
+        """``asyncio.CancelledError`` 绝不能被探测的降级分支吞掉。"""
+
+        async def _cancelled(_args: list[str], _timeout: float | None) -> BskResult:
+            raise asyncio.CancelledError
+
+        self._browsers_handler = _cancelled
+        service, _ = self.make(browser_instance_id="")
+
+        with self.assertRaises(asyncio.CancelledError):
+            await service.probe_browser()
+
+
+class TestModernToolGuidance(ServiceIntegrationCase):
+    """回归保护：面向模型的引导文案应指向默认注册的新工具，而非默认关闭的旧工具。"""
+
+    async def test_observe_rebuild_notice_guides_to_bsk_page_navigate(self) -> None:
+        """会话因空闲回收重建时，提示模型用 ``bsk_page(action=\"navigate\")`` 而非已停用的 ``bsk_open``。"""
+
+        class RebuildOnceRunner(FakeRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self._observe_count = 0
+
+            async def run_or_raise(
+                self,
+                args: list[str],
+                *,
+                timeout: float | None = None,
+                expect_json: bool = True,
+            ) -> BskResult:
+                if self._command_of(list(args)) == "observe":
+                    self._observe_count += 1
+                    if self._observe_count == 1:
+                        raise BskSessionGone(
+                            "session expired",
+                            friendly="会话已过期",
+                            code="not_found",
+                            exit_code=1,
+                        )
+                return await super().run_or_raise(
+                    args, timeout=timeout, expect_json=expect_json
+                )
+
+        runner = RebuildOnceRunner()
+        service = BskService(
+            make_settings(screenshot_dir=self.tmp.name),
+            runner=runner,
+        )
+
+        observation = await service.observe("umo-1")
+
+        self.assertIn('bsk_page(action="navigate")', observation.text)
+        self.assertNotIn("bsk_open", observation.text)
+
+    def test_bsk_evaluate_docstring_guides_to_bsk_inspect_observe(self) -> None:
+        """``main.py`` 中 ``bsk_evaluate`` 的说明应引用 ``bsk_inspect(action=\"observe\")``，不再提 ``bsk_read``。"""
+        main_py = Path(__file__).resolve().parent.parent / "main.py"
+        tree = ast.parse(main_py.read_text(encoding="utf-8"))
+        doc: str | None = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "bsk_evaluate":
+                doc = ast.get_docstring(node)
+                break
+
+        self.assertIsNotNone(doc, "在 main.py 中未找到 bsk_evaluate")
+        assert doc is not None
+        self.assertIn('bsk_inspect(action="observe")', doc)
+        self.assertNotIn("bsk_read", doc)
 
 
 class TestAmbiguousBrowserErrorShape(unittest.TestCase):

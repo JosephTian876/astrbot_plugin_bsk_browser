@@ -222,9 +222,9 @@ async def main() -> int:
     # 5. 反向验证：未配置 instance_id 时不应硬编码某个 id
     # ------------------------------------------------------------------
     print("\n--- 5. 反向验证：未配置 instance_id 时不硬编码浏览器 ---")
-    # 注意 browser_probe 会尝试真实调用 `bsk browsers`。这里用假 runner，
-    # probe 走的是同步 subprocess（见 service.probe_browser），
-    # 拿不到结果就返回空串 —— 于是不传 --browser，交给 bsk 自己选。
+    # 注意 browser_probe 会经 runner 异步调用 `bsk browsers --json`。
+    # 这里用假 runner，拿不到浏览器列表（空 dict）就返回空串 ——
+    # 于是不传 --browser，交给 bsk 自己选。
     plain = parse_settings({})
     runner2 = CapturingRunner()
     service2 = BskService(plain, runner=runner2)

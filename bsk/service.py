@@ -78,6 +78,14 @@ __all__ = ["BskService", "ActionResult", "ShotPayload"]
 TIMEOUT_QUICK = 5.0
 """status / browsers / session list 这类只读命令的下限（它们本身几乎是瞬时的）。"""
 
+TIMEOUT_PROBE_MAX = 10.0
+"""自动探测浏览器（``bsk browsers --json``）的超时上限（秒）。
+
+``probe_browser()`` 是建会话前的快速优化探测（失败可静默回退给 bsk 选默认），
+即使 ``command_timeout_sec`` 配得很高（默认 60 秒）也不该让一次探测干等那么久。
+与 ``bsk.cooperation.COOP_PROBE_TIMEOUT_SEC``（10 秒）对齐。
+"""
+
 TIMEOUT_OBSERVE = 15.0
 """observe 的下限。实测极快，但复杂页面会慢，留足余量。"""
 
@@ -421,15 +429,21 @@ class BskService:
             return []
         return [BrowserInstance.from_json(item) for item in raw]
 
-    def probe_browser(self) -> str:
-        """给 ``SessionManager`` 用的同步探测钩子。
+    async def probe_browser(self) -> str:
+        """给 ``SessionManager`` 用的异步探测钩子。
 
         只在用户没有显式配置 ``browser_instance_id`` 时才会被调用。
         返回空串表示"探测不出，让 bsk 自己选默认浏览器"。
 
+        通过 ``self.runner.run_or_raise(["browsers", "--json"], ...)`` 异步执行，
+        超时上限收紧到 ``min(self._timeout(TIMEOUT_QUICK), TIMEOUT_PROBE_MAX)``：
+        - 绝不在 asyncio 事件循环线程上同步调用 ``subprocess.run``，避免冻结宿主；
+        - 统一复用 ``BskRunner`` 的 Windows 无黑框（``CREATE_NO_WINDOW``）、
+          显式 UTF-8 解码、JSON 容错解析与超时优雅取消逻辑。
+
         三条分支必须分清楚（这是本方法存在的意义）：
 
-        - 探测本身失败（bsk 没装、命令报错、输出不是 JSON）→ 返回空串。
+        - 探测本身失败（bsk 没装、命令报错、超时、输出不是 JSON）→ 返回空串。
           探测是优化，不该阻止会话创建，所以这里静默降级。
         - 恰好 1 个浏览器 → 返回它的 ``instance_id``，替用户省掉一步配置。
           这是最常见的场景（实测本机就是这一种），必须保持免配置可用。
@@ -447,27 +461,18 @@ class BskService:
             上面那个 ``except Exception`` 是给"探测失败"用的，如果歧义异常也被
             它吞掉，就会退化成"静默随机选一个"，正是本次要消灭的行为。
         """
+        probe_timeout = min(self._timeout(TIMEOUT_QUICK), TIMEOUT_PROBE_MAX)
         try:
-            # SessionManager 期望的是同步可调用对象，但我们的探测是异步的。
-            # 为保持接口简单，这里用一个短超时的同步子进程调用。
-            import subprocess
-
-            exe = self.runner.resolve()
-            proc = subprocess.run(
-                [exe, "browsers", "--json"],
-                capture_output=True,
-                timeout=self._timeout(TIMEOUT_QUICK),
-                check=False,
+            result = await self.runner.run_or_raise(
+                ["browsers", "--json"],
+                timeout=probe_timeout,
             )
-            if proc.returncode != 0:
-                return ""
-            data = json.loads(proc.stdout.decode("utf-8", errors="replace") or "[]")
-        except Exception as exc:  # noqa: BLE001 - 探测失败必须静默降级
+        except Exception as exc:  # noqa: BLE001 - 探测失败必须静默降级（不吞 CancelledError）
             self._logger.debug("浏览器探测失败，交给 bsk 选默认：%r", exc)
             return ""
         # 走到这里说明探测成功了，于是"多浏览器歧义"是一条确定的结论，
         #   必须让它抛出去（下面这个方法会抛），不能和上面的失败混为一谈。
-        return self._pick_browser_from_probe(data)
+        return self._pick_browser_from_probe(result.data)
 
     @staticmethod
     def _pick_browser_from_probe(data: Any) -> str:
@@ -715,7 +720,7 @@ class BskService:
             observation.text = (
                 "（注意：浏览器会话刚刚因空闲过久被回收并自动重建，"
                 "当前是新开的空白页，之前打开的网页和填过的内容已经丢失。"
-                "如果用户之前在浏览某个页面，需要重新用 bsk_open 打开那个网址。）\n"
+                '如果用户之前在浏览某个页面，需要重新用 bsk_page(action="navigate") 打开那个网址。）\n'
                 + observation.text
             )
             self._logger.info(
